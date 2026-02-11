@@ -11,8 +11,9 @@ from scanner import scan_universe_with_meta
 from executor import maybe_trade
 from storage import last_orders, log_scan, last_scans, set_setting, get_all_settings, parse_float, parse_int, parse_bool
 
+
+# ================= ADMIN CHECK =================
 def _is_admin_private(update: Update) -> bool:
-    """Commands allowed only from admin in private chat."""
     try:
         if update.effective_chat and update.effective_chat.type != 'private':
             return False
@@ -22,168 +23,226 @@ def _is_admin_private(update: Update) -> bool:
     except Exception:
         return False
 
+
+# ================= CHANNEL SEND =================
 async def _send_channel(app: Application, text: str) -> None:
     if not TELEGRAM_CHANNEL_ID:
         return
-    # Split long messages (Telegram limit ~4096)
     chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
     for ch in chunks:
         await app.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=ch)
 
+
+# ================= FORMAT PICKS =================
 def _format_picks(picks) -> str:
     lines = []
     for i, c in enumerate(picks, start=1):
         lines.append(
-            f"{i}) {c.symbol}  score={c.score:.1f}  close={c.last_close:.2f}  ATR={c.atr:.2f}  RSI={c.rsi14:.0f}\n   {c.notes}"
+            f"{i}) {c.symbol} | score={c.score:.1f} | close={c.last_close:.2f} | ATR={c.atr:.2f} | RSI={c.rsi14:.0f}\n{c.notes}"
         )
     return "\n".join(lines) if lines else "No picks matched filters."
 
+
+# ================= BASIC COMMANDS =================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_private(update):
         return
     await update.message.reply_text(
-        "/analyze - scan the US market and show top picks\n"
-        "/summary - show last scan summaries\n"
-        "/status - show basic status\n"
-        "/orders - show last orders\n"
+        "/analyze - scan market\n"
+        "/summary - last scans\n"
+        "/orders - last orders\n"
+        "/config - show settings\n\n"
+        "CONTROL:\n"
+        "/capital 1000\n"
+        "/size 20\n"
+        "/sl 3\n"
+        "/tp 5\n"
+        "/max 10\n"
+        "/plan daily|weekly|monthly|dw|wm\n"
+        "/auto on|off\n"
+        "/settings"
     )
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_private(update):
         return
-    await update.message.reply_text("Bot is running. Use /analyze to scan. Use /config to see live settings.")
+    await update.message.reply_text("Bot running.")
+
 
 async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_private(update):
         return
     orders = last_orders(10)
     if not orders:
-        await update.message.reply_text("No orders logged yet.")
+        await update.message.reply_text("No orders.")
         return
-    lines = []
-    for o in orders:
-        lines.append(f"{o['ts']} {o['symbol']} {o['side']} qty={o['qty']} {o['status']} {o['message']}")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(f"{o['ts']} {o['symbol']} {o['side']} qty={o['qty']} {o['status']}" for o in orders)
+    )
+
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_private(update):
         return
     scans = last_scans(10)
     if not scans:
-        await update.message.reply_text("No scans logged yet.")
+        await update.message.reply_text("No scans.")
         return
-    lines = []
-    for s in scans:
-        lines.append(f"{s['ts']} universe={s['universe_size']} top={s['top_symbols']}")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(f"{s['ts']} universe={s['universe_size']} top={s['top_symbols']}" for s in scans)
+    )
 
+
+# ================= ANALYZE =================
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_private(update):
         return
-    await update.message.reply_text("Scanning... this may take a minute.")
+
+    await update.message.reply_text("Scanning market...")
+
     picks, universe_size = scan_universe_with_meta()
     msg = _format_picks(picks)
+
     await update.message.reply_text(msg)
-    # Post same to channel
     await _send_channel(context.application, msg)
 
-    # Log scan
     ts = datetime.now(timezone.utc).isoformat()
     top_syms = ",".join([c.symbol for c in picks])
     log_scan(ts, universe_size, top_syms, payload="telegram:/analyze")
 
-    # Optional execution
     picks_payload = [{"symbol": c.symbol, "last_close": c.last_close, "atr": c.atr} for c in picks[:5]]
     logs = maybe_trade(picks_payload)
     await update.message.reply_text("\n".join(logs))
 
 
+# ================= SETTINGS CONTROL =================
 
-async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
-    s = get_all_settings()
-    lines = [
-        "Live settings (DB):",
-        f"- TOP_N={s.get('TOP_N')}",
-        f"- AUTO_TRADE={s.get('AUTO_TRADE')}",
-        f"- MAX_DAILY_TRADES={s.get('MAX_DAILY_TRADES')}",
-        f"- RISK_PER_TRADE_PCT={s.get('RISK_PER_TRADE_PCT')}",
-        f"- TP_R_MULT={s.get('TP_R_MULT')}",
-        f"- SL_ATR_MULT={s.get('SL_ATR_MULT')}",
-        "",
-        f"Safety latches (ENV): EXECUTE_TRADES={EXECUTE_TRADES}  ALLOW_LIVE_TRADING={ALLOW_LIVE_TRADING}",
-        f"Channel: {TELEGRAM_CHANNEL_ID or '(not set)'}",
-    ]
-    await update.message.reply_text("\n".join(lines))
-
-async def cmd_trade_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
-    set_setting("AUTO_TRADE", "1")
-    await update.message.reply_text("AUTO_TRADE enabled (DB). Note: execution still requires EXECUTE_TRADES & ALLOW_LIVE_TRADING env vars.")
-
-async def cmd_trade_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
-    set_setting("AUTO_TRADE", "0")
-    await update.message.reply_text("AUTO_TRADE disabled (DB). Scanner only.")
-
-async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
+async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /risk 0.25  (percent of equity risked per trade)")
+        await update.message.reply_text("Usage: /capital 1000")
         return
-    val = parse_float(context.args[0], -1.0)
-    if val <= 0 or val > 5:
-        await update.message.reply_text("Risk must be a small positive percent (example: 0.25).")
+    val = parse_float(context.args[0], -1)
+    if val <= 0:
+        await update.message.reply_text("Invalid capital.")
         return
-    set_setting("RISK_PER_TRADE_PCT", str(val))
-    await update.message.reply_text(f"Set RISK_PER_TRADE_PCT={val}")
+    set_setting("CAPITAL_USD", str(val))
+    await update.message.reply_text(f"Capital set to {val}$")
+
+
+async def cmd_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
+    if not context.args:
+        await update.message.reply_text("Usage: /size 20")
+        return
+    val = parse_float(context.args[0], -1)
+    if val <= 0 or val > 100:
+        await update.message.reply_text("Size must be 1-100%.")
+        return
+    set_setting("POSITION_PCT", str(val))
+    await update.message.reply_text(f"Position size {val}%")
+
+
+async def cmd_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
+    if not context.args:
+        await update.message.reply_text("Usage: /sl 3")
+        return
+    val = parse_float(context.args[0], -1)
+    if val <= 0 or val > 20:
+        await update.message.reply_text("SL must be between 0-20%.")
+        return
+    set_setting("SL_PCT", str(val))
+    await update.message.reply_text(f"Stop loss {val}%")
+
+
+async def cmd_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
+    if not context.args:
+        await update.message.reply_text("Usage: /tp 5")
+        return
+    val = parse_float(context.args[0], -1)
+    if val <= 0 or val > 50:
+        await update.message.reply_text("TP must be between 0-50%.")
+        return
+    set_setting("TP_PCT", str(val))
+    await update.message.reply_text(f"Take profit {val}%")
+
 
 async def cmd_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
+    if not _is_admin_private(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /max 2")
+        await update.message.reply_text("Usage: /max 10")
         return
     n = parse_int(context.args[0], -1)
-    if n < 0 or n > 50:
-        await update.message.reply_text("MAX_DAILY_TRADES must be between 0 and 50.")
+    if n <= 0 or n > 50:
+        await update.message.reply_text("Invalid number.")
         return
-    set_setting("MAX_DAILY_TRADES", str(n))
-    await update.message.reply_text(f"Set MAX_DAILY_TRADES={n}")
+    set_setting("MAX_SEND", str(n))
+    await update.message.reply_text(f"Max signals per scan {n}")
 
-async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin_private(update):
-        return
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /top 5")
+        await update.message.reply_text("daily | weekly | monthly | dw | wm")
         return
-    n = parse_int(context.args[0], -1)
-    if n < 1 or n > 30:
-        await update.message.reply_text("TOP_N must be between 1 and 30.")
-        return
-    set_setting("TOP_N", str(n))
-    await update.message.reply_text(f"Set TOP_N={n}")
+    val = context.args[0].lower()
+    set_setting("PLAN_MODE", val)
+    await update.message.reply_text(f"Plan set to {val}")
 
 
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
+    if not context.args:
+        await update.message.reply_text("/auto on أو off")
+        return
+    state = context.args[0].lower() == "on"
+    set_setting("AUTO_NOTIFY", "1" if state else "0")
+    await update.message.reply_text(f"Auto notify {'ON' if state else 'OFF'}")
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_private(update): return
+    s = get_all_settings()
+    msg = (
+        f"⚙️ SETTINGS\n"
+        f"Capital: {s.get('CAPITAL_USD')}$\n"
+        f"Size: {s.get('POSITION_PCT')}%\n"
+        f"SL: {s.get('SL_PCT')}%\n"
+        f"TP: {s.get('TP_PCT')}%\n"
+        f"Max signals: {s.get('MAX_SEND')}\n"
+        f"Plan: {s.get('PLAN_MODE')}\n"
+        f"Auto notify: {s.get('AUTO_NOTIFY')}"
+    )
+    await update.message.reply_text(msg)
+
+
+# ================= BUILD APP =================
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("config", cmd_config))
-    app.add_handler(CommandHandler("trade_on", cmd_trade_on))
-    app.add_handler(CommandHandler("trade_off", cmd_trade_off))
-    app.add_handler(CommandHandler("risk", cmd_risk))
+
+    # new controls
+    app.add_handler(CommandHandler("capital", cmd_capital))
+    app.add_handler(CommandHandler("size", cmd_size))
+    app.add_handler(CommandHandler("sl", cmd_sl))
+    app.add_handler(CommandHandler("tp", cmd_tp))
     app.add_handler(CommandHandler("max", cmd_max))
-    app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("plan", cmd_plan))
+    app.add_handler(CommandHandler("auto", cmd_auto))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+
     return app
 
+
+# ================= RUN =================
 async def run_polling():
     if not TELEGRAM_BOT_TOKEN:
         return
