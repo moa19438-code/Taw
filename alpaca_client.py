@@ -52,7 +52,7 @@ def latest_trade(symbol: str) -> Dict[str, Any]:
     # Many users use the same base URL for paper/live; if your plan needs a different data host,
     # set ALPACA_DATA_BASE_URL and adjust code.
     # We'll call through base URL for simplicity.
-    return _get(f"/v2/stocks/{symbol}/trades/latest")
+    return _get_data(f"/v2/stocks/{symbol}/trades/latest")
 
 def bars(symbols: List[str], start: datetime, end: datetime, timeframe: str="1Day", limit: int=200) -> Dict[str, Any]:
     # Newer Alpaca API uses /v2/stocks/bars?symbols=...&timeframe=...
@@ -64,7 +64,7 @@ def bars(symbols: List[str], start: datetime, end: datetime, timeframe: str="1Da
         "limit": limit,
         "adjustment": "raw",
     }
-    return _get("/v2/stocks/bars", params=params)
+    return return _get_data("/v2/stocks/bars", params=params)
 
 def place_bracket_order(symbol: str, side: str, qty: float, take_profit_price: float, stop_loss_price: float) -> Dict[str, Any]:
     payload = {
