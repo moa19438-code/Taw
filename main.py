@@ -50,10 +50,10 @@ def telegram_webhook():
     user_id = message.get("from", {}).get("id")
     text = message.get("text", "")
 
-    # السماح فقط للأدمن
-    if TELEGRAM_ADMIN_ID and user_id != TELEGRAM_ADMIN_ID:
-    _tg_send(chat_id, "⛔ هذا البوت للأدمن فقط. راجع TELEGRAM_ADMIN_ID في Render.")
-    return jsonify({"ok": True})
+    # تم تعطيل شرط الأدمن مؤقتًا للاختبار
+    # if TELEGRAM_ADMIN_ID and user_id != TELEGRAM_ADMIN_ID:
+    #     _tg_send(chat_id, "⛔ هذا البوت للأدمن فقط. راجع TELEGRAM_ADMIN_ID في Render.")
+    #     return jsonify({"ok": True})
 
     # ===== /start =====
     if text.startswith("/start"):
