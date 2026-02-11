@@ -3,7 +3,7 @@ import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 
-from config import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL, REQUEST_TIMEOUT
+from config import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL, ALPACA_DATA_BASE_URL, REQUEST_TIMEOUT
 
 def _headers() -> Dict[str, str]:
     return {
