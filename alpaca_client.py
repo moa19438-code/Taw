@@ -17,6 +17,12 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     r = requests.get(url, headers=_headers(), params=params or {}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
+    
+    def _get_data(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = ALPACA_DATA_BASE_URL.rstrip("/") + path
+    r = requests.get(url, headers=_headers(), params=params or {}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
 def _post(path: str, payload: Dict[str, Any]) -> Any:
     url = ALPACA_BASE_URL.rstrip("/") + path
