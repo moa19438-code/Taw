@@ -14,32 +14,33 @@ from alpaca_client import account, place_bracket_order, clock, positions, open_o
 from indicators import sma
 from storage import log_order, last_orders, get_all_settings, parse_bool, parse_int, parse_float
 
+
 def _today_utc() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
 
 def _count_today_orders() -> int:
     orders = last_orders(500)
     today = _today_utc()
-    return sum(1 for o in orders if o.get("ts","").startswith(today))
+    return sum(1 for o in orders if o.get("ts", "").startswith(today))
+
 
 def _parse_ts(ts: str) -> datetime:
     # Alpaca returns RFC3339 like 2026-02-11T13:30:00Z
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
+
 def _within_time_window() -> Tuple[bool, str]:
     c = clock()
     if not c.get("is_open"):
         return False, "Market closed"
+
     ts = _parse_ts(c["timestamp"])
     nxt_close = _parse_ts(c["next_close"])
-    nxt_open  = _parse_ts(c["next_open"])  # not used but for sanity
-    # When market open, we can infer today's open by using next_open of today? Alpaca doesn't always give last_open.
-    # Approx: use next_close date and assume open at 13:30 UTC (NYSE) can be wrong on DST; so instead,
-    # we skip using inferred open and only skip close window reliably via next_close - minutes.
-    # For open window, we rely on clock "timestamp" and an approximate 1st bar time using bars API on MARKET_SYMBOL.
-    # We'll compute open time from the first 1Min bar of the day for MARKET_SYMBOL.
+    _nxt_open = _parse_ts(c["next_open"])  # not used but for sanity
+
+    # Try to compute first bar time for MARKET_SYMBOL to skip early minutes after open.
     try:
-        # get today's 1Min bars for MARKET_SYMBOL and take first timestamp
         end = ts
         start = ts.replace(hour=0, minute=0, second=0, microsecond=0)
         data = bars([MARKET_SYMBOL], start=start, end=end, timeframe="1Min", limit=2000)
@@ -56,33 +57,40 @@ def _within_time_window() -> Tuple[bool, str]:
     minutes_to_close = (nxt_close - ts).total_seconds() / 60.0
     if minutes_to_close < SKIP_CLOSE_MINUTES:
         return False, f"Skipping last {SKIP_CLOSE_MINUTES}m before close"
+
     return True, "OK"
+
 
 def _market_ok() -> Tuple[bool, str]:
     if not USE_MARKET_FILTER:
         return True, "Market filter off"
-    try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=400)
-    except Exception:
-        end = datetime.now(timezone.utc)
-        start = end
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=400)
+
     try:
         data = bars([MARKET_SYMBOL], start=start, end=end, timeframe="1Day", limit=260)
         blist = (data.get("bars", {}) or {}).get(MARKET_SYMBOL, [])
         closes = [float(b["c"]) for b in blist if "c" in b]
+
         if len(closes) < max(MARKET_SMA_FAST, MARKET_SMA_SLOW) + 5:
             return True, "Market filter: insufficient data"
+
         fast = sma(closes, MARKET_SMA_FAST)
         slow = sma(closes, MARKET_SMA_SLOW)
         last = closes[-1]
+
         if fast is None or slow is None:
             return True, "Market filter: insufficient SMA"
+
         if last > slow and fast > slow:
             return True, f"{MARKET_SYMBOL} bullish (close>{MARKET_SMA_SLOW}SMA & {MARKET_SMA_FAST}>{MARKET_SMA_SLOW})"
+
         return False, f"{MARKET_SYMBOL} not bullish (filter blocks longs)"
+
     except Exception as e:
         return True, f"Market filter error (ignored): {e}"
+
 
 def _has_position(symbol: str) -> bool:
     try:
@@ -90,7 +98,7 @@ def _has_position(symbol: str) -> bool:
             return False
         pos = positions()
         for p in pos or []:
-            if str(p.get("symbol","")).upper() == symbol.upper():
+            if str(p.get("symbol", "")).upper() == symbol.upper():
                 qty = float(p.get("qty", 0) or 0)
                 if abs(qty) > 0:
                     return True
@@ -98,34 +106,49 @@ def _has_position(symbol: str) -> bool:
     except Exception:
         return False
 
+
 def _has_open_order(symbol: str) -> bool:
     try:
         if not BLOCK_IF_ORDER_OPEN:
             return False
         od = open_orders(status="open", limit=500)
         for o in od or []:
-            if str(o.get("symbol","")).upper() == symbol.upper():
+            if str(o.get("symbol", "")).upper() == symbol.upper():
                 return True
         return False
     except Exception:
         return False
 
-def compute_qty(equity: float, last_price: float, atr: float) -> float:
-    risk_amt = equity * (RISK_PER_TRADE_PCT / 100.0)
-    stop_dist = max(atr * SL_ATR_MULT, 0.01)
+
+def compute_qty(equity: float, last_price: float, atr: float, risk_pct: float, sl_atr_mult: float) -> float:
+    """
+    Compute position size from equity + ATR stop distance.
+    risk_pct is in percent (e.g., 0.25 means 0.25% of equity).
+    """
+    risk_amt = equity * (risk_pct / 100.0)
+    stop_dist = max(atr * sl_atr_mult, 0.01)
     qty = risk_amt / stop_dist
+
+    # Cap notional exposure to 20% of equity
     max_notional = equity * 0.20
     qty = min(qty, max_notional / max(last_price, 0.01))
+
+    # Use whole shares
     return max(0.0, float(int(qty)))
+
 
 def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
     logs: List[str] = []
     settings = get_all_settings()
-    auto_trade = parse_bool(settings.get('AUTO_TRADE'), AUTO_TRADE)
-    max_daily = parse_int(settings.get('MAX_DAILY_TRADES'), MAX_DAILY_TRADES)
-    risk_pct = parse_float(settings.get('risk_pct'), risk_pct)
-    tp_r = parse_float(settings.get('tp_r'), tp_r)
-    sl_atr_mult = parse_float(settings.get('sl_atr_mult'), sl_atr_mult)
+
+    auto_trade = parse_bool(settings.get("AUTO_TRADE"), AUTO_TRADE)
+    max_daily = parse_int(settings.get("MAX_DAILY_TRADES"), MAX_DAILY_TRADES)
+
+    # Fix: provide defaults (no UnboundLocalError)
+    risk_pct = parse_float(settings.get("risk_pct"), RISK_PER_TRADE_PCT)
+    tp_r = parse_float(settings.get("tp_r"), TP_R_MULT)
+    sl_atr_mult = parse_float(settings.get("sl_atr_mult"), SL_ATR_MULT)
+
     if not auto_trade:
         return ["AUTO_TRADE=false (scan only)"]
 
@@ -147,7 +170,7 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
     logs.append(mkt_reason)
 
     if _count_today_orders() >= max_daily:
-        return [f"Daily limit reached ({MAX_DAILY_TRADES})"]
+        return [f"Daily limit reached ({max_daily})"]
 
     acct = account()
     equity = float(acct.get("equity", 0.0))
@@ -168,7 +191,7 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
             logs.append(f"{sym}: skip (open order exists)")
             continue
 
-        qty = compute_qty(equity, last_price, atr)
+        qty = compute_qty(equity, last_price, atr, risk_pct=risk_pct, sl_atr_mult=sl_atr_mult)
         if qty <= 0:
             logs.append(f"{sym}: qty=0 (skip)")
             continue
