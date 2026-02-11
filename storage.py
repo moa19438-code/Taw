@@ -114,6 +114,7 @@ def _env_defaults() -> Dict[str, str]:
             "DEDUP_HOURS": "6",
             "ALLOW_RESEND_IF_STRONGER": "1",
             "PLAN_MODE": "daily",  # daily|weekly|monthly|daily_weekly|weekly_monthly
+            "SCAN_MODE": "mixed",  # breakout|pullback|mixed
             "ENTRY_MODE": "auto",  # auto|market|limit
             "CAPITAL_USD": "800",
             "POSITION_PCT": "0.20",
