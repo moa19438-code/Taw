@@ -52,7 +52,8 @@ def telegram_webhook():
 
     # السماح فقط للأدمن
     if TELEGRAM_ADMIN_ID and user_id != TELEGRAM_ADMIN_ID:
-        return jsonify({"ok": True})
+    _tg_send(chat_id, "⛔ هذا البوت للأدمن فقط. راجع TELEGRAM_ADMIN_ID في Render.")
+    return jsonify({"ok": True})
 
     # ===== /start =====
     if text.startswith("/start"):
