@@ -204,26 +204,4 @@ def signals_since(ts_iso: str, mode: Optional[str]=None) -> List[Dict[str, Any]]
                 "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals WHERE ts>=? ORDER BY id DESC",
                 (ts_iso,),
             ).fetchall()
-            import os
-import requests
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-    }
-
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print("Telegram error:", e)
         return [dict(r) for r in rows]

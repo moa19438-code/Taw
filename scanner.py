@@ -48,16 +48,22 @@ def scan_universe() -> List[Candidate]:
     return scan_universe_from_symbols(symbols)
 
 
-def scan_universe_with_meta() -> Tuple[List[Candidate], int]:
+def scan_universe_with_meta() -> Tuple[List[Candidate], Dict[str, Any]]:
     symbols = build_universe()
-    picks = scan_universe_from_symbols(symbols)
-    return picks, len(symbols)
+    picks, meta = scan_universe_from_symbols(symbols, with_meta=True)
+    meta.setdefault('universe', len(symbols))
+    return picks, meta
 
-def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
+def scan_universe_from_symbols(symbols: List[str], with_meta: bool=False):
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
     results: List[Candidate] = []
+    checked = 0
+    missing_data = 0
+    filtered_price = 0
+    filtered_liquidity = 0
     for batch in _chunks(symbols, SYMBOL_BATCH):
+        checked += len(batch)
         data = bars(batch, start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
         bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
         for sym, blist in bars_by_symbol.items():
