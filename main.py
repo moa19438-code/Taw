@@ -309,6 +309,91 @@ def _build_entry_kb() -> Dict[str, Any]:
     }
 
 
+
+
+
+def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
+    auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
+    allow_resend = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "💰 رأس المال", "callback_data": "show_capital"},
+                {"text": "📦 حجم الصفقة", "callback_data": "show_position"},
+            ],
+            [
+                {"text": "📉 وقف الخسارة%", "callback_data": "show_sl"},
+                {"text": "📈 جني الربح%", "callback_data": "show_tp"},
+            ],
+            [
+                {"text": "🎛 عدد الفرص", "callback_data": "show_send"},
+                {"text": f"🔁 إعادة الإرسال إذا أقوى: {'نعم' if allow_resend else 'لا'}", "callback_data": "toggle_resend"},
+            ],
+            [
+                {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
+                {"text": "🕒 نافذة السوق", "callback_data": "show_window"},
+            ],
+            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+
+def _build_capital_kb() -> Dict[str, Any]:
+    presets = [300, 500, 800, 1000, 2000, 5000]
+    rows = []
+    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[3:]])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_position_kb() -> Dict[str, Any]:
+    # % of capital used per trade suggestion (manual trading)
+    presets = [0.10, 0.15, 0.20, 0.25, 0.30]
+    rows = []
+    rows.append([{"text": f"{int(p*100)}%", "callback_data": f"set_position:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"{int(p*100)}%", "callback_data": f"set_position:{p}"} for p in presets[3:]])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_sl_kb() -> Dict[str, Any]:
+    presets = [2, 3, 4, 5]
+    rows = []
+    rows.append([{"text": f"{p}%", "callback_data": f"set_sl:{p}"} for p in presets[:2]])
+    rows.append([{"text": f"{p}%", "callback_data": f"set_sl:{p}"} for p in presets[2:]])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_tp_kb() -> Dict[str, Any]:
+    # base TP for متوسط/ضعيف; قوي/قوي جداً use TP_PCT_STRONG / TP_PCT_VSTRONG
+    presets = [5, 6, 7, 8, 10]
+    rows = []
+    rows.append([{"text": f"{p}%", "callback_data": f"set_tp:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"{p}%", "callback_data": f"set_tp:{p}"} for p in presets[3:]])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_send_kb() -> Dict[str, Any]:
+    # min,max pairs
+    pairs = [(5, 7), (7, 10), (10, 15)]
+    rows = []
+    rows.append([{"text": f"{a}-{b}", "callback_data": f"set_send:{a}:{b}"} for a, b in pairs])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_window_kb() -> Dict[str, Any]:
+    # Common US market windows in Riyadh; you can change later
+    presets = [("17:30", "00:00"), ("17:30", "00:30"), ("16:30", "23:30")]
+    rows = []
+    for a, b in presets:
+        rows.append([{"text": f"{a}→{b}", "callback_data": f"set_window:{a}:{b}"}])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
 # ================= Core scan/notify logic =================
 def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, str]) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
@@ -468,8 +553,11 @@ def telegram_webhook():
             cur = _get_bool(settings, "AUTO_NOTIFY", True)
             set_setting("AUTO_NOTIFY", "0" if cur else "1")
             settings = _settings()
-            _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_menu(settings))
+            _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
             return jsonify({"ok": True})
+
+
+
 
         if action == "show_settings":
             s = _settings()
@@ -478,17 +566,99 @@ def telegram_webhook():
                 f"- الخطة: {_mode_label(_get_str(s,'PLAN_MODE','daily'))}\n"
                 f"- الدخول: {_entry_type_label(_get_str(s,'ENTRY_MODE','auto'))}\n"
                 f"- SL%: {_get_float(s,'SL_PCT',3.0)}\n"
-                f"- TP%: {_get_float(s,'TP_PCT',5.0)}\n"
+                f"- TP% (لضعيف/متوسط): {_get_float(s,'TP_PCT',5.0)}\n"
                 f"- TP قوي: {_get_float(s,'TP_PCT_STRONG',7.0)}\n"
                 f"- TP قوي جداً: {_get_float(s,'TP_PCT_VSTRONG',10.0)}\n"
                 f"- رأس المال: {_get_float(s,'CAPITAL_USD',800.0)}$\n"
                 f"- حجم الصفقة: {_get_float(s,'POSITION_PCT',0.20)*100:.0f}%\n"
-                f"- جديد فقط (منع تكرار): {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
+                f"- عدد الفرص: {_get_int(s,'MIN_SEND',7)} إلى {_get_int(s,'MAX_SEND',10)}\n"
+                f"- منع تكرار: {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
                 f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
                 f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
             )
-            _tg_send(str(chat_id), txt, reply_markup=_build_menu(s))
+            _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
             return jsonify({"ok": True})
+
+
+        if action == "show_capital":
+            _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=_build_capital_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_capital:"):
+            val = action.split(":", 1)[1]
+            set_setting("CAPITAL_USD", val)
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "show_position":
+            _tg_send(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_position:"):
+            val = action.split(":", 1)[1]
+            set_setting("POSITION_PCT", val)
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "show_sl":
+            _tg_send(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_sl:"):
+            val = action.split(":", 1)[1]
+            set_setting("SL_PCT", val)
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "show_tp":
+            _tg_send(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_tp:"):
+            val = action.split(":", 1)[1]
+            set_setting("TP_PCT", val)
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "show_send":
+            _tg_send(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_send:"):
+            parts = action.split(":")
+            if len(parts) == 3:
+                set_setting("MIN_SEND", parts[1])
+                set_setting("MAX_SEND", parts[2])
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "toggle_resend":
+            cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
+            set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
+            s = _settings()
+            _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+        if action == "show_window":
+            _tg_send(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_window:"):
+            parts = action.split(":")
+            if len(parts) == 3:
+                set_setting("WINDOW_START", parts[1])
+                set_setting("WINDOW_END", parts[2])
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+
+
+
 
         if action in ("do_analyze", "do_top"):
             settings = _settings()
