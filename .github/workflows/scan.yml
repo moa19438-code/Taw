@@ -1,0 +1,14 @@
+name: Market Scan Notify
+
+on:
+  schedule:
+    - cron: "*/20 * * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call scan endpoint
+        run: |
+          curl -s "${{ secrets.BASE_URL }}/scan?key=${{ secrets.RUN_KEY }}&notify=1"
