@@ -91,7 +91,8 @@ def place_bracket_order(
 
 # ===== Market Data =====
 def latest_trade(symbol: str) -> Dict[str, Any]:
-    return _get_data(f"/v2/stocks/{symbol}/trades/latest")
+    # add feed=iex to avoid SIP access errors on free plans
+    return _get_data(f"/v2/stocks/{symbol}/trades/latest", params={"feed": "iex"})
 
 
 def bars(
@@ -108,5 +109,7 @@ def bars(
         "end": end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
         "limit": limit,
         "adjustment": "raw",
+        # add feed=iex to avoid SIP access errors on free plans
+        "feed": "iex",
     }
     return _get_data("/v2/stocks/bars", params=params)
