@@ -2,13 +2,14 @@ name: Market Scan Notify
 
 on:
   schedule:
-    - cron: "*/20 * * * 1-5"
-  workflow_dispatch:
+    - cron: "*/20 2-9 * * 1-5"   # كل 20 دقيقة وقت السوق الأمريكي
+  workflow_dispatch:              # يسمح بالتشغيل اليدوي
 
 jobs:
-  ping:
+  scan:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Call scan endpoint
+      - name: Call Render Scan API
         run: |
-          curl -s "${{ secrets.BASE_URL }}/scan?key=${{ secrets.RUN_KEY }}&notify=1"
+          curl -s "https://taw-bot.onrender.com/scan?key=605d50054a03c428d1ed223426689f62&notify=1"
