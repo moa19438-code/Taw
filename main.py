@@ -1,6 +1,4 @@
 from __future__ import annotations
-import threading
-import asyncio
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify
@@ -9,29 +7,10 @@ from config import RUN_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ADMIN
 from storage import init_db, ensure_default_settings, last_orders, log_scan, last_scans
 from scanner import scan_universe_with_meta
 from executor import maybe_trade
-from telegram_bot import run_polling
 
 app = Flask(__name__)
 init_db()
 ensure_default_settings()
-
-
-# ================= TELEGRAM POLLING (اختياري) =================
-def _start_telegram_thread():
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    def _runner():
-        try:
-            asyncio.run(run_polling())
-        except Exception as e:
-            print("Telegram polling failed:", e)
-
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-
-
-_start_telegram_thread()
 
 
 # ================= TELEGRAM SEND =================
