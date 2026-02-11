@@ -39,6 +39,23 @@ def init_db() -> None:
                 value TEXT NOT NULL
             )"""
         )
+
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                strength TEXT NOT NULL,
+                score REAL,
+                entry REAL,
+                sl REAL,
+                tp REAL
+            )"""
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_mode ON signals(symbol, mode)")
+
         con.commit()
         con.commit()
 
@@ -90,6 +107,22 @@ def _env_defaults() -> Dict[str, str]:
             "RISK_PER_TRADE_PCT": str(config.RISK_PER_TRADE_PCT),
             "TP_R_MULT": str(config.TP_R_MULT),
             "SL_ATR_MULT": str(config.SL_ATR_MULT),
+            # Bot UI / manual-trading settings
+            "AUTO_NOTIFY": "1",
+            "MAX_SEND": "10",
+            "MIN_SEND": "7",
+            "DEDUP_HOURS": "6",
+            "ALLOW_RESEND_IF_STRONGER": "1",
+            "PLAN_MODE": "daily",  # daily|weekly|monthly|daily_weekly|weekly_monthly
+            "ENTRY_MODE": "auto",  # auto|market|limit
+            "CAPITAL_USD": "800",
+            "POSITION_PCT": "0.20",
+            "SL_PCT": "3",
+            "TP_PCT": "5",
+            "TP_PCT_STRONG": "7",
+            "TP_PCT_VSTRONG": "10",
+            "WINDOW_START": "17:30",
+            "WINDOW_END": "00:00",
         }
     except Exception:
         return {}
@@ -138,3 +171,37 @@ def parse_float(v: Any, default: float=0.0) -> float:
         return float(str(v).strip())
     except Exception:
         return default
+
+
+# ===== Signal logging for "send only new" notifications =====
+def log_signal(ts: str, symbol: str, mode: str, strength: str, score: float, entry: float, sl: float, tp: float) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO signals (ts, symbol, mode, strength, score, entry, sl, tp) VALUES (?,?,?,?,?,?,?,?)",
+            (ts, symbol, mode, strength, float(score), float(entry), float(sl), float(tp)),
+        )
+        con.commit()
+
+def last_signal(symbol: str, mode: str) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals WHERE symbol=? AND mode=? ORDER BY id DESC LIMIT 1",
+            (symbol, mode),
+        ).fetchone()
+        return dict(row) if row else None
+
+def signals_since(ts_iso: str, mode: Optional[str]=None) -> List[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        if mode:
+            rows = con.execute(
+                "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals WHERE ts>=? AND mode=? ORDER BY id DESC",
+                (ts_iso, mode),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals WHERE ts>=? ORDER BY id DESC",
+                (ts_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]

@@ -1,40 +1,423 @@
 from __future__ import annotations
+
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 from flask import Flask, request, jsonify
 
-from config import RUN_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL_ID, SEND_DAILY_SUMMARY
-from storage import init_db, ensure_default_settings, last_orders, log_scan, last_scans
-from scanner import scan_universe_with_meta
-from executor import maybe_trade
+from config import (
+    RUN_KEY,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    TELEGRAM_ADMIN_ID,
+    TELEGRAM_CHANNEL_ID,
+    SEND_DAILY_SUMMARY,
+    LOCAL_TZ,
+)
+from storage import (
+    init_db,
+    ensure_default_settings,
+    last_orders,
+    log_scan,
+    last_scans,
+    get_all_settings,
+    set_setting,
+    parse_int,
+    parse_float,
+    parse_bool,
+    last_signal,
+    log_signal,
+)
+from scanner import scan_universe_with_meta, Candidate
 
 app = Flask(__name__)
 init_db()
 ensure_default_settings()
 
 
-# ================= TELEGRAM SEND =================
-def _tg_send(chat_id: str, text: str) -> None:
+# ================= Telegram helpers =================
+def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     if not (TELEGRAM_BOT_TOKEN and chat_id):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=15)
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(url, json=payload, timeout=20)
     except Exception:
         pass
 
 
-def send_telegram(text: str) -> None:
-    """Send to channel + admin."""
+def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+    """Broadcast to channel (if set) and to admin DM (preferred)."""
     if TELEGRAM_CHANNEL_ID:
-        _tg_send(TELEGRAM_CHANNEL_ID, text)
+        _tg_send(TELEGRAM_CHANNEL_ID, text, reply_markup=reply_markup)
 
     admin_id = TELEGRAM_ADMIN_ID or TELEGRAM_CHAT_ID
     if admin_id:
-        _tg_send(admin_id, text)
+        _tg_send(admin_id, text, reply_markup=reply_markup)
 
 
-# ================= TELEGRAM WEBHOOK =================
+def _admin_id_int() -> int:
+    try:
+        return int(str(TELEGRAM_ADMIN_ID).strip()) if str(TELEGRAM_ADMIN_ID).strip() else 0
+    except Exception:
+        return 0
+
+
+def _is_admin(user_id: Optional[int]) -> bool:
+    aid = _admin_id_int()
+    if aid <= 0:
+        # If not configured, allow (but you should set TELEGRAM_ADMIN_ID in production)
+        return True
+    return int(user_id or 0) == aid
+
+
+# ================= Bot settings =================
+def _settings() -> Dict[str, str]:
+    return get_all_settings()
+
+
+def _get_str(settings: Dict[str, str], k: str, default: str) -> str:
+    v = settings.get(k)
+    return v if (v is not None and str(v).strip() != "") else default
+
+
+def _get_int(settings: Dict[str, str], k: str, default: int) -> int:
+    return parse_int(settings.get(k), default)
+
+
+def _get_float(settings: Dict[str, str], k: str, default: float) -> float:
+    return parse_float(settings.get(k), default)
+
+
+def _get_bool(settings: Dict[str, str], k: str, default: bool) -> bool:
+    return parse_bool(settings.get(k), default)
+
+
+# ================= Market window (Riyadh) =================
+def _now_local() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(LOCAL_TZ))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _parse_hhmm(s: str) -> Tuple[int, int]:
+    try:
+        hh, mm = s.strip().split(":")
+        return int(hh), int(mm)
+    except Exception:
+        return 0, 0
+
+
+def _within_notification_window(settings: Dict[str, str]) -> Tuple[bool, str]:
+    """
+    Window is in LOCAL_TZ (default Asia/Riyadh).
+    Supports ranges crossing midnight (e.g. 17:30 -> 00:00).
+    """
+    now = _now_local()
+
+    # Only weekdays (US market)
+    if now.weekday() >= 5:
+        return False, "Weekend"
+
+    start_s = _get_str(settings, "WINDOW_START", "17:30")
+    end_s = _get_str(settings, "WINDOW_END", "00:00")
+    sh, sm = _parse_hhmm(start_s)
+    eh, em = _parse_hhmm(end_s)
+
+    t = now.time()
+    start_t = t.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_t = t.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    if (sh, sm) == (eh, em):
+        return True, "Window: all day"
+
+    if (sh, sm) < (eh, em):
+        ok = (t >= start_t) and (t < end_t)
+    else:
+        # crosses midnight
+        ok = (t >= start_t) or (t < end_t)
+
+    return (ok, f"Window {start_s}-{end_s} {LOCAL_TZ}")
+
+
+# ================= Scoring -> strength =================
+_STRENGTH_RANK = {"ضعيف": 1, "متوسط": 2, "قوي": 3, "قوي جداً": 4}
+
+
+def _strength(score: float) -> str:
+    if score >= 8.5:
+        return "قوي جداً"
+    if score >= 7.0:
+        return "قوي"
+    if score >= 5.0:
+        return "متوسط"
+    return "ضعيف"
+
+
+def _mode_matches(c: Candidate, mode: str) -> bool:
+    mode = (mode or "daily").lower()
+    if mode == "daily":
+        return bool(c.daily_ok)
+    if mode == "weekly":
+        return bool(c.weekly_ok)
+    if mode == "monthly":
+        return bool(c.monthly_ok)
+    if mode == "daily_weekly":
+        return bool(c.daily_ok and c.weekly_ok)
+    if mode == "weekly_monthly":
+        return bool(c.weekly_ok and c.monthly_ok)
+    return bool(c.daily_ok)
+
+
+def _mode_label(mode: str) -> str:
+    m = (mode or "daily").lower()
+    return {
+        "daily": "يومي",
+        "weekly": "أسبوعي",
+        "monthly": "شهري",
+        "daily_weekly": "يومي + أسبوعي",
+        "weekly_monthly": "أسبوعي + شهري",
+    }.get(m, "يومي")
+
+
+def _entry_type_label(entry_mode: str) -> str:
+    em = (entry_mode or "auto").lower()
+    return {"auto": "تلقائي", "market": "سوق", "limit": "محدد"}.get(em, "تلقائي")
+
+
+def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any]:
+    """
+    Manual plan for Sahm:
+    - Entry price suggestion (default last_close)
+    - SL/TP percentages, with dynamic TP for strong signals
+    - Qty suggestion based on capital and position percent
+    """
+    entry = float(c.last_close)
+    sl_pct = _get_float(settings, "SL_PCT", 3.0)
+    tp_pct = _get_float(settings, "TP_PCT", 5.0)
+    tp_strong = _get_float(settings, "TP_PCT_STRONG", 7.0)
+    tp_vstrong = _get_float(settings, "TP_PCT_VSTRONG", 10.0)
+
+    st = _strength(float(c.score))
+    if st == "قوي جداً":
+        tp_pct_used = tp_vstrong
+    elif st == "قوي":
+        tp_pct_used = tp_strong
+    else:
+        tp_pct_used = tp_pct
+
+    sl = entry * (1.0 - (sl_pct / 100.0))
+    tp = entry * (1.0 + (tp_pct_used / 100.0))
+
+    capital = _get_float(settings, "CAPITAL_USD", 800.0)
+    pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
+
+    notional = max(0.0, capital * pos_pct)
+    qty = int(notional / max(entry, 0.01))
+    if qty < 1:
+        qty = 1
+
+    entry_mode = _get_str(settings, "ENTRY_MODE", "auto").lower()
+    return {
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp": round(tp, 2),
+        "qty": qty,
+        "sl_pct": sl_pct,
+        "tp_pct_used": tp_pct_used,
+        "entry_mode": entry_mode,
+    }
+
+
+def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any]) -> str:
+    strength = _strength(float(c.score))
+    entry_type = _entry_type_label(plan["entry_mode"])
+    # Sahm screen fields (Arabic, as requested)
+    return (
+        f"السهم: {c.symbol} | القوة: {strength} | Score: {c.score:.1f}\n"
+        f"العملية: شراء\n"
+        f"النوع: {entry_type}\n"
+        f"السعر: {plan['entry']}\n"
+        f"الكمية: {plan['qty']}\n"
+        f"الأمر المرفق: جني الربح/وقف الخسارة\n"
+        f"جني الربح:\n"
+        f"  سعر الإيقاف: {plan['tp']}\n"
+        f"  سعر الأمر: {plan['tp']}\n"
+        f"وقف الخسارة:\n"
+        f"  سعر الإيقاف: {plan['sl']}\n"
+        f"  سعر الأمر: {plan['sl']}\n"
+        f"تاريخ الاستحقاق: {mode_label}\n"
+        f"ملاحظة: {c.notes}\n"
+    )
+
+
+def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
+    mode = _get_str(settings, "PLAN_MODE", "daily")
+    entry = _get_str(settings, "ENTRY_MODE", "auto")
+    auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔎 Analyze الآن", "callback_data": "do_analyze"},
+                {"text": "⭐ Top", "callback_data": "do_top"},
+            ],
+            [
+                {"text": f"📆 الخطة: {_mode_label(mode)}", "callback_data": "show_modes"},
+                {"text": f"🎯 الدخول: {_entry_type_label(entry)}", "callback_data": "show_entry"},
+            ],
+            [
+                {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
+                {"text": "⚙️ الإعدادات", "callback_data": "show_settings"},
+            ],
+        ]
+    }
+
+
+def _build_modes_kb() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "يومي", "callback_data": "set_mode:daily"},
+                {"text": "أسبوعي", "callback_data": "set_mode:weekly"},
+                {"text": "شهري", "callback_data": "set_mode:monthly"},
+            ],
+            [
+                {"text": "يومي+أسبوعي", "callback_data": "set_mode:daily_weekly"},
+                {"text": "أسبوعي+شهري", "callback_data": "set_mode:weekly_monthly"},
+            ],
+            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+
+def _build_entry_kb() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "تلقائي", "callback_data": "set_entry:auto"},
+                {"text": "سوق", "callback_data": "set_entry:market"},
+                {"text": "محدد", "callback_data": "set_entry:limit"},
+            ],
+            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+
+# ================= Core scan/notify logic =================
+def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, str]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Returns:
+      - blocks: list[str] formatted for Telegram
+      - logged: list of dicts (symbol, strength, score, entry, sl, tp)
+    """
+    mode = _get_str(settings, "PLAN_MODE", "daily").lower()
+    dedup_hours = _get_int(settings, "DEDUP_HOURS", 6)
+    allow_resend_stronger = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
+    max_send = _get_int(settings, "MAX_SEND", 10)
+    min_send = _get_int(settings, "MIN_SEND", 7)
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=dedup_hours)
+
+    mode_label = _mode_label(mode)
+
+    # filter + sort
+    candidates = [c for c in picks if _mode_matches(c, mode)]
+    candidates.sort(key=lambda x: x.score, reverse=True)
+
+    blocks: List[str] = []
+    logged: List[Dict[str, Any]] = []
+
+    for c in candidates:
+        if len(blocks) >= max_send:
+            break
+
+        st = _strength(float(c.score))
+        last = last_signal(c.symbol, mode)
+        should_send = False
+
+        if not last:
+            should_send = True
+        else:
+            # check time
+            try:
+                last_ts = datetime.fromisoformat(str(last["ts"]).replace("Z", "+00:00"))
+            except Exception:
+                last_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+            if last_ts < cutoff:
+                should_send = True
+            else:
+                if allow_resend_stronger:
+                    prev_rank = _STRENGTH_RANK.get(str(last.get("strength")), 0)
+                    cur_rank = _STRENGTH_RANK.get(st, 0)
+                    if cur_rank > prev_rank:
+                        should_send = True
+
+        if not should_send:
+            continue
+
+        plan = _compute_trade_plan(settings, c)
+        blocks.append(_format_sahm_block(mode_label, c, plan))
+        logged.append({
+            "symbol": c.symbol,
+            "strength": st,
+            "score": float(c.score),
+            "entry": float(plan["entry"]),
+            "sl": float(plan["sl"]),
+            "tp": float(plan["tp"]),
+            "mode": mode,
+        })
+
+    # ensure at least min_send if possible (even if repeats blocked by dedup)
+    if len(blocks) < min_send:
+        # fill remaining with highest-ranked not already chosen (but still avoid duplicates within this message)
+        chosen = {d["symbol"] for d in logged}
+        for c in candidates:
+            if len(blocks) >= min_send:
+                break
+            if c.symbol in chosen:
+                continue
+            plan = _compute_trade_plan(settings, c)
+            st = _strength(float(c.score))
+            blocks.append(_format_sahm_block(mode_label, c, plan))
+            logged.append({
+                "symbol": c.symbol,
+                "strength": st,
+                "score": float(c.score),
+                "entry": float(plan["entry"]),
+                "sl": float(plan["sl"]),
+                "tp": float(plan["tp"]),
+                "mode": mode,
+            })
+
+    # persist
+    ts = now_utc.isoformat()
+    for d in logged:
+        log_signal(ts, d["symbol"], d["mode"], d["strength"], d["score"], d["entry"], d["sl"], d["tp"])
+
+    return blocks, logged
+
+
+def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
+    picks, universe_size = scan_universe_with_meta()
+    blocks, _ = _select_and_log_new_candidates(picks, settings)
+
+    if not blocks:
+        return "❌ لا توجد فرص جديدة الآن.", universe_size
+
+    header = f"📊 فرص جديدة ({_mode_label(_get_str(settings,'PLAN_MODE','daily'))})\n"
+    msg = header + "\n\n".join(blocks)
+    return msg, universe_size
+
+
+# ================= Telegram webhook =================
 @app.post("/webhook")
 def telegram_webhook():
     if not TELEGRAM_BOT_TOKEN:
@@ -42,55 +425,127 @@ def telegram_webhook():
 
     data = request.get_json(force=True)
 
+    # Handle button clicks
+    cb = data.get("callback_query")
+    if cb:
+        user_id = cb.get("from", {}).get("id")
+        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        action = (cb.get("data") or "").strip()
+
+        if not _is_admin(user_id):
+            _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+            return jsonify({"ok": True})
+
+        settings = _settings()
+
+        if action == "menu":
+            _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        if action == "show_modes":
+            _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_mode:"):
+            mode = action.split(":", 1)[1]
+            set_setting("PLAN_MODE", mode)
+            settings = _settings()
+            _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        if action == "show_entry":
+            _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
+            return jsonify({"ok": True})
+
+        if action.startswith("set_entry:"):
+            entry = action.split(":", 1)[1]
+            set_setting("ENTRY_MODE", entry)
+            settings = _settings()
+            _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        if action == "toggle_notify":
+            cur = _get_bool(settings, "AUTO_NOTIFY", True)
+            set_setting("AUTO_NOTIFY", "0" if cur else "1")
+            settings = _settings()
+            _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        if action == "show_settings":
+            s = _settings()
+            txt = (
+                "⚙️ الإعدادات الحالية:\n"
+                f"- الخطة: {_mode_label(_get_str(s,'PLAN_MODE','daily'))}\n"
+                f"- الدخول: {_entry_type_label(_get_str(s,'ENTRY_MODE','auto'))}\n"
+                f"- SL%: {_get_float(s,'SL_PCT',3.0)}\n"
+                f"- TP%: {_get_float(s,'TP_PCT',5.0)}\n"
+                f"- TP قوي: {_get_float(s,'TP_PCT_STRONG',7.0)}\n"
+                f"- TP قوي جداً: {_get_float(s,'TP_PCT_VSTRONG',10.0)}\n"
+                f"- رأس المال: {_get_float(s,'CAPITAL_USD',800.0)}$\n"
+                f"- حجم الصفقة: {_get_float(s,'POSITION_PCT',0.20)*100:.0f}%\n"
+                f"- جديد فقط (منع تكرار): {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
+                f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
+                f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
+            )
+            _tg_send(str(chat_id), txt, reply_markup=_build_menu(s))
+            return jsonify({"ok": True})
+
+        if action in ("do_analyze", "do_top"):
+            settings = _settings()
+            _tg_send(str(chat_id), "🔎 جاري الفحص...")
+            try:
+                msg, _ = _run_scan_and_build_message(settings)
+                send_telegram(msg)
+            except Exception as e:
+                _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+            return jsonify({"ok": True})
+
+        # Unknown action
+        _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
+        return jsonify({"ok": True})
+
+    # Handle normal messages
     message = data.get("message") or data.get("channel_post")
     if not message:
         return jsonify({"ok": True})
 
     chat_id = message["chat"]["id"]
     user_id = message.get("from", {}).get("id")
-    text = message.get("text", "")
+    text = (message.get("text") or "").strip()
 
-    # تم تعطيل شرط الأدمن مؤقتًا للاختبار
-    # if TELEGRAM_ADMIN_ID and user_id != TELEGRAM_ADMIN_ID:
-    #     _tg_send(chat_id, "⛔ هذا البوت للأدمن فقط. راجع TELEGRAM_ADMIN_ID في Render.")
-    #     return jsonify({"ok": True})
-
-    # ===== /start =====
-    if text.startswith("/start"):
-        _tg_send(chat_id, "🤖 البوت شغال.\nاستخدم /analyze لفحص السوق.")
+    if not _is_admin(user_id):
+        # Ignore silently for channels, but reply in private
+        if str(message.get("chat", {}).get("type")) == "private":
+            _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
         return jsonify({"ok": True})
 
-    # ===== /analyze =====
+    settings = _settings()
+
+    if text.startswith("/start"):
+        _tg_send(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
+        return jsonify({"ok": True})
+
+    if text.startswith("/menu"):
+        _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+        return jsonify({"ok": True})
+
     if text.startswith("/analyze"):
-        _tg_send(chat_id, "🔎 جاري فحص السوق...")
-
+        _tg_send(str(chat_id), "🔎 جاري الفحص...")
         try:
-            picks, universe_size = scan_universe_with_meta()
-
-            if not picks:
-                msg = "❌ لا توجد فرص اليوم."
-            else:
-                top = picks[0]
-                msg = (
-                    f"📊 أفضل سهم اليوم:\n"
-                    f"{top.symbol}\n"
-                    f"السعر: {top.last_close}\n"
-                    f"ATR: {top.atr:.2f}\n"
-                    f"Score: {top.score}\n"
-                    f"ملاحظات: {top.notes}"
-                )
-
+            msg, _ = _run_scan_and_build_message(settings)
             send_telegram(msg)
-
         except Exception as e:
-            _tg_send(chat_id, f"❌ خطأ أثناء الفحص:\n{e}")
+            _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+        return jsonify({"ok": True})
 
+    if text.startswith("/settings"):
+        _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})
 
 
-# ================= API ROUTES =================
+# ================= API routes =================
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "us-stocks-scanner-executor"})
@@ -100,7 +555,6 @@ def home():
 def status():
     if request.args.get("key") != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-
     return jsonify({
         "ok": True,
         "orders_logged": len(last_orders(200)),
@@ -110,26 +564,53 @@ def status():
 
 @app.get("/scan")
 def scan():
+    """
+    Used by:
+      - Manual testing: /scan?key=RUN_KEY
+      - Render cron: /scan?key=RUN_KEY&notify=1
+    """
     if request.args.get("key") != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
+    settings = _settings()
+
+    # Log scan (always)
     picks, universe_size = scan_universe_with_meta()
-
-    picks_payload = [
-        {"symbol": c.symbol, "score": c.score, "last_close": c.last_close, "atr": c.atr, "notes": c.notes}
-        for c in picks
-    ]
-
+    top_syms = ",".join([c.symbol for c in picks[:20]])
     ts = datetime.now(timezone.utc).isoformat()
-    top_syms = ",".join([c.symbol for c in picks])
     log_scan(ts, universe_size, top_syms, payload="http:/scan")
 
-    trade_logs = maybe_trade([{"symbol": c.symbol, "last_close": c.last_close, "atr": c.atr} for c in picks[:5]])
+    notify = request.args.get("notify") == "1"
 
-    if request.args.get("notify") == "1":
-        send_telegram(f"Scan done (universe={universe_size}). Top: {top_syms}\n" + "\n".join(trade_logs))
+    sent = False
+    sent_reason = ""
 
-    return jsonify({"ok": True, "universe_size": universe_size, "top": picks_payload, "trade_logs": trade_logs})
+    if notify and _get_bool(settings, "AUTO_NOTIFY", True):
+        ok, reason = _within_notification_window(settings)
+        if ok:
+            try:
+                blocks, logged = _select_and_log_new_candidates(picks, settings)
+                if blocks:
+                    msg = f"📊 فرص جديدة ({_mode_label(_get_str(settings,'PLAN_MODE','daily'))})\n" + "\n\n".join(blocks)
+                    send_telegram(msg)
+                    sent = True
+                    sent_reason = f"sent {len(logged)}"
+                else:
+                    sent_reason = "no new"
+            except Exception as e:
+                sent_reason = f"error: {e}"
+        else:
+            sent_reason = reason
+    else:
+        sent_reason = "notify=0 or AUTO_NOTIFY=OFF"
+
+    return jsonify({
+        "ok": True,
+        "universe_size": universe_size,
+        "top": [{"symbol": c.symbol, "score": c.score, "last_close": c.last_close, "notes": c.notes} for c in picks[:10]],
+        "notify": notify,
+        "notify_status": {"sent": sent, "reason": sent_reason},
+    })
 
 
 @app.get("/daily")
@@ -156,7 +637,6 @@ def daily():
             msg_lines.append(f"- {o['symbol']} {o['side']} qty={o['qty']} {o['status']}")
 
     msg = "\n".join(msg_lines)
-
     if SEND_DAILY_SUMMARY or request.args.get("notify") == "1":
         send_telegram(msg)
 

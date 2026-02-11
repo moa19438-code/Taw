@@ -21,6 +21,9 @@ class Candidate:
     rsi14: float
     trend: str
     notes: str
+    daily_ok: bool
+    weekly_ok: bool
+    monthly_ok: bool
 
 def _chunks(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i+n] for i in range(0, len(lst), n)]
@@ -74,6 +77,7 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                 continue
             s20 = sma(closes, 20)
             s50 = sma(closes, 50)
+            s100 = sma(closes, 100)
             s200 = sma(closes, 200)
             r14 = rsi(closes, 14)
             a14 = atr(highs, lows, closes, 14)
@@ -122,6 +126,11 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                 if gap > 0.12:
                     score -= 1.5
                     notes.append("Big gap")
+
+            daily_ok = bool(s20 > s50)
+            weekly_ok = bool((s200 is not None) and (s50 is not None) and (s50 > s200) and (last > s200))
+            monthly_ok = bool((s200 is not None) and (s100 is not None) and (s100 > s200) and (last > s200))
+
             results.append(Candidate(
                 symbol=sym,
                 score=score,
@@ -130,7 +139,10 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                 atr=a14,
                 rsi14=r14,
                 trend=trend,
-                notes=", ".join(notes)
+                notes=", ".join(notes),
+                daily_ok=daily_ok,
+                weekly_ok=weekly_ok,
+                monthly_ok=monthly_ok
             ))
     results.sort(key=lambda x: x.score, reverse=True)
     settings = get_all_settings()

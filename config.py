@@ -38,7 +38,7 @@ MIN_PRICE = env_float("MIN_PRICE", 2.0)
 MAX_PRICE = env_float("MAX_PRICE", 250.0)
 MIN_AVG_DOLLAR_VOL = env_float("MIN_AVG_DOLLAR_VOL", 2_000_000.0)
 LOOKBACK_DAYS = env_int("LOOKBACK_DAYS", 60)
-TOP_N = env_int("TOP_N", 5)
+TOP_N = env_int("TOP_N", 80)  # return enough candidates; bot will send 7-10
 
 # Execution / risk
 BROKER = os.getenv("BROKER", "alpaca")  # only alpaca supported here
@@ -73,3 +73,7 @@ BLOCK_IF_ORDER_OPEN = env_bool('BLOCK_IF_ORDER_OPEN', True)
 
 # Reporting
 SEND_DAILY_SUMMARY = env_bool('SEND_DAILY_SUMMARY', False)
+
+# Local timezone (used for scheduled notifications)
+LOCAL_TZ = os.getenv('LOCAL_TZ', 'Asia/Riyadh')
+
