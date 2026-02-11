@@ -12,7 +12,7 @@ from config import (
 )
 from alpaca_client import account, place_bracket_order, clock, positions, open_orders, bars
 from indicators import sma
-from storage import log_order, last_orders
+from storage import log_order, last_orders, get_all_settings, parse_bool, parse_int, parse_float
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).date().isoformat()
@@ -120,7 +120,13 @@ def compute_qty(equity: float, last_price: float, atr: float) -> float:
 
 def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
     logs: List[str] = []
-    if not AUTO_TRADE:
+    settings = get_all_settings()
+    auto_trade = parse_bool(settings.get('AUTO_TRADE'), AUTO_TRADE)
+    max_daily = parse_int(settings.get('MAX_DAILY_TRADES'), MAX_DAILY_TRADES)
+    risk_pct = parse_float(settings.get('risk_pct'), risk_pct)
+    tp_r = parse_float(settings.get('tp_r'), tp_r)
+    sl_atr_mult = parse_float(settings.get('sl_atr_mult'), sl_atr_mult)
+    if not auto_trade:
         return ["AUTO_TRADE=false (scan only)"]
 
     if not (EXECUTE_TRADES and ALLOW_LIVE_TRADING):
@@ -140,14 +146,14 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
         return [f"Blocked by market filter: {mkt_reason}"]
     logs.append(mkt_reason)
 
-    if _count_today_orders() >= MAX_DAILY_TRADES:
+    if _count_today_orders() >= max_daily:
         return [f"Daily limit reached ({MAX_DAILY_TRADES})"]
 
     acct = account()
     equity = float(acct.get("equity", 0.0))
 
     for p in picks:
-        if _count_today_orders() >= MAX_DAILY_TRADES:
+        if _count_today_orders() >= max_daily:
             logs.append("Stopped: daily limit reached")
             break
 
@@ -168,9 +174,9 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
             continue
 
         side = "buy"  # Long-only
-        stop_price = max(last_price - (atr * SL_ATR_MULT), 0.01)
+        stop_price = max(last_price - (atr * sl_atr_mult), 0.01)
         r = last_price - stop_price
-        take_profit = last_price + (r * TP_R_MULT)
+        take_profit = last_price + (r * tp_r)
 
         payload = {
             "symbol": sym,

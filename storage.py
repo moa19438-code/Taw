@@ -32,6 +32,14 @@ def init_db() -> None:
             )"""
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts)")
+        
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"""
+        )
+        con.commit()
         con.commit()
 
 def log_order(symbol: str, side: str, qty: float, order_type: str, payload: str, broker_order_id: Optional[str], status: str, message: str) -> None:
@@ -69,3 +77,64 @@ def last_scans(limit: int = 50) -> List[Dict[str, Any]]:
     for ts, usize, syms, payload in rows:
         out.append({"ts": ts, "universe_size": usize, "top_symbols": syms, "payload": payload})
     return out
+
+
+def _env_defaults() -> Dict[str, str]:
+    """Defaults written once (if missing) at startup."""
+    try:
+        import config
+        return {
+            "TOP_N": str(config.TOP_N),
+            "AUTO_TRADE": str(int(config.AUTO_TRADE)),
+            "MAX_DAILY_TRADES": str(config.MAX_DAILY_TRADES),
+            "RISK_PER_TRADE_PCT": str(config.RISK_PER_TRADE_PCT),
+            "TP_R_MULT": str(config.TP_R_MULT),
+            "SL_ATR_MULT": str(config.SL_ATR_MULT),
+        }
+    except Exception:
+        return {}
+
+def ensure_default_settings() -> None:
+    defaults = _env_defaults()
+    if not defaults:
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        for k, v in defaults.items():
+            con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+        con.commit()
+
+def get_setting(key: str, default: Optional[str]=None) -> Optional[str]:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+def set_setting(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        con.commit()
+
+def get_all_settings() -> Dict[str, str]:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("SELECT key,value FROM settings")
+        return {k: v for k, v in cur.fetchall()}
+
+def parse_bool(v: Any, default: bool=False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1","true","yes","y","on")
+
+def parse_int(v: Any, default: int=0) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+def parse_float(v: Any, default: float=0.0) -> float:
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default

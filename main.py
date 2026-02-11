@@ -5,14 +5,15 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify
 
-from config import RUN_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEND_DAILY_SUMMARY
-from storage import init_db, last_orders, log_scan, last_scans
+from config import RUN_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL_ID, SEND_DAILY_SUMMARY, EXECUTE_TRADES, ALLOW_LIVE_TRADING
+from storage import init_db, ensure_default_settings, last_orders, log_scan, last_scans
 from scanner import scan_universe_with_meta
 from executor import maybe_trade
 from telegram_bot import run_polling
 
 app = Flask(__name__)
 init_db()
+ensure_default_settings()
 
 def _start_telegram_thread():
     if not TELEGRAM_BOT_TOKEN:
@@ -27,14 +28,24 @@ def _start_telegram_thread():
 
 _start_telegram_thread()
 
-def send_telegram(text: str) -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def _tg_send(chat_id: str, text: str) -> None:
+    if not (TELEGRAM_BOT_TOKEN and chat_id):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=15)
     except Exception:
         pass
+
+def send_telegram(text: str) -> None:
+    """Broadcasts to channel (if set) and to admin DM (if set)."""
+    # Channel broadcast
+    if TELEGRAM_CHANNEL_ID:
+        _tg_send(TELEGRAM_CHANNEL_ID, text)
+    # Admin DM (preferred). Fallback to legacy TELEGRAM_CHAT_ID if provided.
+    admin_id = TELEGRAM_ADMIN_ID or TELEGRAM_CHAT_ID
+    if admin_id:
+        _tg_send(admin_id, text)
 
 @app.get("/")
 def home():
@@ -76,7 +87,7 @@ def scan():
     log_scan(ts, universe_size, top_syms, payload="http:/scan")
 
     # Optional trading on top 3
-    trade_logs = maybe_trade([{"symbol": c.symbol, "last_close": c.last_close, "atr": c.atr} for c in picks[:3]])
+    trade_logs = maybe_trade([{"symbol": c.symbol, "last_close": c.last_close, "atr": c.atr} for c in picks[:5]])
 
     # Optional push
     if request.args.get("notify") == "1":

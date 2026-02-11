@@ -22,7 +22,9 @@ RUN_KEY = os.getenv("RUN_KEY", "CHANGE_ME")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # legacy (admin DM chat id)
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")  # numeric user id; commands allowed only in private chat
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # @channelusername or numeric chat id for broadcasts
 
 # Alpaca
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
@@ -35,7 +37,7 @@ MIN_PRICE = env_float("MIN_PRICE", 2.0)
 MAX_PRICE = env_float("MAX_PRICE", 250.0)
 MIN_AVG_DOLLAR_VOL = env_float("MIN_AVG_DOLLAR_VOL", 2_000_000.0)
 LOOKBACK_DAYS = env_int("LOOKBACK_DAYS", 60)
-TOP_N = env_int("TOP_N", 12)
+TOP_N = env_int("TOP_N", 5)
 
 # Execution / risk
 BROKER = os.getenv("BROKER", "alpaca")  # only alpaca supported here

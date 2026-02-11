@@ -39,7 +39,7 @@ Recommended (scanner):
 - `MAX_PRICE=250`
 - `MIN_AVG_DOLLAR_VOL=2000000` (2M)
 - `LOOKBACK_DAYS=60`
-- `TOP_N=12`
+- `TOP_N=5`
 
 Risk & execution:
 - `BROKER=alpaca`
@@ -62,3 +62,22 @@ Risk & execution:
 - `/status` show status
 - `/orders` show last orders
 - `/help`
+
+
+## Telegram: channel broadcasts + private control
+
+Set these env vars:
+
+- `TELEGRAM_CHANNEL_ID` = `@your_channel_username` (or numeric chat id). Bot will post scan results + summaries here.
+- `TELEGRAM_ADMIN_ID` = your numeric Telegram user id. Only this user can run commands, and only in **private chat**.
+
+Legacy: `TELEGRAM_CHAT_ID` can still be used as a fallback admin id, but `TELEGRAM_ADMIN_ID` is recommended.
+
+### Quick commands (admin DM only)
+- `/analyze` — scan the US universe and post the picks to the channel
+- `/config` — show live settings (stored in SQLite) + safety latches
+- `/trade_on` / `/trade_off` — toggle AUTO_TRADE in DB (execution still requires env safety latches)
+- `/risk 0.25` — set risk per trade percent
+- `/max 2` — set max daily trades
+- `/top 5` — set how many picks to post (TOP_N)
+

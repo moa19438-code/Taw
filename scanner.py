@@ -9,6 +9,7 @@ from config import (
 )
 from alpaca_client import list_assets, bars
 from indicators import sma, rsi, atr
+from storage import get_all_settings, parse_int, parse_float
 
 @dataclass
 class Candidate:
@@ -35,7 +36,9 @@ def build_universe() -> List[str]:
         if "." in sym or "/" in sym:
             continue
         syms.append(sym)
-    return syms[:UNIVERSE_MAX]
+    settings = get_all_settings()
+    umax = parse_int(settings.get('UNIVERSE_MAX'), UNIVERSE_MAX)
+    return syms[:umax]
 
 def scan_universe() -> List[Candidate]:
     symbols = build_universe()
@@ -130,4 +133,6 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                 notes=", ".join(notes)
             ))
     results.sort(key=lambda x: x.score, reverse=True)
-    return results[:TOP_N]
+    settings = get_all_settings()
+    top_n = parse_int(settings.get('TOP_N'), TOP_N)
+    return results[:max(1, top_n)]
