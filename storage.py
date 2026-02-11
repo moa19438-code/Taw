@@ -39,6 +39,15 @@ def init_db() -> None:
                 value TEXT NOT NULL
             )"""
         )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS user_state (
+                chat_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            )"""
+
+        )
 
         con.execute(
             """CREATE TABLE IF NOT EXISTS signals (
@@ -114,9 +123,13 @@ def _env_defaults() -> Dict[str, str]:
             "DEDUP_HOURS": "6",
             "ALLOW_RESEND_IF_STRONGER": "1",
             "PLAN_MODE": "daily",  # daily|weekly|monthly|daily_weekly|weekly_monthly
-            "SCAN_MODE": "mixed",  # breakout|pullback|mixed
             "ENTRY_MODE": "auto",  # auto|market|limit
             "CAPITAL_USD": "800",
+            "RISK_APLUS_PCT": "1.5",
+            "RISK_A_PCT": "1.0",
+            "RISK_B_PCT": "0.5",
+            "SCAN_INTERVAL_MIN": "20",
+            "SCHED_ENABLED": "1",
             "POSITION_PCT": "0.20",
             "SL_PCT": "3",
             "TP_PCT": "5",
@@ -206,3 +219,23 @@ def signals_since(ts_iso: str, mode: Optional[str]=None) -> List[Dict[str, Any]]
                 (ts_iso,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+# ===== Per-chat UI state (for button-driven custom input) =====
+def set_user_state(chat_id: str, key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO user_state(chat_id, key, value) VALUES(?,?,?) ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value",
+            (str(chat_id), str(key), str(value)),
+        )
+        con.commit()
+
+def get_user_state(chat_id: str, key: str, default: str='') -> str:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("SELECT value FROM user_state WHERE chat_id=? AND key=?", (str(chat_id), str(key)))
+        row = cur.fetchone()
+        return str(row[0]) if row else default
+
+def clear_user_state(chat_id: str, key: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM user_state WHERE chat_id=? AND key=?", (str(chat_id), str(key)))
+        con.commit()

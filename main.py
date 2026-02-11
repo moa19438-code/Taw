@@ -4,8 +4,10 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-import os
 import requests
+import atexit
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
 
 from config import (
@@ -35,29 +37,7 @@ from scanner import scan_universe_with_meta, Candidate
 
 app = Flask(__name__)
 init_db()
-
-# ================= رسائل عربية =================
-def _fmt_summary_ar(meta: Dict[str, Any]) -> str:
-    return (
-        '⏱ انتهى الفحص — لا توجد فرص جديدة\n\n'
-        f"حجم الكون: {meta.get('universe', 0)}\n"
-        f"تم فحص: {meta.get('checked', 0)}\n"
-        f"بيانات ناقصة: {meta.get('missing_data', 0)}\n"
-        f"مستبعدة (سعر): {meta.get('filtered_price', 0)}\n"
-        f"مستبعدة (سيولة): {meta.get('filtered_liquidity', 0)}\n"
-        f"مرشحين: {meta.get('candidates', 0)}\n"
-    )
-
-
 ensure_default_settings()
-
-# إرسال رسالة عند تشغيل الخدمة (اختياري)
-try:
-    if os.getenv('STARTUP_NOTIFY','1') == '1':
-        # قد تُرسل أكثر من مرة عند تعدد workers في gunicorn، لذلك يمكن إيقافها بتعيين STARTUP_NOTIFY=0
-        pass
-except Exception:
-    pass
 
 
 # ================= Telegram helpers =================
@@ -216,44 +196,72 @@ def _entry_type_label(entry_mode: str) -> str:
 
 def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any]:
     """
-    Manual plan for Sahm:
-    - Entry price suggestion (default last_close)
-    - SL/TP percentages, with dynamic TP for strong signals
-    - Qty suggestion based on capital and position percent
+    خطة يدوية لتطبيق Sahm (ATR):
+    - الدخول: سعر الإغلاق الأخير
+    - وقف الخسارة: ATR * SL_ATR_MULT تحت الدخول
+    - جني الربح: (المخاطرة R) * TP_R_MULT فوق الدخول
+    - الكمية: حسب رأس المال والمخاطرة المتغيرة A+/A/B
     """
     entry = float(c.last_close)
-    sl_pct = _get_float(settings, "SL_PCT", 3.0)
-    tp_pct = _get_float(settings, "TP_PCT", 5.0)
-    tp_strong = _get_float(settings, "TP_PCT_STRONG", 7.0)
-    tp_vstrong = _get_float(settings, "TP_PCT_VSTRONG", 10.0)
 
+    # إعدادات ATR
+    sl_atr_mult = _get_float(settings, "SL_ATR_MULT", 2.0)
+    tp_r_mult = _get_float(settings, "TP_R_MULT", 2.0)
+
+    atr_val = float(getattr(c, "atr", 0.0) or 0.0)
+    if atr_val <= 0:
+        # fallback
+        atr_val = max(entry * 0.01, 0.5)
+
+    sl = max(0.01, entry - (atr_val * sl_atr_mult))
+    risk_per_share = max(entry - sl, 0.01)
+    tp = entry + (risk_per_share * tp_r_mult)
+
+    # تصنيف (A+/A/B) حسب القوة
     st = _strength(float(c.score))
     if st == "قوي جداً":
-        tp_pct_used = tp_vstrong
+        grade = "A+"
+        risk_pct = _get_float(settings, "RISK_APLUS_PCT", 1.5)
     elif st == "قوي":
-        tp_pct_used = tp_strong
+        grade = "A"
+        risk_pct = _get_float(settings, "RISK_A_PCT", 1.0)
     else:
-        tp_pct_used = tp_pct
-
-    sl = entry * (1.0 - (sl_pct / 100.0))
-    tp = entry * (1.0 + (tp_pct_used / 100.0))
+        grade = "B"
+        risk_pct = _get_float(settings, "RISK_B_PCT", 0.5)
 
     capital = _get_float(settings, "CAPITAL_USD", 800.0)
-    pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
+    risk_amount = max(1.0, capital * (risk_pct / 100.0))
 
-    notional = max(0.0, capital * pos_pct)
-    qty = int(notional / max(entry, 0.01))
-    if qty < 1:
-        qty = 1
+    qty_risk = int(risk_amount / risk_per_share)
+    if qty_risk < 1:
+        qty_risk = 1
+
+    # حد أقصى لحجم الصفقة (كنسبة من رأس المال)
+    pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
+    max_notional = max(0.0, capital * pos_pct)
+    qty_cap = int(max_notional / max(entry, 0.01)) if max_notional > 0 else qty_risk
+    if qty_cap < 1:
+        qty_cap = 1
+
+    qty = max(1, min(qty_risk, qty_cap))
 
     entry_mode = _get_str(settings, "ENTRY_MODE", "auto").lower()
+
+    rr = (tp - entry) / max(entry - sl, 0.01)
+
     return {
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
-        "qty": qty,
-        "sl_pct": sl_pct,
-        "tp_pct_used": tp_pct_used,
+        "qty": int(qty),
+        "atr": round(atr_val, 2),
+        "sl_atr_mult": sl_atr_mult,
+        "tp_r_mult": tp_r_mult,
+        "risk_pct": round(risk_pct, 2),
+        "risk_amount": round(risk_amount, 2),
+        "risk_per_share": round(risk_per_share, 2),
+        "rr": round(rr, 2),
+        "grade": grade,
         "entry_mode": entry_mode,
     }
 
@@ -263,11 +271,11 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any]) -> s
     entry_type = _entry_type_label(plan["entry_mode"])
     # Sahm screen fields (Arabic, as requested)
     return (
-        f"السهم: {c.symbol} | القوة: {strength} | Score: {c.score:.1f}\n"
+        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}\n"
         f"العملية: شراء\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
-        f"الكمية: {plan['qty']}\n"
+        f"الكمية: {plan['qty']}\n"f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
         f"جني الربح:\n"
         f"  سعر الإيقاف: {plan['tp']}\n"
@@ -287,8 +295,8 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {"text": "🔎 Analyze الآن", "callback_data": "do_analyze"},
-                {"text": "⭐ Top", "callback_data": "do_top"},
+                {"text": "🔎 تحليل الآن", "callback_data": "do_analyze"},
+                {"text": "⭐ أفضل الفرص", "callback_data": "do_top"},
             ],
             [
                 {"text": f"📆 الخطة: {_mode_label(mode)}", "callback_data": "show_modes"},
@@ -342,6 +350,10 @@ def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
         "inline_keyboard": [
             [
                 {"text": "💰 رأس المال", "callback_data": "show_capital"},
+                {"text": "⚖️ المخاطرة", "callback_data": "show_risk"},
+            ],
+            [
+                {"text": "⏱️ وقت الفحص", "callback_data": "show_interval"},
                 {"text": "📦 حجم الصفقة", "callback_data": "show_position"},
             ],
             [
@@ -361,11 +373,38 @@ def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
-def _build_capital_kb() -> Dict[str, Any]:
-    presets = [300, 500, 800, 1000, 2000, 5000]
-    rows = []
-    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[3:]])
+
+def _build_risk_kb(settings: Dict[str, str]) -> Dict[str, Any]:
+    presets = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    aplus = _get_float(settings, "RISK_APLUS_PCT", 1.5)
+    a = _get_float(settings, "RISK_A_PCT", 1.0)
+    b = _get_float(settings, "RISK_B_PCT", 0.5)
+
+    rows: List[List[Dict[str, str]]] = []
+    rows.append([
+        {"text": f"A+ = {aplus}%", "callback_data": "noop"},
+        {"text": f"A = {a}%", "callback_data": "noop"},
+        {"text": f"B = {b}%", "callback_data": "noop"},
+    ])
+
+    rows.append([{"text": f"A+ {p}%", "callback_data": f"set_risk_aplus:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"A+ {p}%", "callback_data": f"set_risk_aplus:{p}"} for p in presets[3:]])
+    rows.append([{"text": f"A {p}%", "callback_data": f"set_risk_a:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"A {p}%", "callback_data": f"set_risk_a:{p}"} for p in presets[3:]])
+    rows.append([{"text": f"B {p}%", "callback_data": f"set_risk_b:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"B {p}%", "callback_data": f"set_risk_b:{p}"} for p in presets[3:]])
+
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
+
+
+def _build_interval_kb(settings: Dict[str, str]) -> Dict[str, Any]:
+    presets = [10, 15, 20, 30, 60]
+    cur = _get_int(settings, "SCAN_INTERVAL_MIN", 20)
+    rows: List[List[Dict[str, str]]] = []
+    rows.append([{"text": f"الحالي: {cur} دقيقة", "callback_data": "noop"}])
+    rows.append([{"text": f"{p} دقيقة", "callback_data": f"set_interval:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"{p} دقيقة", "callback_data": f"set_interval:{p}"} for p in presets[3:]])
     rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
     return {"inline_keyboard": rows}
 
@@ -514,8 +553,7 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
 
 
 def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
-    picks, meta = scan_universe_with_meta()
-    universe_size = int(meta.get('universe', 0))
+    picks, universe_size = scan_universe_with_meta()
     blocks, _ = _select_and_log_new_candidates(picks, settings)
 
     if not blocks:
@@ -769,8 +807,7 @@ def scan():
     settings = _settings()
 
     # Log scan (always)
-    picks, meta = scan_universe_with_meta()
-    universe_size = int(meta.get('universe', 0))
+    picks, universe_size = scan_universe_with_meta()
     top_syms = ",".join([c.symbol for c in picks[:20]])
     ts = datetime.now(timezone.utc).isoformat()
     log_scan(ts, universe_size, top_syms, payload="http:/scan")
@@ -847,3 +884,59 @@ def _parse_dt(s: str) -> datetime:
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+
+# ================= Scheduler (بديل GitHub Actions) =================
+_scheduler: Optional[BackgroundScheduler] = None
+
+def _fmt_scan_summary_ar(settings: Dict[str, str], universe_size: int, picks: List[Candidate]) -> str:
+    mode = _get_str(settings, "PLAN_MODE", "daily")
+    return (
+        "⏱ انتهى الفحص — لا توجد فرص جديدة\n\n"
+        f"الخطة: {_mode_label(mode)}\n"
+        f"حجم الكون: {universe_size}\n"
+        f"عدد النتائج: {len(picks)}\n"
+        f"وقت الرياض: {_now_local().strftime('%H:%M')}\n"
+    )
+
+def _run_scan_and_notify(force_summary: bool=True) -> None:
+    s = _settings()
+    if not _get_bool(s, "SCHED_ENABLED", True):
+        return
+    ok, _ = _within_notification_window(s)
+    if not ok:
+        return
+
+    picks, universe_size = scan_universe_with_meta()
+    if not _get_bool(s, "AUTO_NOTIFY", True):
+        return
+
+    blocks, _logged = _select_and_log_new_candidates(picks, s)
+    if blocks:
+        for b in blocks:
+            send_telegram(b)
+    elif force_summary:
+        send_telegram(_fmt_scan_summary_ar(s, universe_size, picks))
+
+def _start_scheduler() -> None:
+    global _scheduler
+    if _scheduler is not None:
+        return
+    s = _settings()
+    interval = _get_int(s, "SCAN_INTERVAL_MIN", 20)
+    _scheduler = BackgroundScheduler(timezone=LOCAL_TZ)
+    _scheduler.add_job(
+        _run_scan_and_notify,
+        IntervalTrigger(minutes=max(5, interval)),
+        kwargs={"force_summary": True},
+        id="scan_job",
+        replace_existing=True,
+    )
+    _scheduler.start()
+    atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler else None)
+
+try:
+    if os.getenv("ENABLE_SCHEDULER", "1") == "1":
+        _start_scheduler()
+except Exception:
+    pass
