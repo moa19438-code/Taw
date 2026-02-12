@@ -57,6 +57,67 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
     results: List[Candidate] = []
+    def get_symbol_features(symbol: str) -> Dict[str, Any]:
+    """
+    Fetches recent bars for a single symbol and returns a feature dict
+    suitable for AI analysis.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
+
+    data = bars([symbol], start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
+    bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
+    blist = bars_by_symbol.get(symbol) or []
+    if len(blist) < 30:
+        return {"error": "Not enough bars"}
+
+    closes = [float(b["c"]) for b in blist if "c" in b]
+    highs  = [float(b["h"]) for b in blist if "h" in b]
+    lows   = [float(b["l"]) for b in blist if "l" in b]
+    vols   = [float(b["v"]) for b in blist if "v" in b]
+    if len(closes) < 30:
+        return {"error": "Not enough data"}
+
+    last = closes[-1]
+    s20 = sma(closes, 20)
+    s50 = sma(closes, 50)
+    s100 = sma(closes, 100)
+    s200 = sma(closes, 200)
+    r14 = rsi(closes, 14)
+    a14 = atr(highs, lows, closes, 14)
+
+    atr_pct = (a14 / last) if (a14 and last) else None
+    hi20 = max(highs[-20:]) if len(highs) >= 20 else None
+    vavg20 = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
+    vol_spike = (vavg20 and vols[-1] >= 1.5 * vavg20) if (vavg20 and len(vols) > 0) else False
+
+    notes = []
+    if s20 is not None and s50 is not None and s20 > s50:
+        notes.append("SMA20>SMA50")
+    if s200 is not None and last > s200:
+        notes.append("Above SMA200")
+    if r14 is not None:
+        notes.append(f"RSI {r14:.0f}")
+    if atr_pct is not None:
+        notes.append(f"ATR% {atr_pct*100:.1f}")
+    if hi20 is not None and last >= 0.98 * hi20:
+        notes.append("Near 20D high")
+    if vol_spike:
+        notes.append("Vol spike")
+
+    return {
+        "price": round(last, 4),
+        "SMA20": round(s20, 4) if s20 is not None else None,
+        "SMA50": round(s50, 4) if s50 is not None else None,
+        "SMA100": round(s100, 4) if s100 is not None else None,
+        "SMA200": round(s200, 4) if s200 is not None else None,
+        "RSI14": round(r14, 2) if r14 is not None else None,
+        "ATR14": round(a14, 4) if a14 is not None else None,
+        "ATR%": round(atr_pct * 100, 2) if atr_pct is not None else None,
+        "Near 20D high": bool(hi20 is not None and last >= 0.98 * hi20),
+        "Vol spike": bool(vol_spike),
+        "notes": ", ".join(notes),
+    }
     for batch in _chunks(symbols, SYMBOL_BATCH):
         data = bars(batch, start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
         bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
