@@ -12,6 +12,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
+from ai_analyzer import gemini_analyze
 
 from config import (
     RUN_KEY,
@@ -36,7 +37,7 @@ from storage import (
     last_signal,
     log_signal,
 )
-from scanner import scan_universe_with_meta, Candidate
+from scanner import scan_universe_with_meta, Candidate, get_symbol_features
 
 app = Flask(__name__)
 
