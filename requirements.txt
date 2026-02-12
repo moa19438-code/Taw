@@ -5,3 +5,4 @@ python-telegram-bot==21.6
 pytz==2024.1
 APScheduler==3.10.4
 psycopg[binary]==3.2.13
+google-genai
