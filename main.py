@@ -722,6 +722,26 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
 
+
+            if action == "show_notify_route":
+                _tg_send(str(chat_id), "📨 اختر وجهة التنبيهات:", reply_markup=_build_notify_route_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_notify_route:"):
+                route = action.split(":", 1)[1].strip().lower()
+                if route not in ("dm", "group", "both"):
+                    route = "dm"
+                set_setting("NOTIFY_ROUTE", route)
+                settings = _settings()
+                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
+                return jsonify({"ok": True})
+
+            if action == "toggle_silent":
+                cur = _get_bool(settings, "NOTIFY_SILENT", True)
+                set_setting("NOTIFY_SILENT", "0" if cur else "1")
+                settings = _settings()
+                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
+                return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
                 txt = (
@@ -888,12 +908,6 @@ def telegram_webhook():
 
                 _run_async(_job)
                 return jsonify({"ok": True})
-                
-                if cb:
-    msg = cb.get("message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    action = (cb.get("data") or "").strip()
 
             # Unknown action
             _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
