@@ -873,6 +873,28 @@ def telegram_webhook():
                     _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
             _run_async(_job)
             return jsonify({"ok": True})
+                    if text.startswith("/ai"):
+            parts = text.split()
+            if len(parts) < 2:
+                _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
+                return jsonify({"ok": True})
+
+            symbol = parts[1].upper().strip()
+            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
+
+            def _job_ai():
+                try:
+                    feats = get_symbol_features(symbol)
+                    if feats.get("error"):
+                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}")
+                        return
+                    ai_text = gemini_analyze(symbol, feats)
+                    _tg_send(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
+
+            _run_async(_job_ai)
+            return jsonify({"ok": True})
 
         if text.startswith("/settings"):
             _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
