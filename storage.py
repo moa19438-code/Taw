@@ -9,13 +9,13 @@ DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 IS_POSTGRES = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
 
 if IS_POSTGRES:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+    import psycopg
+    from psycopg.rows import dict_row
 
 
 def _pg_connect():
     # DATABASE_URL لازم يكون فيه ?sslmode=require
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db() -> None:
@@ -83,7 +83,7 @@ def init_db() -> None:
             con.commit()
         return
 
-    # SQLite fallback (زي كودك تقريبًا)
+    # SQLite fallback (زي كودك)
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
             """CREATE TABLE IF NOT EXISTS scans (
@@ -173,9 +173,9 @@ def log_order(symbol: str, side: str, qty: float, order_type: str, payload: str,
 def last_orders(limit: int = 20) -> List[Dict[str, Any]]:
     if IS_POSTGRES:
         with _pg_connect() as con:
-            with con.cursor(cursor_factory=RealDictCursor) as cur:
+            with con.cursor(row_factory=dict_row) as cur:
                 cur.execute("SELECT * FROM orders ORDER BY id DESC LIMIT %s", (limit,))
-                return [dict(r) for r in cur.fetchall()]
+                return cur.fetchall()
 
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -205,12 +205,12 @@ def log_scan(ts: str, universe_size: int, top_symbols: str, payload: str = "") -
 def last_scans(limit: int = 50) -> List[Dict[str, Any]]:
     if IS_POSTGRES:
         with _pg_connect() as con:
-            with con.cursor(cursor_factory=RealDictCursor) as cur:
+            with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     "SELECT ts, universe_size, top_symbols, payload FROM scans ORDER BY id DESC LIMIT %s",
                     (limit,),
                 )
-                return [dict(r) for r in cur.fetchall()]
+                return cur.fetchall()
 
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
@@ -272,8 +272,7 @@ def ensure_default_settings() -> None:
             with con.cursor() as cur:
                 for k, v in defaults.items():
                     cur.execute(
-                        "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                        "ON CONFLICT(key) DO NOTHING",
+                        "INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING",
                         (k, v),
                     )
             con.commit()
@@ -304,8 +303,7 @@ def set_setting(key: str, value: str) -> None:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                    "INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                     (key, value),
                 )
             con.commit()
@@ -313,8 +311,7 @@ def set_setting(key: str, value: str) -> None:
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
         con.commit()
@@ -379,14 +376,14 @@ def log_signal(ts: str, symbol: str, mode: str, strength: str, score: float, ent
 def last_signal(symbol: str, mode: str) -> Optional[Dict[str, Any]]:
     if IS_POSTGRES:
         with _pg_connect() as con:
-            with con.cursor(cursor_factory=RealDictCursor) as cur:
+            with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals "
                     "WHERE symbol=%s AND mode=%s ORDER BY id DESC LIMIT 1",
                     (symbol, mode),
                 )
                 row = cur.fetchone()
-                return dict(row) if row else None
+                return row if row else None
 
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -400,7 +397,7 @@ def last_signal(symbol: str, mode: str) -> Optional[Dict[str, Any]]:
 def signals_since(ts_iso: str, mode: Optional[str] = None) -> List[Dict[str, Any]]:
     if IS_POSTGRES:
         with _pg_connect() as con:
-            with con.cursor(cursor_factory=RealDictCursor) as cur:
+            with con.cursor(row_factory=dict_row) as cur:
                 if mode:
                     cur.execute(
                         "SELECT ts, symbol, mode, strength, score, entry, sl, tp FROM signals "
@@ -413,7 +410,7 @@ def signals_since(ts_iso: str, mode: Optional[str] = None) -> List[Dict[str, Any
                         "WHERE ts>=%s ORDER BY id DESC",
                         (ts_iso,),
                     )
-                return [dict(r) for r in cur.fetchall()]
+                return cur.fetchall()
 
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
