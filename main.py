@@ -289,7 +289,9 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any]) -> s
         f"العملية: شراء\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
-        f"الكمية: {plan['qty']}\n"f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
+        f"الكمية: {plan['qty']}\n"
+        f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"
+        f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
         f"جني الربح:\n"
         f"  سعر الإيقاف: {plan['tp']}\n"
@@ -432,6 +434,7 @@ def _build_capital_kb() -> Dict[str, Any]:
     rows.append([{"text": "✍️ قيمة مخصصة", "callback_data": "set_capital_custom"}])
     rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
     return {"inline_keyboard": rows}
+
 def _build_position_kb() -> Dict[str, Any]:
     # % of capital used per trade suggestion (manual trading)
     presets = [0.10, 0.15, 0.20, 0.25, 0.30]
@@ -642,9 +645,6 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
 
-
-
-
             if action == "show_settings":
                 s = _settings()
                 txt = (
@@ -664,7 +664,6 @@ def telegram_webhook():
                 )
                 _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
-
 
             if action == "show_capital":
                 reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
@@ -750,11 +749,6 @@ def telegram_webhook():
                 _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
-
-
-
-
-
             if action == "noop":
                 return jsonify({"ok": True})
 
@@ -807,12 +801,14 @@ def telegram_webhook():
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
                 _tg_send(str(chat_id), "⏳ جاري التحليل...")
+
                 def _job():
                     try:
                         msg, _ = _run_scan_and_build_message(settings)
                         send_telegram(msg)
                     except Exception as e:
                         _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+
                 _run_async(_job)
                 return jsonify({"ok": True})
 
@@ -863,17 +859,21 @@ def telegram_webhook():
             _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
+
         if text.startswith("/analyze"):
             _tg_send(str(chat_id), "⏳ جاري التحليل...")
+
             def _job():
                 try:
                     msg, _ = _run_scan_and_build_message(settings)
                     send_telegram(msg)
                 except Exception as e:
                     _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+
             _run_async(_job)
             return jsonify({"ok": True})
-                    if text.startswith("/ai"):
+
+        if text.startswith("/ai"):
             parts = text.split()
             if len(parts) < 2:
                 _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
@@ -885,10 +885,10 @@ def telegram_webhook():
             def _job_ai():
                 try:
                     feats = get_symbol_features(symbol)
-                    if feats.get("error"):
+                    if isinstance(feats, dict) and feats.get("error"):
                         _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}")
                         return
-                    ai_text = gemini_analyze(symbol, feats)
+                    ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
                     _tg_send(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
                 except Exception as e:
                     _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
@@ -902,12 +902,12 @@ def telegram_webhook():
 
         return jsonify({"ok": True})
 
-
-
     except Exception:
         print('WEBHOOK ERROR:')
         print(traceback.format_exc())
         return jsonify({"ok": True})
+
+
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "us-stocks-scanner-executor"})
