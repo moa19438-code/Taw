@@ -40,6 +40,10 @@ from scanner import scan_universe_with_meta, Candidate
 
 app = Flask(__name__)
 
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "service": "taw-bot"})
+
 # ===== تنفيذ مهام ثقيلة بدون تعطيل webhook =====
 def _run_async(fn, *args, **kwargs):
     t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
