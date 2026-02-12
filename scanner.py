@@ -53,15 +53,16 @@ def scan_universe_with_meta() -> Tuple[List[Candidate], int]:
     picks = scan_universe_from_symbols(symbols)
     return picks, len(symbols)
 
-def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
-    results: List[Candidate] = []
-    def get_symbol_features(symbol: str) -> Dict[str, Any]:
+def get_symbol_features(symbol: str) -> Dict[str, Any]:
+    """Fetch recent daily bars for one symbol and compute features for AI analysis.
+
+    Returns a dict of numeric indicators + a short notes string.
+    If data is insufficient, returns {"error": "..."}.
     """
-    Fetches recent bars for a single symbol and returns a feature dict
-    suitable for AI analysis.
-    """
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return {"error": "Empty symbol"}
+
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
 
@@ -71,11 +72,11 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     if len(blist) < 30:
         return {"error": "Not enough bars"}
 
-    closes = [float(b["c"]) for b in blist if "c" in b]
-    highs  = [float(b["h"]) for b in blist if "h" in b]
-    lows   = [float(b["l"]) for b in blist if "l" in b]
-    vols   = [float(b["v"]) for b in blist if "v" in b]
-    if len(closes) < 30:
+    closes = [float(b.get("c", 0)) for b in blist if "c" in b]
+    highs  = [float(b.get("h", 0)) for b in blist if "h" in b]
+    lows   = [float(b.get("l", 0)) for b in blist if "l" in b]
+    vols   = [float(b.get("v", 0)) for b in blist if "v" in b]
+    if len(closes) < 30 or len(highs) < 30 or len(lows) < 30:
         return {"error": "Not enough data"}
 
     last = closes[-1]
@@ -89,7 +90,7 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     atr_pct = (a14 / last) if (a14 and last) else None
     hi20 = max(highs[-20:]) if len(highs) >= 20 else None
     vavg20 = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
-    vol_spike = (vavg20 and vols[-1] >= 1.5 * vavg20) if (vavg20 and len(vols) > 0) else False
+    vol_spike = bool(vavg20 and vols[-1] >= 1.5 * vavg20)
 
     notes = []
     if s20 is not None and s50 is not None and s20 > s50:
@@ -118,6 +119,12 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
         "Vol spike": bool(vol_spike),
         "notes": ", ".join(notes),
     }
+
+
+def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
+    results: List[Candidate] = []
     for batch in _chunks(symbols, SYMBOL_BATCH):
         data = bars(batch, start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
         bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
