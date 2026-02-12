@@ -9,7 +9,7 @@ from config import (
 )
 from alpaca_client import list_assets, bars
 from indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
-from storage import get_all_settings, parse_int, parse_float
+from storage import get_all_settings, parse_int, parse_float, get_watchlist
 
 @dataclass
 class Candidate:
@@ -29,6 +29,14 @@ def _chunks(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i+n] for i in range(0, len(lst), n)]
 
 def build_universe() -> List[str]:
+
+    # Optional: use manual watchlist only (set USE_WATCHLIST=1 in settings table)
+    s = get_all_settings()
+    use_wl = str(s.get('USE_WATCHLIST','0')).strip().lower() in ('1','true','yes','y','on')
+    wl = get_watchlist() if use_wl else []
+    if wl:
+        return wl
+
     assets = list_assets(limit=5000)
     syms = []
     for a in assets:

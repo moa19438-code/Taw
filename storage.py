@@ -57,6 +57,13 @@ def init_db() -> None:
                 """)
 
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS watchlist (
+                        symbol TEXT PRIMARY KEY,
+                        added_ts TEXT
+                    );
+                """)
+
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS user_state (
                         chat_id TEXT NOT NULL,
                         key TEXT NOT NULL,
@@ -116,6 +123,13 @@ def init_db() -> None:
             """CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )"""
+        )
+
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS watchlist (
+                symbol TEXT PRIMARY KEY,
+                added_ts TEXT
             )"""
         )
 
@@ -603,4 +617,48 @@ def clear_user_state(chat_id: str, key: str) -> None:
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute("DELETE FROM user_state WHERE chat_id=? AND key=?", (str(chat_id), str(key)))
+        con.commit()
+
+
+# ===== Watchlist (manual symbols) =====
+def get_watchlist() -> List[str]:
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT symbol FROM watchlist ORDER BY symbol")
+                return [r[0] for r in cur.fetchall()]
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("SELECT symbol FROM watchlist ORDER BY symbol")
+        return [r[0] for r in cur.fetchall()]
+
+def add_watchlist(symbol: str) -> None:
+    sym = (symbol or '').strip().upper()
+    if not sym:
+        return
+    ts = datetime.utcnow().isoformat()
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO watchlist(symbol, added_ts) VALUES(%s,%s) ON CONFLICT(symbol) DO NOTHING",
+                    (sym, ts),
+                )
+            con.commit()
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT OR IGNORE INTO watchlist(symbol,added_ts) VALUES(?,?)", (sym, ts))
+        con.commit()
+
+def remove_watchlist(symbol: str) -> None:
+    sym = (symbol or '').strip().upper()
+    if not sym:
+        return
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("DELETE FROM watchlist WHERE symbol=%s", (sym,))
+            con.commit()
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM watchlist WHERE symbol=?", (sym,))
         con.commit()

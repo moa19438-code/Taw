@@ -19,6 +19,7 @@ from ai_filter import should_alert
 from ml_model import parse_weights, dumps_weights, featurize, predict_prob, update_online
 from executor import trade_symbol
 from alpaca_client import bars
+from backtesting import run_backtest_symbol
 
 from config import (
     RUN_KEY,
@@ -343,6 +344,9 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
         "rr": round(rr, 2),
         "grade": grade,
         "entry_mode": entry_mode,
+        "ml_prob": None,
+        "ev_r": None,
+
     }
 
 
@@ -351,7 +355,7 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
     entry_type = _entry_type_label(plan["entry_mode"])
     # Sahm screen fields (Arabic, as requested)
     return (
-        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}" + (f" | AI: {ai_score}/100" if ai_score is not None else "") + "\n"
+        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}" + (f" | AI: {ai_score}/100" if ai_score is not None else "") + (f" | ML: {int(round(float(plan.get('ml_prob') or 0)*100))}%" if plan.get('ml_prob') is not None else "") + (f" | EV(R): {float(plan.get('ev_r')):.2f}" if plan.get('ev_r') is not None else "") + "\n"
         f"العملية: شراء\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
@@ -637,6 +641,18 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 continue
 
         plan = _compute_trade_plan(settings, c)
+        # ML probability / expected value (اختياري)
+        try:
+            if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
+                w = parse_weights(settings.get("ML_WEIGHTS") or "")
+                x = featurize(_ai_features)
+                p = float(predict_prob(w, x))
+                plan["ml_prob"] = round(p, 4)
+                # Expected value in R units: p*TP_R - (1-p)*1R
+                tp_r = float(plan.get("tp_r_mult") or 0.0)
+                plan["ev_r"] = round((p * tp_r) - ((1.0 - p) * 1.0), 3)
+        except Exception:
+            pass
         blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
         logged.append({
             "symbol": c.symbol,
@@ -667,6 +683,16 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                     continue
 
             plan = _compute_trade_plan(settings, c)
+            try:
+                if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
+                    w = parse_weights(settings.get("ML_WEIGHTS") or "")
+                    x = featurize(_ai_features)
+                    p = float(predict_prob(w, x))
+                    plan["ml_prob"] = round(p, 4)
+                    tp_r = float(plan.get("tp_r_mult") or 0.0)
+                    plan["ev_r"] = round((p * tp_r) - ((1.0 - p) * 1.0), 3)
+            except Exception:
+                pass
             st = _strength(float(c.score))
             blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
             logged.append({
@@ -1003,6 +1029,32 @@ def telegram_webhook():
         if text.startswith("/menu"):
             _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
+
+        if text.startswith("/wl"):
+            parts = text.strip().split()
+            if len(parts) == 1 or (len(parts) >= 2 and parts[1].lower() in ("list","show")):
+                wl = get_watchlist()
+                if not wl:
+                    _tg_send(str(chat_id), "📌 الـ Watchlist فاضي.\nاستخدم: /wl add TSLA")
+                    return jsonify({"ok": True})
+                _tg_send(str(chat_id), "📌 Watchlist:\n" + "\n".join(wl))
+                return jsonify({"ok": True})
+
+            if len(parts) >= 3 and parts[1].lower() in ("add","+"):
+                sym = parts[2].upper()
+                add_watchlist(sym)
+                _tg_send(str(chat_id), f"✅ تم إضافة {sym} للـ Watchlist.")
+                return jsonify({"ok": True})
+
+            if len(parts) >= 3 and parts[1].lower() in ("del","remove","rm","-"):
+                sym = parts[2].upper()
+                remove_watchlist(sym)
+                _tg_send(str(chat_id), f"✅ تم حذف {sym} من الـ Watchlist.")
+                return jsonify({"ok": True})
+
+            _tg_send(str(chat_id), "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
+            return jsonify({"ok": True})
+
 
 
         if text.startswith("/analyze"):
@@ -1466,3 +1518,207 @@ try:
         _start_scheduler()
 except Exception:
     pass
+
+# ================= Dashboard (simple UI) =================
+_DASH_TEMPLATE = """<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Taw Bot Dashboard</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:16px; background:#0b1220; color:#e6e8ee}
+    a{color:#8ab4ff}
+    .card{background:#121a2b; border:1px solid #1f2a44; border-radius:12px; padding:14px; margin:12px 0}
+    .row{display:flex; gap:12px; flex-wrap:wrap}
+    .kpi{min-width:220px; flex:1}
+    input,select,button{padding:10px; border-radius:10px; border:1px solid #2b3a61; background:#0b1220; color:#e6e8ee}
+    button{cursor:pointer}
+    table{width:100%; border-collapse:collapse; font-size:14px}
+    th,td{padding:8px; border-bottom:1px solid #1f2a44; text-align:right}
+    .muted{opacity:.8}
+  </style>
+</head>
+<body>
+  <h2>لوحة التحكم - Taw Bot</h2>
+  <div class="muted">هذه لوحة خفيفة (بدون قاعدة بيانات إضافية). كل شيء يُجلب من نفس الخدمة.</div>
+
+  <div class="card row" id="kpis"></div>
+
+  <div class="card">
+    <h3>آخر الإشارات</h3>
+    <div id="signals"></div>
+  </div>
+
+  <div class="card">
+    <h3>Backtest (تجربة تاريخية)</h3>
+    <div class="row">
+      <input id="bt_symbol" placeholder="رمز السهم (مثال: AAPL)" value="AAPL"/>
+      <select id="bt_days">
+        <option value="365">365 يوم</option>
+        <option value="730">سنتين</option>
+        <option value="1095">3 سنوات</option>
+      </select>
+      <button onclick="runBacktest()">تشغيل</button>
+    </div>
+    <pre id="bt_out" style="white-space:pre-wrap"></pre>
+  </div>
+
+<script>
+const KEY = new URLSearchParams(window.location.search).get('key') || '';
+
+async function getJSON(path){
+  const r = await fetch(path + (path.includes('?')?'&':'?') + 'key=' + encodeURIComponent(KEY));
+  return await r.json();
+}
+
+function esc(s){ return (s||'').toString().replace(/[&<>]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function load(){
+  const sum = await getJSON('/api/summary');
+  const k = document.getElementById('kpis');
+  const items = [
+    ['الوضع', esc(sum.mode||'')],
+    ['AUTO_TRADE', esc(sum.auto_trade)],
+    ['CAPITAL_USD', esc(sum.capital_usd)],
+    ['إشارات (آخر 7 أيام)', esc(sum.signals_7d)],
+    ['Winrate (آخر 100)', esc(sum.winrate_100)],
+  ];
+  k.innerHTML = items.map(([a,b])=>`<div class="kpi card"><div class="muted">${a}</div><div style="font-size:20px;margin-top:6px">${b}</div></div>`).join('');
+
+  const sig = await getJSON('/api/signals?limit=20');
+  const div = document.getElementById('signals');
+  if(!sig.items || !sig.items.length){
+    div.innerHTML = '<div class="muted">لا يوجد بيانات.</div>';
+    return;
+  }
+  const rows = sig.items.map(x=>`
+    <tr>
+      <td>${esc(x.ts)}</td><td>${esc(x.symbol)}</td><td>${esc(x.mode)}</td><td>${esc(x.strength)}</td>
+      <td>${esc(x.entry)}</td><td>${esc(x.sl)}</td><td>${esc(x.tp)}</td>
+      <td>${x.ml_prob!=null ? Math.round(x.ml_prob*100)+'%' : ''}</td>
+      <td>${x.ev_r!=null ? x.ev_r.toFixed(2) : ''}</td>
+    </tr>`).join('');
+  div.innerHTML = `<table>
+    <thead><tr><th>الوقت</th><th>السهم</th><th>الخطة</th><th>القوة</th><th>دخول</th><th>وقف</th><th>هدف</th><th>ML</th><th>EV(R)</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function runBacktest(){
+  const sym = (document.getElementById('bt_symbol').value||'').trim();
+  const days = parseInt(document.getElementById('bt_days').value||'365',10);
+  const out = document.getElementById('bt_out');
+  out.textContent = '...';
+  const res = await getJSON('/api/backtest?symbol=' + encodeURIComponent(sym) + '&days=' + days);
+  out.textContent = JSON.stringify(res, null, 2);
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+@app.get("/dashboard")
+def dashboard():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return ("unauthorized", 401)
+    return _DASH_TEMPLATE
+
+@app.get("/api/summary")
+def api_summary():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"error":"unauthorized"}), 401
+    s = _settings()
+    mode = _get_str(s, "PLAN_MODE", "daily")
+    # count signals in last 7d from DB (best-effort)
+    items = last_signals(limit=100) or []
+    signals_7d = 0
+    try:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=7)
+        for it in items:
+            try:
+                ts = datetime.fromisoformat(str(it.get("ts")).replace("Z","+00:00"))
+                if ts >= cutoff:
+                    signals_7d += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # winrate last 100 (requires evaluated results if available; fallback using pnl if present)
+    wins=0; n=0
+    for it in items:
+        # if storage has "outcome" fields in the future, handle; else skip
+        o = (it.get("outcome") or "").lower()
+        if o:
+            n += 1
+            if o in ("tp","win","profit"):
+                wins += 1
+    winrate_100 = (wins/n) if n else None
+
+    return jsonify({
+        "mode": mode,
+        "auto_trade": _get_bool(s, "AUTO_TRADE", False),
+        "capital_usd": _get_float(s, "CAPITAL_USD", 800.0),
+        "signals_7d": signals_7d,
+        "winrate_100": winrate_100,
+    })
+
+@app.get("/api/signals")
+def api_signals():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"error":"unauthorized"}), 401
+    limit = int(request.args.get("limit") or 50)
+    items = last_signals(limit=limit) or []
+    # attach ml_prob/ev_r if present in reasons/features payloads
+    out=[]
+    for it in items:
+        try:
+            feat = json.loads(it.get("features") or "{}") if isinstance(it.get("features"), str) else (it.get("features") or {})
+        except Exception:
+            feat={}
+        ml_prob = None
+        ev_r = None
+        # if we stored these in reasons json in future, ignore; here compute if ai features exist
+        if ML_ENABLED and feat:
+            try:
+                w = parse_weights((_settings().get("ML_WEIGHTS") or ""))
+                x = featurize(feat)
+                ml_prob = float(predict_prob(w, x))
+                tp_r = float(_get_float(_settings(), "TP_R_MULT", 1.8))
+                ev_r = (ml_prob*tp_r) - ((1-ml_prob)*1.0)
+            except Exception:
+                pass
+        out.append({
+            "ts": it.get("ts"),
+            "symbol": it.get("symbol"),
+            "mode": it.get("mode"),
+            "strength": it.get("strength"),
+            "entry": it.get("entry"),
+            "sl": it.get("sl"),
+            "tp": it.get("tp"),
+            "ml_prob": ml_prob,
+            "ev_r": ev_r,
+        })
+    return jsonify({"items": out})
+
+@app.get("/api/backtest")
+def api_backtest():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"error":"unauthorized"}), 401
+    symbol = (request.args.get("symbol") or "").strip().upper()
+    days = int(request.args.get("days") or 365)
+    s = _settings()
+    capital = float(_get_float(s, "CAPITAL_USD", 10000.0))
+    risk = float(_get_float(s, "RISK_A_PCT", 1.0))
+    sl_atr = float(_get_float(s, "SL_ATR_MULT", 1.5))
+    tp_r = float(_get_float(s, "TP_R_MULT", 1.8))
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    res = run_backtest_symbol(symbol, start, end, capital=capital, risk_per_trade_pct=risk, sl_atr_mult=sl_atr, tp_r_mult=tp_r)
+    return jsonify(res)

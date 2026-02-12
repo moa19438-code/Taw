@@ -81,3 +81,14 @@ Legacy: `TELEGRAM_CHAT_ID` can still be used as a fallback admin id, but `TELEGR
 - `/max 2` — set max daily trades
 - `/top 5` — set how many picks to post (TOP_N)
 
+
+
+## ✅ الدمج (Enhanced + Watchlist)
+- تم دمج ميزة الـ Watchlist من النسخة الأخرى.
+- لتفعيل المسح على الـ Watchlist فقط: اكتب في قاعدة البيانات settings: USE_WATCHLIST=1.
+- أو اتركها 0 لمسح السوق كامل.
+
+### أوامر تيليجرام الجديدة
+- `/wl` عرض الـ Watchlist
+- `/wl add TSLA` إضافة
+- `/wl del TSLA` حذف
