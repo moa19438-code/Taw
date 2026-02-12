@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import atexit
+import traceback
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
@@ -36,6 +38,12 @@ from storage import (
 from scanner import scan_universe_with_meta, Candidate
 
 app = Flask(__name__)
+
+# ===== تنفيذ مهام ثقيلة بدون تعطيل webhook =====
+def _run_async(fn, *args, **kwargs):
+    t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+    t.start()
+
 init_db()
 ensure_default_settings()
 
@@ -567,10 +575,16 @@ def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
 # ================= Telegram webhook =================
 @app.post("/webhook")
 def telegram_webhook():
-    if not TELEGRAM_BOT_TOKEN:
+    try:
+        if not TELEGRAM_BOT_TOKEN:
+            return jsonify({"ok": True})
+
+    except Exception:
+        print("WEBHOOK ERROR:")
+        print(traceback.format_exc())
         return jsonify({"ok": True})
 
-    data = request.get_json(force=True)
+        data = request.get_json(silent=True) or {}
 
     # Handle button clicks
     cb = data.get("callback_query")
@@ -643,7 +657,14 @@ def telegram_webhook():
 
 
         if action == "show_capital":
-            _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=_build_capital_kb())
+            reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
+            _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
+            return jsonify({"ok": True})
+
+        if action == "set_capital_custom":
+            from storage import set_user_state
+            set_user_state(str(chat_id), "pending", "capital")
+            _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
             return jsonify({"ok": True})
 
         if action.startswith("set_capital:"):
@@ -724,12 +745,14 @@ def telegram_webhook():
 
         if action in ("do_analyze", "do_top"):
             settings = _settings()
-            _tg_send(str(chat_id), "🔎 جاري الفحص...")
-            try:
-                msg, _ = _run_scan_and_build_message(settings)
-                send_telegram(msg)
-            except Exception as e:
-                _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+            _tg_send(str(chat_id), "⏳ جاري التحليل...")
+            def _job():
+                try:
+                    msg, _ = _run_scan_and_build_message(settings)
+                    send_telegram(msg)
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+            _run_async(_job)
             return jsonify({"ok": True})
 
         # Unknown action
@@ -744,6 +767,24 @@ def telegram_webhook():
     chat_id = message["chat"]["id"]
     user_id = message.get("from", {}).get("id")
     text = (message.get("text") or "").strip()
+
+    # إدخال مخصص بعد ضغط زر
+    from storage import get_user_state, clear_user_state
+    pending = get_user_state(str(chat_id), "pending", "")
+    if pending == "capital" and text:
+        t = text.replace(",", "").strip()
+        try:
+            val = float(t)
+            if val <= 0:
+                raise ValueError("bad")
+            set_setting("CAPITAL_USD", str(val))
+            clear_user_state(str(chat_id), "pending")
+            s = _settings()
+            _tg_send(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
+            return jsonify({"ok": True})
+        except Exception:
+            _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
+            return jsonify({"ok": True})
 
     if not _is_admin(user_id):
         # Ignore silently for channels, but reply in private
