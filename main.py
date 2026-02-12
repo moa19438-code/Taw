@@ -888,6 +888,12 @@ def telegram_webhook():
 
                 _run_async(_job)
                 return jsonify({"ok": True})
+                
+                if cb:
+    msg = cb.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    action = (cb.get("data") or "").strip()
 
             # Unknown action
             _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
