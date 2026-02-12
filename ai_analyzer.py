@@ -1,10 +1,18 @@
 import os
 from google import genai
 
-# يقرأ المفتاح تلقائيًا من ENV: GEMINI_API_KEY
-_client = genai.Client()
+# الأفضل تمرير المفتاح صراحة (أوضح وأضمن)
+_api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+_client = genai.Client(api_key=_api_key) if _api_key else genai.Client()
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# موديلات آمنة/شائعة (غيّر من Render عبر GEMINI_MODEL إذا تبي)
+DEFAULT_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-flash-latest").strip()
+
+_FALLBACK_MODELS = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
 
 def _build_prompt(symbol: str, features: dict) -> str:
     lines = [
@@ -14,21 +22,42 @@ def _build_prompt(symbol: str, features: dict) -> str:
     ]
     for k, v in features.items():
         lines.append(f"- {k}: {v}")
-
     lines += [
         "",
-        "اكتب الرد بالعربية وبشكل مختصر وواضح:",
-        "1) ملخص الحالة (صاعد/متذبذب/ضعيف) + سبب.",
-        "2) أهم 3 نقاط قوة.",
-        "3) أهم 3 مخاطر.",
-        "4) سيناريو اختراق + سيناريو فشل (مع مستويات رقمية إن أمكن).",
-        "5) اقتراح إدارة صفقة اختياري (Entry/SL/TP أو Trailing) بدون مبالغة.",
-        "6) هل مناسب للاستكشاف الآن؟ (نعم/لا) + سبب واحد.",
+        "أبغى:",
+        "1) نظرة عامة مختصرة (اتجاه/زخم/تذبذب).",
+        "2) أهم 3 نقاط إيجابية وأهم 3 مخاطر.",
+        "3) سيناريوهين: صعود/هبوط + مستويات محتملة (تقريبية) بناءً على البيانات.",
+        "4) اقتراح وقف خسارة ذكي (فكرة عامة) بدون أرقام مؤكدة إذا البيانات ما تكفي.",
+        "5) خلاصة: هل مناسب للاستكشاف الآن؟ ولماذا.",
+        "",
+        "اكتب بالعربي وبشكل واضح ومختصر."
     ]
     return "\n".join(lines)
 
+def _is_model_not_found(err: Exception) -> bool:
+    s = str(err)
+    return ("404" in s) or ("NOT_FOUND" in s) or ("is not found for API version" in s)
+
 def gemini_analyze(symbol: str, features: dict, model: str | None = None) -> str:
-    m = model or DEFAULT_MODEL
+    m = (model or DEFAULT_MODEL).strip()
     prompt = _build_prompt(symbol, features)
-    resp = _client.models.generate_content(model=m, contents=prompt)
-    return (resp.text or "").strip()
+
+    # نجرب الموديل المحدد أولاً ثم نسقط على بدائل
+    tried = []
+    candidates = [m] + [x for x in _FALLBACK_MODELS if x != m]
+
+    last_err: Exception | None = None
+    for mm in candidates:
+        tried.append(mm)
+        try:
+            resp = _client.models.generate_content(model=mm, contents=prompt)
+            return (resp.text or "").strip() or f"تمت الاستجابة لكن بدون نص (model={mm})"
+        except Exception as e:
+            last_err = e
+            # إذا الخطأ مو “موديل غير موجود” لا نكمل Fallback
+            if not _is_model_not_found(e):
+                raise
+
+    # لو كلهم فشلوا بنفس المشكلة
+    raise RuntimeError(f"فشل استدعاء Gemini. الموديلات التي جُربت: {tried}\nآخر خطأ: {last_err}")
