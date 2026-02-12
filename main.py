@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import json
+import time
 
 import requests
 import atexit
@@ -82,6 +83,40 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
     except Exception:
         pass
 
+
+
+# --- Telegram callback responsiveness / anti-duplicate ---
+_CB_SEEN: Dict[str, float] = {}  # callback_query.id -> ts
+_ACTION_SEEN: Dict[str, float] = {}  # f"{chat_id}:{action}" -> ts
+_CB_TTL_SEC = int(os.getenv('TG_CB_TTL_SEC', '600'))  # 10 minutes default
+_ACTION_DEBOUNCE_SEC = float(os.getenv('TG_ACTION_DEBOUNCE_SEC', '2.5'))
+
+def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
+    """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
+    if not (TELEGRAM_BOT_TOKEN and callback_id):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        payload: Dict[str, Any] = {"callback_query_id": callback_id, "show_alert": bool(show_alert)}
+        if text:
+            payload["text"] = text
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+def _seen_and_mark(d: Dict[str, float], key: str, ttl_sec: float) -> bool:
+    """Return True if key was seen recently; otherwise mark and return False."""
+    now = time.time()
+    # cheap cleanup
+    if len(d) > 2000:
+        for k, ts in list(d.items())[:1000]:
+            if now - ts > ttl_sec:
+                d.pop(k, None)
+    ts = d.get(key)
+    if ts is not None and (now - ts) < ttl_sec:
+        return True
+    d[key] = now
+    return False
 
 def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     """Send *notifications* according to routing settings.
@@ -682,6 +717,19 @@ def telegram_webhook():
             user_id = cb.get("from", {}).get("id")
             chat_id = cb.get("message", {}).get("chat", {}).get("id")
             action = (cb.get("data") or "").strip()
+            callback_id = cb.get("id")
+            # IMPORTANT: acknowledge callback fast to avoid spinner/retries
+            _tg_answer_callback(callback_id)
+
+            # Dedupe: Telegram may deliver the same callback update more than once
+            if callback_id and _seen_and_mark(_CB_SEEN, str(callback_id), float(_CB_TTL_SEC)):
+                return jsonify({"ok": True})
+
+            # Debounce: prevent accidental double-click from triggering twice
+            if chat_id is not None and action:
+                if _seen_and_mark(_ACTION_SEEN, f"{chat_id}:{action}", float(_ACTION_DEBOUNCE_SEC)):
+                    return jsonify({"ok": True})
+
 
             if not _is_admin(user_id):
                 _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
