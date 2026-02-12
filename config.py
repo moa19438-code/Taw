@@ -20,6 +20,9 @@ def env_float(name: str, default: float) -> float:
 
 RUN_KEY = os.getenv("RUN_KEY", "CHANGE_ME")
 
+# TradingView webhook (optional)
+TRADINGVIEW_WEBHOOK_KEY = os.getenv("TRADINGVIEW_WEBHOOK_KEY", RUN_KEY)
+
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # legacy (admin DM chat id)
@@ -77,3 +80,19 @@ SEND_DAILY_SUMMARY = env_bool('SEND_DAILY_SUMMARY', False)
 # Local timezone (used for scheduled notifications)
 LOCAL_TZ = os.getenv('LOCAL_TZ', 'Asia/Riyadh')
 
+
+
+# AI Signal Filter (deterministic, no training)
+AI_FILTER_ENABLED = env_bool('AI_FILTER_ENABLED', True)
+AI_FILTER_MIN_SCORE = env_int('AI_FILTER_MIN_SCORE', 70)
+AI_FILTER_SEND_REJECTS = env_bool('AI_FILTER_SEND_REJECTS', False)
+
+
+# Signal evaluation & lightweight learning (no external ML deps)
+SIGNAL_EVAL_DAYS = env_int('SIGNAL_EVAL_DAYS', 5)  # evaluate signals after N calendar days
+ML_ENABLED = env_bool('ML_ENABLED', True)          # update lightweight weights from outcomes
+ML_LEARNING_RATE = float(os.getenv('ML_LEARNING_RATE', '0.15'))
+
+# Notification routing defaults (can be changed via Telegram menu)
+NOTIFY_ROUTE_DEFAULT = os.getenv('NOTIFY_ROUTE_DEFAULT', 'dm')  # dm|group|both
+NOTIFY_SILENT_DEFAULT = env_bool('NOTIFY_SILENT_DEFAULT', True)

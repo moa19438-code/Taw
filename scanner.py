@@ -8,7 +8,7 @@ from config import (
     LOOKBACK_DAYS, TOP_N, SYMBOL_BATCH
 )
 from alpaca_client import list_assets, bars
-from indicators import sma, rsi, atr
+from indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
 from storage import get_all_settings, parse_int, parse_float
 
 @dataclass
@@ -54,57 +54,90 @@ def scan_universe_with_meta() -> Tuple[List[Candidate], int]:
     return picks, len(symbols)
 
 def get_symbol_features(symbol: str) -> Dict[str, Any]:
-    """Fetch recent daily bars for one symbol and compute features for AI analysis.
+    """Fetch recent daily bars for one symbol and compute richer technical features.
 
-    Returns a dict of numeric indicators + a short notes string.
-    If data is insufficient, returns {"error": "..."}.
+    This is used by the /ai command (Gemini prompt). It intentionally stays "lightweight"
+    and relies only on daily bars (no intraday).
     """
     symbol = (symbol or "").upper().strip()
     if not symbol:
         return {"error": "Empty symbol"}
 
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
+    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 180))
 
-    data = bars([symbol], start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
+    data = bars([symbol], start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 60)
     bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
     blist = bars_by_symbol.get(symbol) or []
-    if len(blist) < 30:
+    if len(blist) < 60:
         return {"error": "Not enough bars"}
 
     closes = [float(b.get("c", 0)) for b in blist if "c" in b]
     highs  = [float(b.get("h", 0)) for b in blist if "h" in b]
     lows   = [float(b.get("l", 0)) for b in blist if "l" in b]
     vols   = [float(b.get("v", 0)) for b in blist if "v" in b]
-    if len(closes) < 30 or len(highs) < 30 or len(lows) < 30:
+    if len(closes) < 60 or len(highs) < 60 or len(lows) < 60 or len(vols) < 60:
         return {"error": "Not enough data"}
 
     last = closes[-1]
+
+    # Moving averages
     s20 = sma(closes, 20)
     s50 = sma(closes, 50)
     s100 = sma(closes, 100)
     s200 = sma(closes, 200)
+
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    e200 = ema(closes, 200)
+
+    # Momentum / trend strength
     r14 = rsi(closes, 14)
     a14 = atr(highs, lows, closes, 14)
+    macd_vals = macd(closes, 12, 26, 9)
+    bb = bollinger_bands(closes, 20, 2.0)
+    adx_vals = adx(highs, lows, closes, 14)
+    stoch_vals = stochastic(highs, lows, closes, 14, 3)
 
-    atr_pct = (a14 / last) if (a14 and last) else None
-    hi20 = max(highs[-20:]) if len(highs) >= 20 else None
+    # Volume
     vavg20 = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
     vol_spike = bool(vavg20 and vols[-1] >= 1.5 * vavg20)
+    obv_val = obv(closes, vols)
+
+    # Price context
+    atr_pct = (a14 / last) if (a14 and last) else None
+    hi20 = max(highs[-20:]) if len(highs) >= 20 else None
+    near_20d_high = bool(hi20 is not None and last >= 0.98 * hi20)
+
+    vwap20 = vwap(highs, lows, closes, vols, 20)
 
     notes = []
-    if s20 is not None and s50 is not None and s20 > s50:
-        notes.append("SMA20>SMA50")
-    if s200 is not None and last > s200:
-        notes.append("Above SMA200")
+    if e20 is not None and e50 is not None and e20 > e50:
+        notes.append("EMA20>EMA50")
+    if e200 is not None and last > e200:
+        notes.append("Above EMA200")
     if r14 is not None:
         notes.append(f"RSI {r14:.0f}")
+    if macd_vals is not None:
+        _, _, hist = macd_vals
+        notes.append(f"MACD hist {hist:.3f}")
+    if adx_vals is not None:
+        adxv, pdi, mdi = adx_vals
+        notes.append(f"ADX {adxv:.0f} (+DI {pdi:.0f}/-DI {mdi:.0f})")
+    if bb is not None:
+        _, _, _, pctb = bb
+        notes.append(f"BB% {pctb:.2f}")
+    if stoch_vals is not None:
+        k, d = stoch_vals
+        notes.append(f"Stoch {k:.0f}/{d:.0f}")
     if atr_pct is not None:
         notes.append(f"ATR% {atr_pct*100:.1f}")
-    if hi20 is not None and last >= 0.98 * hi20:
+    if near_20d_high:
         notes.append("Near 20D high")
     if vol_spike:
         notes.append("Vol spike")
+    if vwap20 is not None and last > vwap20:
+        notes.append("Above VWAP20")
 
     return {
         "price": round(last, 4),
@@ -112,10 +145,35 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
         "SMA50": round(s50, 4) if s50 is not None else None,
         "SMA100": round(s100, 4) if s100 is not None else None,
         "SMA200": round(s200, 4) if s200 is not None else None,
+        "EMA20": round(e20, 4) if e20 is not None else None,
+        "EMA50": round(e50, 4) if e50 is not None else None,
+        "EMA200": round(e200, 4) if e200 is not None else None,
         "RSI14": round(r14, 2) if r14 is not None else None,
         "ATR14": round(a14, 4) if a14 is not None else None,
         "ATR%": round(atr_pct * 100, 2) if atr_pct is not None else None,
-        "Near 20D high": bool(hi20 is not None and last >= 0.98 * hi20),
+        "MACD": {
+            "macd": round(macd_vals[0], 5),
+            "signal": round(macd_vals[1], 5),
+            "hist": round(macd_vals[2], 5),
+        } if macd_vals is not None else None,
+        "Bollinger": {
+            "mid": round(bb[0], 4),
+            "upper": round(bb[1], 4),
+            "lower": round(bb[2], 4),
+            "pct_b": round(bb[3], 4),
+        } if bb is not None else None,
+        "ADX14": {
+            "adx": round(adx_vals[0], 3),
+            "+di": round(adx_vals[1], 3),
+            "-di": round(adx_vals[2], 3),
+        } if adx_vals is not None else None,
+        "Stochastic": {
+            "%K": round(stoch_vals[0], 3),
+            "%D": round(stoch_vals[1], 3),
+        } if stoch_vals is not None else None,
+        "VWAP20": round(vwap20, 4) if vwap20 is not None else None,
+        "OBV": round(obv_val, 2) if obv_val is not None else None,
+        "Near 20D high": bool(near_20d_high),
         "Vol spike": bool(vol_spike),
         "notes": ", ".join(notes),
     }
@@ -123,80 +181,194 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
 
 def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 120))
+    start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 180))
+
     results: List[Candidate] = []
+
     for batch in _chunks(symbols, SYMBOL_BATCH):
-        data = bars(batch, start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 20)
+        data = bars(batch, start=start, end=end, timeframe="1Day", limit=LOOKBACK_DAYS + 60)
         bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
+
         for sym, blist in bars_by_symbol.items():
-            if not blist or len(blist) < 30:
+            if not blist or len(blist) < 60:
                 continue
+
             closes = [float(b["c"]) for b in blist if "c" in b]
             highs  = [float(b["h"]) for b in blist if "h" in b]
             lows   = [float(b["l"]) for b in blist if "l" in b]
             vols   = [float(b["v"]) for b in blist if "v" in b]
-            if len(closes) < 30 or len(vols) < 30:
+
+            if len(closes) < 60 or len(vols) < 60 or len(highs) != len(lows) or len(lows) != len(closes) or len(closes) != len(vols):
                 continue
+
             last = closes[-1]
             if last < MIN_PRICE or last > MAX_PRICE:
                 continue
+
+            # Average $ volume (liquidity filter)
             adv = sum([closes[i] * vols[i] for i in range(-20, 0)]) / 20.0
             if adv < MIN_AVG_DOLLAR_VOL:
                 continue
-            s20 = sma(closes, 20)
-            s50 = sma(closes, 50)
+
+            # Core indicators
+            e20 = ema(closes, 20)
+            e50 = ema(closes, 50)
+            e200 = ema(closes, 200)
+
             s100 = sma(closes, 100)
             s200 = sma(closes, 200)
+
             r14 = rsi(closes, 14)
             a14 = atr(highs, lows, closes, 14)
-            if s20 is None or s50 is None or r14 is None or a14 is None:
+            m = macd(closes, 12, 26, 9)
+            bb = bollinger_bands(closes, 20, 2.0)
+            adx_vals = adx(highs, lows, closes, 14)
+            stoch_vals = stochastic(highs, lows, closes, 14, 3)
+            vwap20 = vwap(highs, lows, closes, vols, 20)
+
+            if e20 is None or e50 is None or r14 is None or a14 is None or m is None or bb is None or adx_vals is None:
                 continue
+
+            macd_line, macd_sig, macd_hist = m
+            bb_mid, bb_up, bb_lo, bb_pctb = bb
+            adx_v, pdi, mdi = adx_vals
+
+            # Volume features
+            vavg20 = sum(vols[-20:]) / 20.0
+            vol_spike = bool(vavg20 > 0 and vols[-1] >= 1.5 * vavg20)
+            obv_val = obv(closes, vols)
+            obv_prev = obv(closes[:-5], vols[:-5]) if len(closes) >= 10 else None
+            obv_rising = bool(obv_val is not None and obv_prev is not None and obv_val > obv_prev)
+
+            # Price context
+            atr_pct = a14 / last if last else 0.0
+            hi20 = max(highs[-20:])
+            near_20d_high = bool(last >= 0.98 * hi20)
+
+            # ===== Scoring =====
             score = 0.0
             notes = []
-            if s20 > s50:
+
+            # Trend (multi-speed EMAs)
+            if e20 > e50:
                 score += 2.0
-                notes.append("SMA20>SMA50")
+                notes.append("EMA20>EMA50")
                 trend = "up"
             else:
+                score -= 0.5
+                notes.append("EMA20<EMA50")
                 trend = "down"
-            if s200 is not None and last > s200:
+
+            if e200 is not None and last > e200:
+                score += 1.5
+                notes.append("Above EMA200")
+            elif e200 is not None:
+                score -= 0.5
+                notes.append("Below EMA200")
+
+            if e200 is not None and e50 > e200:
                 score += 1.0
-                notes.append("Above SMA200")
-            if 45 <= r14 <= 70:
+                notes.append("EMA50>EMA200")
+
+            # Momentum (RSI + MACD + Stoch)
+            if 50 <= r14 <= 70:
                 score += 2.0
                 notes.append(f"RSI {r14:.0f}")
+            elif 40 <= r14 < 50:
+                score += 1.0
+                notes.append(f"RSI {r14:.0f} (ok)")
             elif r14 > 70:
                 score += 0.5
                 notes.append("RSI hot")
             else:
-                score += 0.5
-                notes.append("RSI low")
-            atr_pct = a14 / last
+                score -= 0.5
+                notes.append("RSI weak")
+
+            if macd_hist > 0:
+                score += 1.5
+                notes.append("MACD+")
+            else:
+                score -= 0.5
+                notes.append("MACD-")
+
+            if stoch_vals is not None:
+                k, d = stoch_vals
+                if k > d and 40 <= k <= 85:
+                    score += 0.8
+                    notes.append("Stoch up")
+                elif k < 20:
+                    score += 0.3
+                    notes.append("Stoch oversold")
+
+            # Trend strength (ADX)
+            if adx_v >= 30:
+                score += 1.5
+                notes.append(f"ADX {adx_v:.0f}")
+            elif adx_v >= 20:
+                score += 1.0
+                notes.append(f"ADX {adx_v:.0f}")
+            else:
+                score += 0.2
+                notes.append("ADX low")
+
+            if pdi > mdi:
+                score += 0.4
+                notes.append("+DI>-DI")
+            else:
+                score -= 0.2
+                notes.append("-DI>=+DI")
+
+            # Volatility sanity (ATR%)
             if 0.012 <= atr_pct <= 0.06:
-                score += 2.0
+                score += 1.0
                 notes.append(f"ATR% {atr_pct*100:.1f}")
             elif atr_pct < 0.012:
-                score += 0.5
+                score += 0.2
                 notes.append("ATR low")
+            elif atr_pct > 0.10:
+                score -= 0.5
+                notes.append("ATR very high")
             else:
-                score += 0.8
+                score += 0.5
                 notes.append("ATR high")
-            hi20 = max(highs[-20:])
-            if last >= 0.98 * hi20:
-                score += 2.0
-                notes.append("Near 20D high")
-            vavg20 = sum(vols[-20:]) / 20.0
-            if vavg20 > 0 and vols[-1] >= 1.5 * vavg20:
+
+            # Breakout / positioning
+            if near_20d_high:
                 score += 1.5
+                notes.append("Near 20D high")
+
+            if bb_pctb >= 0.8:
+                score += 0.8
+                notes.append("BB strong")
+            if bb_pctb > 1.05:
+                score -= 0.3
+                notes.append("BB extended")
+
+            if vwap20 is not None:
+                if last > vwap20:
+                    score += 0.6
+                    notes.append("Above VWAP20")
+                else:
+                    score -= 0.2
+                    notes.append("Below VWAP20")
+
+            # Volume confirmation
+            if vol_spike:
+                score += 1.0
                 notes.append("Vol spike")
-            if len(closes) >= 2:
+            if obv_rising:
+                score += 0.5
+                notes.append("OBV rising")
+
+            # Penalize extreme gap days
+            if len(closes) >= 2 and closes[-2] != 0:
                 gap = abs(closes[-1] - closes[-2]) / closes[-2]
                 if gap > 0.12:
                     score -= 1.5
                     notes.append("Big gap")
 
-            daily_ok = bool(s20 > s50)
-            weekly_ok = bool((s200 is not None) and (s50 is not None) and (s50 > s200) and (last > s200))
+            daily_ok = bool(e20 > e50)
+            weekly_ok = bool((e200 is not None) and (e50 > e200) and (last > e200))
             monthly_ok = bool((s200 is not None) and (s100 is not None) and (s100 > s200) and (last > s200))
 
             results.append(Candidate(
@@ -212,6 +384,7 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                 weekly_ok=weekly_ok,
                 monthly_ok=monthly_ok
             ))
+
     results.sort(key=lambda x: x.score, reverse=True)
     settings = get_all_settings()
     top_n = parse_int(settings.get('TOP_N'), TOP_N)

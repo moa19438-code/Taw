@@ -11,7 +11,7 @@ from config import (
     BLOCK_IF_POSITION_OPEN, BLOCK_IF_ORDER_OPEN
 )
 from alpaca_client import account, place_bracket_order, clock, positions, open_orders, bars
-from indicators import sma
+from indicators import sma, atr
 from storage import log_order, last_orders, get_all_settings, parse_bool, parse_int, parse_float
 
 
@@ -217,5 +217,117 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
         except Exception as e:
             log_order(sym, side, qty, "bracket", json.dumps(payload), "", "error", str(e))
             logs.append(f"{sym}: order failed ({e})")
+
+    return logs
+
+
+
+def trade_symbol(symbol: str, *, side: str = "buy", risk_pct: float | None = None, tp_r: float | None = None, sl_atr_mult: float | None = None) -> List[str]:
+    """Trade a single symbol (long-only by default).
+
+    Intended for external signals (e.g., TradingView alerts) where you want
+    to execute one symbol on-demand using the same risk settings + safety latches.
+
+    Returns logs (human readable).
+    """
+    logs: List[str] = []
+    settings = get_all_settings()
+
+    auto_trade = parse_bool(settings.get("AUTO_TRADE"), AUTO_TRADE)
+    max_daily = parse_int(settings.get("MAX_DAILY_TRADES"), MAX_DAILY_TRADES)
+
+    eff_risk = risk_pct if risk_pct is not None else parse_float(settings.get("risk_pct"), RISK_PER_TRADE_PCT)
+    eff_tp_r = tp_r if tp_r is not None else parse_float(settings.get("tp_r"), TP_R_MULT)
+    eff_sl_atr = sl_atr_mult if sl_atr_mult is not None else parse_float(settings.get("sl_atr_mult"), SL_ATR_MULT)
+
+    if not auto_trade:
+        return ["AUTO_TRADE=false (execution disabled)"]
+
+    if not (EXECUTE_TRADES and ALLOW_LIVE_TRADING):
+        return ["Trade safety latches are OFF (EXECUTE_TRADES & ALLOW_LIVE_TRADING must be true)"]
+
+    # Market open + time filters
+    try:
+        ok, reason = _within_time_window()
+        if not ok:
+            return [f"Cannot trade now: {reason}"]
+    except Exception as e:
+        return [f"Cannot trade now: clock error ({e})"]
+
+    # Market regime filter (optional)
+    ok_mkt, mkt_reason = _market_ok()
+    if not ok_mkt:
+        return [f"Blocked by market filter: {mkt_reason}"]
+    logs.append(mkt_reason)
+
+    if _count_today_orders() >= max_daily:
+        return [f"Daily limit reached ({max_daily})"]
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return ["Empty symbol"]
+
+    if _has_position(sym):
+        return [f"{sym}: skip (position already open)"]
+    if _has_open_order(sym):
+        return [f"{sym}: skip (open order exists)"]
+
+    # Fetch recent daily bars to compute last close + ATR
+    try:
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=180)
+        data = bars([sym], start=start, end=now, timeframe="1Day", limit=120)
+        blist = (data.get("bars", {}) or {}).get(sym, [])
+        if not blist or len(blist) < 30:
+            return [f"{sym}: not enough bars to compute ATR"]
+        closes = [float(b.get("c", 0)) for b in blist if "c" in b]
+        highs  = [float(b.get("h", 0)) for b in blist if "h" in b]
+        lows   = [float(b.get("l", 0)) for b in blist if "l" in b]
+        if len(closes) < 30 or len(highs) != len(lows) or len(lows) != len(closes):
+            return [f"{sym}: invalid bars data"]
+        last_price = closes[-1]
+        a14 = atr(highs, lows, closes, 14)
+        if a14 is None or a14 <= 0:
+            return [f"{sym}: ATR unavailable"]
+    except Exception as e:
+        return [f"{sym}: bars fetch failed ({e})"]
+
+    acct = account()
+    equity = float(acct.get("equity", 0.0))
+
+    qty = compute_qty(equity, last_price, a14, risk_pct=eff_risk, sl_atr_mult=eff_sl_atr)
+    if qty <= 0:
+        return [f"{sym}: qty=0 (equity={equity:.2f} price={last_price:.2f})"]
+
+    side = (side or "buy").lower().strip()
+    if side not in ("buy", "sell"):
+        side = "buy"
+
+    if side != "buy":
+        return [f"{sym}: only long trades are supported حاليا (side={side})"]
+
+    stop_price = max(last_price - (a14 * eff_sl_atr), 0.01)
+    r = last_price - stop_price
+    take_profit = last_price + (r * eff_tp_r)
+
+    payload = {
+        "symbol": sym,
+        "side": side,
+        "qty": qty,
+        "take_profit": take_profit,
+        "stop_loss": stop_price,
+        "risk_pct": eff_risk,
+        "tp_r": eff_tp_r,
+        "sl_atr_mult": eff_sl_atr,
+    }
+
+    try:
+        resp = place_bracket_order(sym, side, qty, take_profit, stop_price)
+        oid = resp.get("id", "")
+        log_order(sym, side, qty, "bracket", json.dumps(payload), oid, "ok", "submitted")
+        logs.append(f"{sym}: order submitted qty={qty} TP={take_profit:.2f} SL={stop_price:.2f}")
+    except Exception as e:
+        log_order(sym, side, qty, "bracket", json.dumps(payload), "", "error", str(e))
+        logs.append(f"{sym}: order failed ({e})")
 
     return logs

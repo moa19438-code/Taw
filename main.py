@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import json
 
 import requests
 import atexit
@@ -13,6 +14,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
 from ai_analyzer import gemini_analyze
+from ai_filter import should_alert
+from ml_model import parse_weights, dumps_weights, featurize, predict_prob, update_online
+from executor import trade_symbol
+from alpaca_client import bars
 
 from config import (
     RUN_KEY,
@@ -22,6 +27,13 @@ from config import (
     TELEGRAM_CHANNEL_ID,
     SEND_DAILY_SUMMARY,
     LOCAL_TZ,
+    TRADINGVIEW_WEBHOOK_KEY,
+    AI_FILTER_ENABLED,
+    AI_FILTER_MIN_SCORE,
+    AI_FILTER_SEND_REJECTS,
+    SIGNAL_EVAL_DAYS,
+    ML_ENABLED,
+    ML_LEARNING_RATE,
 )
 from storage import (
     init_db,
@@ -36,6 +48,9 @@ from storage import (
     parse_bool,
     last_signal,
     log_signal,
+    pending_signals_for_eval,
+    mark_signal_evaluated,
+    last_signals,
 )
 from scanner import scan_universe_with_meta, Candidate, get_symbol_features
 
@@ -55,12 +70,12 @@ ensure_default_settings()
 
 
 # ================= Telegram helpers =================
-def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
     if not (TELEGRAM_BOT_TOKEN and chat_id):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_notification": bool(silent)}
         if reply_markup:
             payload["reply_markup"] = reply_markup
         requests.post(url, json=payload, timeout=20)
@@ -69,15 +84,31 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
 
 
 def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
-    """Broadcast to channel (if set) and to admin DM (preferred)."""
-    if TELEGRAM_CHANNEL_ID:
-        _tg_send(TELEGRAM_CHANNEL_ID, text, reply_markup=reply_markup)
+    """Send *notifications* according to routing settings.
 
-    admin_id = TELEGRAM_ADMIN_ID or TELEGRAM_CHAT_ID
-    if admin_id:
-        _tg_send(admin_id, text, reply_markup=reply_markup)
+    NOTIFY_ROUTE: dm|group|both
+    NOTIFY_SILENT: 1/0 (disable push notifications)
+    """
+    settings = _settings()
+    route = _get_str(settings, "NOTIFY_ROUTE", "dm").lower().strip()
+    silent = _get_bool(settings, "NOTIFY_SILENT", True)
 
+    admin_id = str(TELEGRAM_ADMIN_ID or TELEGRAM_CHAT_ID or "").strip()
+    channel_id = str(TELEGRAM_CHANNEL_ID or "").strip()
 
+    send_dm = route in ("dm", "both")
+    send_group = route in ("group", "both")
+
+    # If channel not configured, fallback to DM
+    if send_group and not channel_id:
+        send_group = False
+        send_dm = True
+
+    if send_group and channel_id:
+        _tg_send(channel_id, text, reply_markup=reply_markup, silent=silent)
+
+    if send_dm and admin_id:
+        _tg_send(admin_id, text, reply_markup=reply_markup, silent=silent)
 def _admin_id_int() -> int:
     try:
         return int(str(TELEGRAM_ADMIN_ID).strip()) if str(TELEGRAM_ADMIN_ID).strip() else 0
@@ -280,12 +311,12 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
     }
 
 
-def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any]) -> str:
+def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_score: int | None = None) -> str:
     strength = _strength(float(c.score))
     entry_type = _entry_type_label(plan["entry_mode"])
     # Sahm screen fields (Arabic, as requested)
     return (
-        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}\n"
+        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}" + (f" | AI: {ai_score}/100" if ai_score is not None else "") + "\n"
         f"العملية: شراء\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
@@ -308,6 +339,16 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
     mode = _get_str(settings, "PLAN_MODE", "daily")
     entry = _get_str(settings, "ENTRY_MODE", "auto")
     auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
+    route = _get_str(settings, "NOTIFY_ROUTE", "dm").lower()
+    silent = _get_bool(settings, "NOTIFY_SILENT", True)
+
+    def _route_label(r: str) -> str:
+        if r == "group":
+            return "القروب فقط"
+        if r == "both":
+            return "الخاص+القروب"
+        return "الخاص فقط"
+
     return {
         "inline_keyboard": [
             [
@@ -322,9 +363,12 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
                 {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
                 {"text": "⚙️ الإعدادات", "callback_data": "show_settings"},
             ],
+            [
+                {"text": f"📨 الوجهة: {_route_label(route)}", "callback_data": "show_notify_route"},
+                {"text": f"🔕 صامت: {'ON' if silent else 'OFF'}", "callback_data": "toggle_silent"},
+            ],
         ]
     }
-
 
 def _build_modes_kb() -> Dict[str, Any]:
     return {
@@ -350,6 +394,21 @@ def _build_entry_kb() -> Dict[str, Any]:
                 {"text": "تلقائي", "callback_data": "set_entry:auto"},
                 {"text": "سوق", "callback_data": "set_entry:market"},
                 {"text": "محدد", "callback_data": "set_entry:limit"},
+            ],
+            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+
+def _build_notify_route_kb() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "الخاص فقط", "callback_data": "set_notify_route:dm"},
+                {"text": "القروب فقط", "callback_data": "set_notify_route:group"},
+            ],
+            [
+                {"text": "الخاص + القروب", "callback_data": "set_notify_route:both"},
             ],
             [{"text": "⬅️ رجوع", "callback_data": "menu"}],
         ]
@@ -536,8 +595,14 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
         if not should_send:
             continue
 
+        ai_score = None
+        if AI_FILTER_ENABLED:
+            ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, "buy", min_score=AI_FILTER_MIN_SCORE)
+            if not ok_ai:
+                continue
+
         plan = _compute_trade_plan(settings, c)
-        blocks.append(_format_sahm_block(mode_label, c, plan))
+        blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
         logged.append({
             "symbol": c.symbol,
             "strength": st,
@@ -546,6 +611,9 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
             "sl": float(plan["sl"]),
             "tp": float(plan["tp"]),
             "mode": mode,
+            "ai_score": ai_score,
+            "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
+            "features": (_ai_features if AI_FILTER_ENABLED else None),
         })
 
     # ensure at least min_send if possible (even if repeats blocked by dedup)
@@ -557,9 +625,15 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 break
             if c.symbol in chosen:
                 continue
+            ai_score = None
+            if AI_FILTER_ENABLED:
+                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, "buy", min_score=AI_FILTER_MIN_SCORE)
+                if not ok_ai:
+                    continue
+
             plan = _compute_trade_plan(settings, c)
             st = _strength(float(c.score))
-            blocks.append(_format_sahm_block(mode_label, c, plan))
+            blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
             logged.append({
                 "symbol": c.symbol,
                 "strength": st,
@@ -568,12 +642,15 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 "sl": float(plan["sl"]),
                 "tp": float(plan["tp"]),
                 "mode": mode,
+            "ai_score": ai_score,
+            "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
+            "features": (_ai_features if AI_FILTER_ENABLED else None),
             })
 
     # persist
     ts = now_utc.isoformat()
     for d in logged:
-        log_signal(ts, d["symbol"], d["mode"], d["strength"], d["score"], d["entry"], d["sl"], d["tp"])
+        log_signal(ts=ts, symbol=d["symbol"], source="scan", side="buy", mode=d["mode"], strength=d["strength"], score=float(d["score"]), entry=float(d["entry"]), sl=d.get("sl"), tp=d.get("tp"), features_json=json.dumps(d.get("features") or {}, ensure_ascii=False), reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False), horizon_days=int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS)))
 
     return blocks, logged
 
@@ -908,6 +985,130 @@ def telegram_webhook():
         return jsonify({"ok": True})
 
 
+
+@app.post("/tradingview")
+def tradingview_webhook():
+    """TradingView alerts webhook.
+
+    Setup in TradingView alert message as JSON, for example:
+
+    {
+      "key": "YOUR_TV_KEY",
+      "symbol": "{{ticker}}",
+      "side": "buy"
+    }
+
+    You can also add optional overrides:
+      - risk_pct
+      - tp_r
+      - sl_atr_mult
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        key = (payload.get("key") or request.args.get("key") or request.headers.get("X-TV-KEY") or "").strip()
+        if not key or key != TRADINGVIEW_WEBHOOK_KEY:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        symbol = (payload.get("symbol") or payload.get("ticker") or payload.get("s") or "").upper().strip()
+        side = (payload.get("side") or payload.get("action") or "buy").lower().strip()
+
+
+        # Optional overrides
+        risk_pct = payload.get("risk_pct")
+        tp_r = payload.get("tp_r")
+        sl_atr_mult = payload.get("sl_atr_mult")
+
+        def _to_float(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        # ---- AI filter (deterministic, no training) ----
+        passed = True
+        ai_score = None
+        ai_reasons: List[str] = []
+        ai_features: Dict[str, Any] = {}
+        if AI_FILTER_ENABLED:
+            passed, ai_score, ai_reasons, ai_features = should_alert(symbol, side, min_score=AI_FILTER_MIN_SCORE)
+
+        # Build a human-friendly alert message
+        lines = [f"📡 TradingView Signal: {symbol} ({side.upper()})"]
+        if ai_score is not None:
+            lines.append(f"🧠 AI score: {ai_score}/100 (min {AI_FILTER_MIN_SCORE})")
+
+        # Lightweight model probability (learns over time from evaluations)
+        model_prob = None
+        try:
+            s = _settings()
+            if ML_ENABLED and _get_bool(s, "ML_ENABLED", True):
+                w = parse_weights(_get_str(s, "ML_WEIGHTS", ""))
+                x = featurize(ai_features)
+                model_prob = predict_prob(x, w)
+                lines.append(f"📈 Prob: {model_prob*100:.1f}%")
+        except Exception:
+            model_prob = None
+            # keep reasons short
+            for r in ai_reasons[:8]:
+                lines.append(r)
+
+        # Add quick indicator snapshot (if available)
+        try:
+            p = ai_features.get("price")
+            if p is not None:
+                lines.append(f"Price: {float(p):.2f}")
+            rsi = ai_features.get("rsi14")
+            macd = ai_features.get("macd_hist")
+            adx = ai_features.get("adx14")
+            ema20 = ai_features.get("ema20")
+            ema50 = ai_features.get("ema50")
+            if rsi is not None:
+                lines.append(f"RSI14: {float(rsi):.1f}")
+            if macd is not None:
+                lines.append(f"MACD hist: {float(macd):.4f}")
+            if adx is not None:
+                lines.append(f"ADX14: {float(adx):.1f}")
+            if ema20 is not None and ema50 is not None:
+                lines.append(f"EMA20/50: {float(ema20):.2f} / {float(ema50):.2f}")
+        except Exception:
+            pass
+
+        # Decide whether to notify
+        notify = passed or AI_FILTER_SEND_REJECTS
+        if notify:
+            try:
+                tag = "✅ PASSED" if passed else "⛔️ FILTERED"
+                send_telegram(tag + "\n" + "\n".join(lines))
+            except Exception:
+                pass
+
+        # Execution is handled elsewhere (and likely disabled via safety latches)
+        logs = []
+        if passed:
+            try:
+                logs = trade_symbol(
+                    symbol,
+                    side=side,
+                    risk_pct=_to_float(risk_pct),
+                    tp_r=_to_float(tp_r),
+                    sl_atr_mult=_to_float(sl_atr_mult),
+                )
+            except Exception as e:
+                logs = [f"trade_symbol error: {e}"]
+
+        return jsonify({
+            "ok": True,
+            "symbol": symbol,
+            "side": side,
+            "ai": {"enabled": AI_FILTER_ENABLED, "passed": passed, "score": ai_score, "min_score": AI_FILTER_MIN_SCORE, "reasons": ai_reasons[:12]},
+            "executed": bool(logs) and not (len(logs)==1 and "disabled" in (logs[0] or "").lower()),
+            "logs": logs,
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "us-stocks-scanner-executor"})
@@ -924,6 +1125,37 @@ def status():
     })
 
 
+
+
+@app.get("/signals")
+def signals_route():
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except Exception:
+        limit = 50
+    rows = last_signals(limit=max(1, min(200, limit)))
+    return jsonify({"ok": True, "count": len(rows), "signals": rows})
+
+
+@app.get("/signals/export")
+def signals_export():
+    """Export evaluated signals as CSV."""
+    rows = last_signals(limit=500)
+    # only evaluated rows
+    rows = [r for r in rows if int(r.get("evaluated") or 0) == 1]
+    # Simple CSV
+    cols = ["id","ts","symbol","source","side","score","model_prob","horizon_days","evaluated","eval_ts","return_pct","mfe_pct","mae_pct","label"]
+    lines = [",".join(cols)]
+    for r in rows:
+        line = []
+        for c in cols:
+            v = r.get(c, "")
+            if v is None:
+                v = ""
+            s = str(v).replace("\n"," ").replace(",",";")
+            line.append(s)
+        lines.append(",".join(line))
+    return ("\n".join(lines), 200, {"Content-Type": "text/csv; charset=utf-8"})
 @app.get("/scan")
 def scan():
     """
@@ -1048,6 +1280,96 @@ def _run_scan_and_notify(force_summary: bool=True) -> None:
     elif force_summary:
         send_telegram(_fmt_scan_summary_ar(s, universe_size, picks))
 
+
+
+def _evaluate_pending_signals() -> None:
+    """Evaluate old signals (after horizon) and optionally update lightweight model weights."""
+    try:
+        now = datetime.now(timezone.utc)
+        rows = pending_signals_for_eval(limit=300)
+        if not rows:
+            return
+
+        s = _settings()
+        default_horizon = int(_get_int(s, "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS))
+
+        weights = parse_weights(_get_str(s, "ML_WEIGHTS", "")) if ML_ENABLED and _get_bool(s, "ML_ENABLED", True) else None
+        updated = False
+
+        for r in rows:
+            try:
+                ts = r.get("ts") or ""
+                if not ts:
+                    continue
+                # normalize ts
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                horizon = int(r.get("horizon_days") or default_horizon)
+                if (now - dt).days < horizon:
+                    continue
+
+                symbol = (r.get("symbol") or "").upper().strip()
+                side = (r.get("side") or "buy").lower().strip()
+
+                start = dt
+                end = dt + timedelta(days=horizon + 2)
+
+                data = bars([symbol], start=start, end=end, timeframe="1Day", limit=500)
+                bars_list = (data.get("bars", {}).get(symbol) or [])
+                if len(bars_list) < 2:
+                    continue
+
+                entry = float(r.get("entry") or bars_list[0].get("c") or 0.0)
+                if entry <= 0:
+                    continue
+
+                # Use the last bar close within horizon window
+                last_close = float(bars_list[-1].get("c") or entry)
+
+                highs = [float(b.get("h") or b.get("c") or entry) for b in bars_list]
+                lows = [float(b.get("l") or b.get("c") or entry) for b in bars_list]
+                max_high = max(highs) if highs else entry
+                min_low = min(lows) if lows else entry
+
+                if side == "sell":
+                    # Profit if price drops
+                    ret = (entry - last_close) / entry * 100.0
+                    mfe = (entry - min_low) / entry * 100.0
+                    mae = (entry - max_high) / entry * 100.0
+                else:
+                    ret = (last_close - entry) / entry * 100.0
+                    mfe = (max_high - entry) / entry * 100.0
+                    mae = (min_low - entry) / entry * 100.0  # negative when drawdown
+
+                label = 1 if ret > 0 else 0
+                eval_ts = now.isoformat()
+
+                # Update model weights (lightweight online learning)
+                if weights is not None:
+                    try:
+                        fj = r.get("features_json") or ""
+                        feats = json.loads(fj) if fj else {}
+                        x = featurize(feats)
+                        weights = update_online(weights, x, label=label, lr=float(ML_LEARNING_RATE))
+                        updated = True
+                    except Exception:
+                        pass
+
+                mark_signal_evaluated(
+                    signal_id=int(r.get("id")),
+                    eval_ts=eval_ts,
+                    return_pct=float(ret),
+                    mfe_pct=float(mfe),
+                    mae_pct=float(mae),
+                    label=int(label),
+                )
+            except Exception:
+                continue
+
+        if updated and weights is not None:
+            set_setting("ML_WEIGHTS", dumps_weights(weights))
+
+    except Exception:
+        pass
 def _start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
@@ -1055,6 +1377,12 @@ def _start_scheduler() -> None:
     s = _settings()
     interval = _get_int(s, "SCAN_INTERVAL_MIN", 20)
     _scheduler = BackgroundScheduler(timezone=LOCAL_TZ)
+    _scheduler.add_job(
+        _evaluate_pending_signals,
+        IntervalTrigger(hours=6),
+        id="eval_job",
+        replace_existing=True,
+    )
     _scheduler.add_job(
         _run_scan_and_notify,
         IntervalTrigger(minutes=max(5, interval)),

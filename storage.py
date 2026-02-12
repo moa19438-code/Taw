@@ -146,6 +146,147 @@ def init_db() -> None:
         con.commit()
 
 
+
+# --- Signals schema migrations (backwards compatible) ---
+_SIGNAL_COLS = {
+    # column_name: sqlite_type
+    "source": "TEXT",
+    "side": "TEXT",
+    "features_json": "TEXT",
+    "reasons_json": "TEXT",
+    "horizon_days": "INTEGER",
+    "evaluated": "INTEGER",
+    "eval_ts": "TEXT",
+    "return_pct": "REAL",
+    "mfe_pct": "REAL",
+    "mae_pct": "REAL",
+    "label": "INTEGER",
+    "model_prob": "REAL",
+}
+
+def ensure_signal_schema() -> None:
+    """Add missing columns to signals table (SQLite/Postgres)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                for col, typ in _SIGNAL_COLS.items():
+                    cur.execute(f"ALTER TABLE signals ADD COLUMN IF NOT EXISTS {col} {('DOUBLE PRECISION' if typ=='REAL' else 'INTEGER' if typ=='INTEGER' else 'TEXT')};")
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("PRAGMA table_info(signals)")
+        existing = {r[1] for r in cur.fetchall()}
+        for col, typ in _SIGNAL_COLS.items():
+            if col not in existing:
+                con.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+        con.commit()
+
+
+def log_signal(
+    ts: str,
+    symbol: str,
+    source: str,
+    side: str,
+    mode: str,
+    strength: str,
+    score: float,
+    entry: float,
+    sl: float | None,
+    tp: float | None,
+    features_json: str = "",
+    reasons_json: str = "",
+    horizon_days: int = 5,
+    model_prob: float | None = None,
+) -> None:
+    """Persist a signal so we can evaluate and learn later."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO signals
+                    (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, evaluated, model_prob)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s)""",
+                    (ts, symbol, mode, strength, float(score), float(entry), float(sl) if sl is not None else None,
+                     float(tp) if tp is not None else None, source, side, features_json, reasons_json, int(horizon_days), float(model_prob) if model_prob is not None else None),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """INSERT INTO signals
+            (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, evaluated, model_prob)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+            (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, model_prob),
+        )
+        con.commit()
+
+
+def pending_signals_for_eval(limit: int = 200) -> List[Dict[str, Any]]:
+    """Signals not evaluated yet."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT * FROM signals
+                    WHERE COALESCE(evaluated,0)=0
+                    ORDER BY id ASC
+                    LIMIT %s""",
+                    (limit,),
+                )
+                return cur.fetchall()
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT * FROM signals WHERE COALESCE(evaluated,0)=0 ORDER BY id ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_signal_evaluated(
+    signal_id: int,
+    eval_ts: str,
+    return_pct: float,
+    mfe_pct: float,
+    mae_pct: float,
+    label: int,
+    model_prob: float | None = None,
+) -> None:
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """UPDATE signals SET evaluated=1, eval_ts=%s, return_pct=%s, mfe_pct=%s, mae_pct=%s, label=%s, model_prob=COALESCE(%s, model_prob)
+                    WHERE id=%s""",
+                    (eval_ts, float(return_pct), float(mfe_pct), float(mae_pct), int(label), float(model_prob) if model_prob is not None else None, int(signal_id)),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """UPDATE signals SET evaluated=1, eval_ts=?, return_pct=?, mfe_pct=?, mae_pct=?, label=?, model_prob=COALESCE(?, model_prob)
+            WHERE id=?""",
+            (eval_ts, return_pct, mfe_pct, mae_pct, label, model_prob, signal_id),
+        )
+        con.commit()
+
+
+def last_signals(limit: int = 50) -> List[Dict[str, Any]]:
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM signals ORDER BY id DESC LIMIT %s", (limit,))
+                return cur.fetchall()
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
 def log_order(symbol: str, side: str, qty: float, order_type: str, payload: str,
               broker_order_id: Optional[str], status: str, message: str) -> None:
     ts = datetime.utcnow().isoformat()
@@ -238,6 +379,11 @@ def _env_defaults() -> Dict[str, str]:
             "SL_ATR_MULT": str(config.SL_ATR_MULT),
             # Bot UI / manual-trading settings
             "AUTO_NOTIFY": "1",
+            "NOTIFY_ROUTE": str(getattr(config, "NOTIFY_ROUTE_DEFAULT", "dm")),
+            "NOTIFY_SILENT": str(int(getattr(config, "NOTIFY_SILENT_DEFAULT", True))),
+            "SIGNAL_EVAL_DAYS": str(getattr(config, "SIGNAL_EVAL_DAYS", 5)),
+            "ML_ENABLED": str(int(getattr(config, "ML_ENABLED", True))),
+            "ML_WEIGHTS": "",
             "MAX_SEND": "10",
             "MIN_SEND": "7",
             "DEDUP_HOURS": "6",
@@ -354,24 +500,6 @@ def parse_float(v: Any, default: float = 0.0) -> float:
 
 
 # ===== Signal logging for "send only new" notifications =====
-def log_signal(ts: str, symbol: str, mode: str, strength: str, score: float, entry: float, sl: float, tp: float) -> None:
-    if IS_POSTGRES:
-        with _pg_connect() as con:
-            with con.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO signals (ts, symbol, mode, strength, score, entry, sl, tp) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (ts, symbol, mode, strength, float(score), float(entry), float(sl), float(tp)),
-                )
-            con.commit()
-        return
-
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            "INSERT INTO signals (ts, symbol, mode, strength, score, entry, sl, tp) VALUES (?,?,?,?,?,?,?,?)",
-            (ts, symbol, mode, strength, float(score), float(entry), float(sl), float(tp)),
-        )
-        con.commit()
-
 
 def last_signal(symbol: str, mode: str) -> Optional[Dict[str, Any]]:
     if IS_POSTGRES:
