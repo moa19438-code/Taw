@@ -417,6 +417,15 @@ def _build_interval_kb(settings: Dict[str, str]) -> Dict[str, Any]:
     return {"inline_keyboard": rows}
 
 
+
+def _build_capital_kb() -> Dict[str, Any]:
+    presets = [300, 500, 800, 1000, 2000, 5000]
+    rows: List[List[Dict[str, str]]] = []
+    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[:3]])
+    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[3:]])
+    rows.append([{"text": "✍️ قيمة مخصصة", "callback_data": "set_capital_custom"}])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
+    return {"inline_keyboard": rows}
 def _build_position_kb() -> Dict[str, Any]:
     # % of capital used per trade suggestion (manual trading)
     presets = [0.10, 0.15, 0.20, 0.25, 0.30]
@@ -579,172 +588,225 @@ def telegram_webhook():
         if not TELEGRAM_BOT_TOKEN:
             return jsonify({"ok": True})
 
-    except Exception:
-        print("WEBHOOK ERROR:")
-        print(traceback.format_exc())
-        return jsonify({"ok": True})
-
         data = request.get_json(silent=True) or {}
 
-    # Handle button clicks
-    cb = data.get("callback_query")
-    if cb:
-        user_id = cb.get("from", {}).get("id")
-        chat_id = cb.get("message", {}).get("chat", {}).get("id")
-        action = (cb.get("data") or "").strip()
+        # Handle button clicks
+        cb = data.get("callback_query")
+        if cb:
+            user_id = cb.get("from", {}).get("id")
+            chat_id = cb.get("message", {}).get("chat", {}).get("id")
+            action = (cb.get("data") or "").strip()
+
+            if not _is_admin(user_id):
+                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                return jsonify({"ok": True})
+
+            settings = _settings()
+
+            if action == "menu":
+                _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+                return jsonify({"ok": True})
+
+            if action == "show_modes":
+                _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_mode:"):
+                mode = action.split(":", 1)[1]
+                set_setting("PLAN_MODE", mode)
+                settings = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
+                return jsonify({"ok": True})
+
+            if action == "show_entry":
+                _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_entry:"):
+                entry = action.split(":", 1)[1]
+                set_setting("ENTRY_MODE", entry)
+                settings = _settings()
+                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
+                return jsonify({"ok": True})
+
+            if action == "toggle_notify":
+                cur = _get_bool(settings, "AUTO_NOTIFY", True)
+                set_setting("AUTO_NOTIFY", "0" if cur else "1")
+                settings = _settings()
+                _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
+                return jsonify({"ok": True})
+
+
+
+
+            if action == "show_settings":
+                s = _settings()
+                txt = (
+                    "⚙️ الإعدادات الحالية:\n"
+                    f"- الخطة: {_mode_label(_get_str(s,'PLAN_MODE','daily'))}\n"
+                    f"- الدخول: {_entry_type_label(_get_str(s,'ENTRY_MODE','auto'))}\n"
+                    f"- SL%: {_get_float(s,'SL_PCT',3.0)}\n"
+                    f"- TP% (لضعيف/متوسط): {_get_float(s,'TP_PCT',5.0)}\n"
+                    f"- TP قوي: {_get_float(s,'TP_PCT_STRONG',7.0)}\n"
+                    f"- TP قوي جداً: {_get_float(s,'TP_PCT_VSTRONG',10.0)}\n"
+                    f"- رأس المال: {_get_float(s,'CAPITAL_USD',800.0)}$\n"
+                    f"- حجم الصفقة: {_get_float(s,'POSITION_PCT',0.20)*100:.0f}%\n"
+                    f"- عدد الفرص: {_get_int(s,'MIN_SEND',7)} إلى {_get_int(s,'MAX_SEND',10)}\n"
+                    f"- منع تكرار: {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
+                    f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
+                    f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
+                )
+                _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+
+            if action == "show_capital":
+                reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
+                _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
+                return jsonify({"ok": True})
+
+            if action == "set_capital_custom":
+                from storage import set_user_state
+                set_user_state(str(chat_id), "pending", "capital")
+                _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
+                return jsonify({"ok": True})
+
+            if action.startswith("set_capital:"):
+                val = action.split(":", 1)[1]
+                set_setting("CAPITAL_USD", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "show_position":
+                _tg_send(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_position:"):
+                val = action.split(":", 1)[1]
+                set_setting("POSITION_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "show_sl":
+                _tg_send(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_sl:"):
+                val = action.split(":", 1)[1]
+                set_setting("SL_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "show_tp":
+                _tg_send(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_tp:"):
+                val = action.split(":", 1)[1]
+                set_setting("TP_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "show_send":
+                _tg_send(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_send:"):
+                parts = action.split(":")
+                if len(parts) == 3:
+                    set_setting("MIN_SEND", parts[1])
+                    set_setting("MAX_SEND", parts[2])
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "toggle_resend":
+                cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
+                set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
+                s = _settings()
+                _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+            if action == "show_window":
+                _tg_send(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
+                return jsonify({"ok": True})
+
+            if action.startswith("set_window:"):
+                parts = action.split(":")
+                if len(parts) == 3:
+                    set_setting("WINDOW_START", parts[1])
+                    set_setting("WINDOW_END", parts[2])
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+
+
+
+
+            if action in ("do_analyze", "do_top"):
+                settings = _settings()
+                _tg_send(str(chat_id), "⏳ جاري التحليل...")
+                def _job():
+                    try:
+                        msg, _ = _run_scan_and_build_message(settings)
+                        send_telegram(msg)
+                    except Exception as e:
+                        _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+                _run_async(_job)
+                return jsonify({"ok": True})
+
+            # Unknown action
+            _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        # Handle normal messages
+        message = data.get("message") or data.get("channel_post")
+        if not message:
+            return jsonify({"ok": True})
+
+        chat_id = message["chat"]["id"]
+        user_id = message.get("from", {}).get("id")
+        text = (message.get("text") or "").strip()
+
+        # إدخال مخصص بعد ضغط زر
+        from storage import get_user_state, clear_user_state
+        pending = get_user_state(str(chat_id), "pending", "")
+        if pending == "capital" and text:
+            t = text.replace(",", "").strip()
+            try:
+                val = float(t)
+                if val <= 0:
+                    raise ValueError("bad")
+                set_setting("CAPITAL_USD", str(val))
+                clear_user_state(str(chat_id), "pending")
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
+            except Exception:
+                _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
+                return jsonify({"ok": True})
 
         if not _is_admin(user_id):
-            _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+            # Ignore silently for channels, but reply in private
+            if str(message.get("chat", {}).get("type")) == "private":
+                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
             return jsonify({"ok": True})
 
         settings = _settings()
 
-        if action == "menu":
+        if text.startswith("/start"):
+            _tg_send(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
+            return jsonify({"ok": True})
+
+        if text.startswith("/menu"):
             _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
-        if action == "show_modes":
-            _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_mode:"):
-            mode = action.split(":", 1)[1]
-            set_setting("PLAN_MODE", mode)
-            settings = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
-            return jsonify({"ok": True})
-
-        if action == "show_entry":
-            _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_entry:"):
-            entry = action.split(":", 1)[1]
-            set_setting("ENTRY_MODE", entry)
-            settings = _settings()
-            _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
-            return jsonify({"ok": True})
-
-        if action == "toggle_notify":
-            cur = _get_bool(settings, "AUTO_NOTIFY", True)
-            set_setting("AUTO_NOTIFY", "0" if cur else "1")
-            settings = _settings()
-            _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
-            return jsonify({"ok": True})
-
-
-
-
-        if action == "show_settings":
-            s = _settings()
-            txt = (
-                "⚙️ الإعدادات الحالية:\n"
-                f"- الخطة: {_mode_label(_get_str(s,'PLAN_MODE','daily'))}\n"
-                f"- الدخول: {_entry_type_label(_get_str(s,'ENTRY_MODE','auto'))}\n"
-                f"- SL%: {_get_float(s,'SL_PCT',3.0)}\n"
-                f"- TP% (لضعيف/متوسط): {_get_float(s,'TP_PCT',5.0)}\n"
-                f"- TP قوي: {_get_float(s,'TP_PCT_STRONG',7.0)}\n"
-                f"- TP قوي جداً: {_get_float(s,'TP_PCT_VSTRONG',10.0)}\n"
-                f"- رأس المال: {_get_float(s,'CAPITAL_USD',800.0)}$\n"
-                f"- حجم الصفقة: {_get_float(s,'POSITION_PCT',0.20)*100:.0f}%\n"
-                f"- عدد الفرص: {_get_int(s,'MIN_SEND',7)} إلى {_get_int(s,'MAX_SEND',10)}\n"
-                f"- منع تكرار: {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
-                f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
-                f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
-            )
-            _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-
-        if action == "show_capital":
-            reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
-            _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
-            return jsonify({"ok": True})
-
-        if action == "set_capital_custom":
-            from storage import set_user_state
-            set_user_state(str(chat_id), "pending", "capital")
-            _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
-            return jsonify({"ok": True})
-
-        if action.startswith("set_capital:"):
-            val = action.split(":", 1)[1]
-            set_setting("CAPITAL_USD", val)
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "show_position":
-            _tg_send(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_position:"):
-            val = action.split(":", 1)[1]
-            set_setting("POSITION_PCT", val)
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "show_sl":
-            _tg_send(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_sl:"):
-            val = action.split(":", 1)[1]
-            set_setting("SL_PCT", val)
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "show_tp":
-            _tg_send(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_tp:"):
-            val = action.split(":", 1)[1]
-            set_setting("TP_PCT", val)
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "show_send":
-            _tg_send(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_send:"):
-            parts = action.split(":")
-            if len(parts) == 3:
-                set_setting("MIN_SEND", parts[1])
-                set_setting("MAX_SEND", parts[2])
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "toggle_resend":
-            cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
-            set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
-            s = _settings()
-            _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-        if action == "show_window":
-            _tg_send(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
-            return jsonify({"ok": True})
-
-        if action.startswith("set_window:"):
-            parts = action.split(":")
-            if len(parts) == 3:
-                set_setting("WINDOW_START", parts[1])
-                set_setting("WINDOW_END", parts[2])
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-
-
-
-
-        if action in ("do_analyze", "do_top"):
-            settings = _settings()
+        if text.startswith("/analyze"):
             _tg_send(str(chat_id), "⏳ جاري التحليل...")
             def _job():
                 try:
@@ -755,70 +817,18 @@ def telegram_webhook():
             _run_async(_job)
             return jsonify({"ok": True})
 
-        # Unknown action
-        _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
-        return jsonify({"ok": True})
-
-    # Handle normal messages
-    message = data.get("message") or data.get("channel_post")
-    if not message:
-        return jsonify({"ok": True})
-
-    chat_id = message["chat"]["id"]
-    user_id = message.get("from", {}).get("id")
-    text = (message.get("text") or "").strip()
-
-    # إدخال مخصص بعد ضغط زر
-    from storage import get_user_state, clear_user_state
-    pending = get_user_state(str(chat_id), "pending", "")
-    if pending == "capital" and text:
-        t = text.replace(",", "").strip()
-        try:
-            val = float(t)
-            if val <= 0:
-                raise ValueError("bad")
-            set_setting("CAPITAL_USD", str(val))
-            clear_user_state(str(chat_id), "pending")
-            s = _settings()
-            _tg_send(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
-            return jsonify({"ok": True})
-        except Exception:
-            _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
+        if text.startswith("/settings"):
+            _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
-    if not _is_admin(user_id):
-        # Ignore silently for channels, but reply in private
-        if str(message.get("chat", {}).get("type")) == "private":
-            _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
         return jsonify({"ok": True})
 
-    settings = _settings()
 
-    if text.startswith("/start"):
-        _tg_send(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
+
+    except Exception:
+        print('WEBHOOK ERROR:')
+        print(traceback.format_exc())
         return jsonify({"ok": True})
-
-    if text.startswith("/menu"):
-        _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
-        return jsonify({"ok": True})
-
-    if text.startswith("/analyze"):
-        _tg_send(str(chat_id), "🔎 جاري الفحص...")
-        try:
-            msg, _ = _run_scan_and_build_message(settings)
-            send_telegram(msg)
-        except Exception as e:
-            _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
-        return jsonify({"ok": True})
-
-    if text.startswith("/settings"):
-        _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
-        return jsonify({"ok": True})
-
-    return jsonify({"ok": True})
-
-
-# ================= API routes =================
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "us-stocks-scanner-executor"})
