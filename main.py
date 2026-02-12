@@ -750,54 +750,54 @@ def telegram_webhook():
 
 
 
-if action == "noop":
-    return jsonify({"ok": True})
+            if action == "noop":
+                return jsonify({"ok": True})
 
-if action == "show_risk":
-    _tg_send(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
-    return jsonify({"ok": True})
+            if action == "show_risk":
+                _tg_send(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
+                return jsonify({"ok": True})
 
-if action.startswith("set_risk_aplus:"):
-    val = action.split(":", 1)[1]
-    set_setting("RISK_APLUS_PCT", val)
-    s = _settings()
-    _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
-    return jsonify({"ok": True})
+            if action.startswith("set_risk_aplus:"):
+                val = action.split(":", 1)[1]
+                set_setting("RISK_APLUS_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
 
-if action.startswith("set_risk_a:"):
-    val = action.split(":", 1)[1]
-    set_setting("RISK_A_PCT", val)
-    s = _settings()
-    _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
-    return jsonify({"ok": True})
+            if action.startswith("set_risk_a:"):
+                val = action.split(":", 1)[1]
+                set_setting("RISK_A_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
 
-if action.startswith("set_risk_b:"):
-    val = action.split(":", 1)[1]
-    set_setting("RISK_B_PCT", val)
-    s = _settings()
-    _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
-    return jsonify({"ok": True})
+            if action.startswith("set_risk_b:"):
+                val = action.split(":", 1)[1]
+                set_setting("RISK_B_PCT", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
 
-if action == "show_interval":
-    _tg_send(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
-    return jsonify({"ok": True})
+            if action == "show_interval":
+                _tg_send(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
+                return jsonify({"ok": True})
 
-if action.startswith("set_interval:"):
-    val = action.split(":", 1)[1]
-    set_setting("SCAN_INTERVAL_MIN", val)
+            if action.startswith("set_interval:"):
+                val = action.split(":", 1)[1]
+                set_setting("SCAN_INTERVAL_MIN", val)
 
-    # Apply immediately if scheduler already running
-    try:
-        if _scheduler is not None:
-            job = _scheduler.get_job("scan_job")
-            if job:
-                job.reschedule(trigger=IntervalTrigger(minutes=max(5, int(val))))
-    except Exception:
-        pass
+                # Apply immediately if scheduler already running
+                try:
+                    if _scheduler is not None:
+                        job = _scheduler.get_job("scan_job")
+                        if job:
+                            job.reschedule(trigger=IntervalTrigger(minutes=max(5, int(val))))
+                except Exception:
+                    pass
 
-    s = _settings()
-    _tg_send(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
-    return jsonify({"ok": True})
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
+                return jsonify({"ok": True})
 
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
