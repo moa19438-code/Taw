@@ -187,6 +187,65 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
     }
 
 
+def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
+    """Fetch recent 5-min bars for one symbol and compute lightweight intraday features.
+
+    Used for fast M5 / hybrid predictions. Keeps it lightweight to avoid slowing scans.
+    """
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return {"error": "Empty symbol"}
+
+    end = datetime.now(timezone.utc)
+    # last ~7 days is usually enough to compute EMA/RSI/ATR on 5m
+    start = end - timedelta(days=7)
+
+    data = bars([symbol], start=start, end=end, timeframe="5Min", limit=1000)
+    bars_by_symbol: Dict[str, List[Dict[str, Any]]] = data.get("bars", {}) if isinstance(data, dict) else {}
+    blist = bars_by_symbol.get(symbol) or []
+    if len(blist) < 120:
+        return {"error": "Not enough bars"}
+
+    closes = [float(b.get("c", 0)) for b in blist if "c" in b]
+    highs  = [float(b.get("h", 0)) for b in blist if "h" in b]
+    lows   = [float(b.get("l", 0)) for b in blist if "l" in b]
+    vols   = [float(b.get("v", 0)) for b in blist if "v" in b]
+    if len(closes) < 120 or len(highs) < 120 or len(lows) < 120 or len(vols) < 120:
+        return {"error": "Not enough data"}
+
+    last = closes[-1]
+
+    # Fast moving averages suitable for 5m
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    r14 = rsi(closes, 14)
+    a14 = atr(highs, lows, closes, 14)
+    atr_pct = (a14 / last) if (a14 and last) else None
+
+    vavg20 = (sum(vols[-20:]) / 20.0) if len(vols) >= 20 else None
+    vol_spike = bool(vavg20 and vols[-1] >= 1.5 * vavg20)
+
+    notes = []
+    if e20 is not None and e50 is not None and e20 > e50:
+        notes.append("EMA20>EMA50")
+    if r14 is not None:
+        notes.append(f"RSI {r14:.0f}")
+    if vol_spike:
+        notes.append("Vol spike")
+
+    return {
+        "tf": "5Min",
+        "last": round(float(last), 4),
+        "ema20": (round(float(e20), 4) if e20 is not None else None),
+        "ema50": (round(float(e50), 4) if e50 is not None else None),
+        "rsi14": (round(float(r14), 2) if r14 is not None else None),
+        "atr14": (round(float(a14), 4) if a14 is not None else None),
+        "atr_pct": (round(float(atr_pct), 4) if atr_pct is not None else None),
+        "vol_spike": bool(vol_spike),
+        "notes": ",".join(notes),
+    }
+
+
 def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=max(LOOKBACK_DAYS * 2, 180))

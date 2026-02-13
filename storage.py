@@ -417,6 +417,14 @@ def _env_defaults() -> Dict[str, str]:
             "TP_PCT_VSTRONG": "10",
             "WINDOW_START": "17:30",
             "WINDOW_END": "00:00",
+
+            # AI prediction (direction) settings
+            # D1 | M5 | M5+
+            "PREDICT_FRAME": "D1",
+            # Off by default for speed/cost; enable from Telegram settings
+            "AI_PREDICT_ENABLED": "0",
+            # Only run AI on top N candidates
+            "AI_PREDICT_TOPN": "5",
         }
     except Exception:
         return {}

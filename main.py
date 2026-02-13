@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import os
 import json
 import time
+import re
 
 import requests
 import atexit
@@ -14,7 +15,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
-from ai_analyzer import gemini_analyze
+from ai_analyzer import gemini_analyze, gemini_predict_direction
 from ai_filter import should_alert
 from ml_model import parse_weights, dumps_weights, featurize, predict_prob, update_online
 from executor import trade_symbol
@@ -54,7 +55,7 @@ from storage import (
     mark_signal_evaluated,
     last_signals,
 )
-from scanner import scan_universe_with_meta, Candidate, get_symbol_features
+from scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 
 app = Flask(__name__)
 
@@ -80,17 +81,10 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_notification": bool(silent)}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=20)
     except Exception:
         pass
 
-
-
-
-
-def _tg_send_async(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
-    """Fire-and-forget Telegram send to keep webhook responses snappy."""
-    _run_async(_tg_send, chat_id, text, reply_markup, silent)
 
 
 # --- Telegram callback responsiveness / anti-duplicate ---
@@ -148,10 +142,10 @@ def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> N
         send_dm = True
 
     if send_group and channel_id:
-        _tg_send_async(channel_id, text, reply_markup=reply_markup, silent=silent)
+        _tg_send(channel_id, text, reply_markup=reply_markup, silent=silent)
 
     if send_dm and admin_id:
-        _tg_send_async(admin_id, text, reply_markup=reply_markup, silent=silent)
+        _tg_send(admin_id, text, reply_markup=reply_markup, silent=silent)
 def _admin_id_int() -> int:
     try:
         return int(str(TELEGRAM_ADMIN_ID).strip()) if str(TELEGRAM_ADMIN_ID).strip() else 0
@@ -239,6 +233,89 @@ def _within_notification_window(settings: Dict[str, str]) -> Tuple[bool, str]:
 
 # ================= Scoring -> strength =================
 _STRENGTH_RANK = {"ضعيف": 1, "متوسط": 2, "قوي": 3, "قوي جداً": 4}
+
+
+def _extract_json_obj(text: str) -> Optional[dict]:
+    """Best-effort JSON extraction from a model response."""
+    if not text:
+        return None
+    t = text.strip()
+    # If it's already JSON
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Try to find a JSON object inside
+    m = re.search(r"\{[\s\S]*\}", t)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _ai_direction_for_symbol(symbol: str, settings: Dict[str, str]) -> Optional[dict]:
+    """Run Gemini direction prediction for one symbol.
+
+    Returns dict with keys: direction, confidence, reasons, risks, horizon.
+    """
+    if not _get_bool(settings, "AI_PREDICT_ENABLED", False):
+        return None
+
+    frame = _get_str(settings, "PREDICT_FRAME", "D1").upper()
+    if frame in ("HYBRID", "M5PLUS"):
+        frame = "M5+"
+    if frame not in ("D1", "M5", "M5+"):
+        frame = "D1"
+
+    # Build features depending on the requested horizon
+    features: Dict[str, Any] = {}
+    try:
+        if frame == "D1":
+            features = get_symbol_features(symbol)
+        elif frame == "M5":
+            features = get_symbol_features_m5(symbol)
+        else:  # M5+
+            f_d1 = get_symbol_features(symbol)
+            f_m5 = get_symbol_features_m5(symbol)
+            features = {f"d1_{k}": v for k, v in (f_d1 or {}).items()}
+            features.update({f"m5_{k}": v for k, v in (f_m5 or {}).items()})
+    except Exception as e:
+        return {"direction": "NEUTRAL", "confidence": 0, "horizon": frame, "reasons": [f"feature_error: {e}"], "risks": []}
+
+    # If we don't have enough data, don't waste an AI call
+    if isinstance(features, dict) and features.get("error"):
+        return {"direction": "NEUTRAL", "confidence": 0, "horizon": frame, "reasons": [str(features.get("error"))], "risks": []}
+
+    raw = gemini_predict_direction(symbol, features, horizon=frame)
+    obj = _extract_json_obj(str(raw.get("raw") or ""))
+    if not obj:
+        return {"direction": "NEUTRAL", "confidence": 0, "horizon": frame, "reasons": ["bad_ai_output"], "risks": []}
+
+    direction = str(obj.get("direction") or "NEUTRAL").upper()
+    if direction not in ("UP", "DOWN", "NEUTRAL"):
+        direction = "NEUTRAL"
+    try:
+        confidence = int(round(float(obj.get("confidence") or 0)))
+    except Exception:
+        confidence = 0
+    confidence = max(0, min(100, confidence))
+    reasons = obj.get("reasons") if isinstance(obj.get("reasons"), list) else []
+    risks = obj.get("risks") if isinstance(obj.get("risks"), list) else []
+
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "horizon": frame,
+        "reasons": [str(x) for x in reasons][:3],
+        "risks": [str(x) for x in risks][:3],
+    }
 
 
 def _strength(score: float) -> str:
@@ -360,6 +437,15 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
 def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_score: int | None = None) -> str:
     strength = _strength(float(c.score))
     entry_type = _entry_type_label(plan["entry_mode"])
+    ai_dir = plan.get("ai_dir")
+    ai_conf = plan.get("ai_conf")
+    ai_h = plan.get("ai_h")
+    ai_line = ""
+    if ai_dir:
+        try:
+            ai_line = f"تنبؤ AI ({ai_h or ''}): {ai_dir} ({int(ai_conf)}%)\n"
+        except Exception:
+            ai_line = f"تنبؤ AI ({ai_h or ''}): {ai_dir}\n"
     # Sahm screen fields (Arabic, as requested)
     return (
         f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}" + (f" | AI: {ai_score}/100" if ai_score is not None else "") + (f" | ML: {int(round(float(plan.get('ml_prob') or 0)*100))}%" if plan.get('ml_prob') is not None else "") + (f" | EV(R): {float(plan.get('ev_r')):.2f}" if plan.get('ev_r') is not None else "") + "\n"
@@ -369,6 +455,7 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         f"الكمية: {plan['qty']}\n"
         f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"
         f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
+        f"{ai_line}"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
         f"جني الربح:\n"
         f"  سعر الإيقاف: {plan['tp']}\n"
@@ -467,6 +554,16 @@ def _build_notify_route_kb() -> Dict[str, Any]:
 def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
     auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
     allow_resend = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
+    predict_frame = _get_str(settings, "PREDICT_FRAME", "D1").upper()
+    ai_pred = _get_bool(settings, "AI_PREDICT_ENABLED", False)
+
+    def _pf_label(p: str) -> str:
+        p = (p or "D1").upper()
+        if p == "M5":
+            return "M5"
+        if p in ("M5+", "M5PLUS", "HYBRID"):
+            return "M5+"
+        return "D1"
     return {
         "inline_keyboard": [
             [
@@ -489,7 +586,29 @@ def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
                 {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
                 {"text": "🕒 نافذة السوق", "callback_data": "show_window"},
             ],
+            [
+                {"text": f"🤖 إطار التنبؤ: {_pf_label(predict_frame)}", "callback_data": "show_horizon"},
+                {"text": f"🤖 تنبؤ AI: {'ON' if ai_pred else 'OFF'}", "callback_data": "toggle_ai_predict"},
+            ],
             [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+        ]
+    }
+
+
+def _build_horizon_kb(settings: Dict[str, str]) -> Dict[str, Any]:
+    cur = _get_str(settings, "PREDICT_FRAME", "D1").upper()
+    def _mark(val: str) -> str:
+        return "✅" if cur == val else ""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"{_mark('D1')} D1 (يومي)", "callback_data": "set_horizon:D1"},
+                {"text": f"{_mark('M5')} M5 (سريع)", "callback_data": "set_horizon:M5"},
+            ],
+            [
+                {"text": f"{_mark('M5+')} M5+ (هجين)", "callback_data": "set_horizon:M5+"},
+            ],
+            [{"text": "⬅️ رجوع", "callback_data": "show_settings"}],
         ]
     }
 
@@ -612,6 +731,10 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
     blocks: List[str] = []
     logged: List[Dict[str, Any]] = []
 
+    ai_topn = _get_int(settings, "AI_PREDICT_TOPN", 5)
+    ai_cache: Dict[str, Optional[dict]] = {}
+    ai_used = 0
+
     for c in candidates:
         if len(blocks) >= max_send:
             break
@@ -648,6 +771,20 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 continue
 
         plan = _compute_trade_plan(settings, c)
+
+        # Optional AI direction prediction (run only on top N to avoid slowness)
+        if _get_bool(settings, "AI_PREDICT_ENABLED", False) and ai_used < max(0, ai_topn):
+            if c.symbol not in ai_cache:
+                try:
+                    ai_cache[c.symbol] = _ai_direction_for_symbol(c.symbol, settings)
+                except Exception:
+                    ai_cache[c.symbol] = None
+            pred = ai_cache.get(c.symbol)
+            if pred:
+                plan["ai_dir"] = pred.get("direction")
+                plan["ai_conf"] = pred.get("confidence")
+                plan["ai_h"] = pred.get("horizon")
+                ai_used += 1
         # ML probability / expected value (اختياري)
         try:
             if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
@@ -690,6 +827,18 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                     continue
 
             plan = _compute_trade_plan(settings, c)
+            if _get_bool(settings, "AI_PREDICT_ENABLED", False) and ai_used < max(0, ai_topn):
+                if c.symbol not in ai_cache:
+                    try:
+                        ai_cache[c.symbol] = _ai_direction_for_symbol(c.symbol, settings)
+                    except Exception:
+                        ai_cache[c.symbol] = None
+                pred = ai_cache.get(c.symbol)
+                if pred:
+                    plan["ai_dir"] = pred.get("direction")
+                    plan["ai_conf"] = pred.get("confidence")
+                    plan["ai_h"] = pred.get("horizon")
+                    ai_used += 1
             try:
                 if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
                     w = parse_weights(settings.get("ML_WEIGHTS") or "")
@@ -765,47 +914,69 @@ def telegram_webhook():
 
 
             if not _is_admin(user_id):
-                _tg_send_async(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
                 return jsonify({"ok": True})
 
             settings = _settings()
 
             if action == "menu":
-                _tg_send_async(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "show_modes":
-                _tg_send_async(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
+                _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_mode:"):
                 mode = action.split(":", 1)[1]
                 set_setting("PLAN_MODE", mode)
                 settings = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "show_entry":
-                _tg_send_async(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
+                _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_entry:"):
                 entry = action.split(":", 1)[1]
                 set_setting("ENTRY_MODE", entry)
                 settings = _settings()
-                _tg_send_async(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "toggle_notify":
                 cur = _get_bool(settings, "AUTO_NOTIFY", True)
                 set_setting("AUTO_NOTIFY", "0" if cur else "1")
                 settings = _settings()
-                _tg_send_async(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
+                return jsonify({"ok": True})
+
+            if action == "toggle_ai_predict":
+                cur = _get_bool(settings, "AI_PREDICT_ENABLED", False)
+                set_setting("AI_PREDICT_ENABLED", "0" if cur else "1")
+                settings = _settings()
+                _tg_send(str(chat_id), "✅ تم تحديث تنبؤ AI.", reply_markup=_build_settings_kb(settings))
+                return jsonify({"ok": True})
+
+            if action == "show_horizon":
+                _tg_send(str(chat_id), "🤖 اختر إطار التنبؤ (يؤثر على تحليل AI فقط):", reply_markup=_build_horizon_kb(settings))
+                return jsonify({"ok": True})
+
+            if action.startswith("set_horizon:"):
+                val = action.split(":", 1)[1].strip().upper()
+                if val in ("HYBRID", "M5PLUS"):
+                    val = "M5+"
+                if val not in ("D1", "M5", "M5+"):
+                    val = "D1"
+                set_setting("PREDICT_FRAME", val)
+                s = _settings()
+                _tg_send(str(chat_id), f"✅ تم ضبط إطار التنبؤ: {val}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
 
             if action == "show_notify_route":
-                _tg_send_async(str(chat_id), "📨 اختر وجهة التنبيهات:", reply_markup=_build_notify_route_kb())
+                _tg_send(str(chat_id), "📨 اختر وجهة التنبيهات:", reply_markup=_build_notify_route_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_notify_route:"):
@@ -814,14 +985,14 @@ def telegram_webhook():
                     route = "dm"
                 set_setting("NOTIFY_ROUTE", route)
                 settings = _settings()
-                _tg_send_async(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "toggle_silent":
                 cur = _get_bool(settings, "NOTIFY_SILENT", True)
                 set_setting("NOTIFY_SILENT", "0" if cur else "1")
                 settings = _settings()
-                _tg_send_async(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
@@ -839,63 +1010,64 @@ def telegram_webhook():
                     f"- منع تكرار: {_get_int(s,'DEDUP_HOURS',6)} ساعات\n"
                     f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
                     f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
+                    f"- إطار التنبؤ (AI): {_get_str(s,'PREDICT_FRAME','D1')} | AI تنبؤ: {'ON' if _get_bool(s,'AI_PREDICT_ENABLED',False) else 'OFF'}\n"
                 )
-                _tg_send_async(str(chat_id), txt, reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_capital":
                 reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
-                _tg_send_async(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
+                _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
                 return jsonify({"ok": True})
 
             if action == "set_capital_custom":
                 from storage import set_user_state
                 set_user_state(str(chat_id), "pending", "capital")
-                _tg_send_async(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
+                _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
                 return jsonify({"ok": True})
 
             if action.startswith("set_capital:"):
                 val = action.split(":", 1)[1]
                 set_setting("CAPITAL_USD", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_position":
-                _tg_send_async(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
+                _tg_send(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_position:"):
                 val = action.split(":", 1)[1]
                 set_setting("POSITION_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_sl":
-                _tg_send_async(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
+                _tg_send(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_sl:"):
                 val = action.split(":", 1)[1]
                 set_setting("SL_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_tp":
-                _tg_send_async(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
+                _tg_send(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_tp:"):
                 val = action.split(":", 1)[1]
                 set_setting("TP_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_send":
-                _tg_send_async(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
+                _tg_send(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_send:"):
@@ -904,18 +1076,18 @@ def telegram_webhook():
                     set_setting("MIN_SEND", parts[1])
                     set_setting("MAX_SEND", parts[2])
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "toggle_resend":
                 cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
                 set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
                 s = _settings()
-                _tg_send_async(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_window":
-                _tg_send_async(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
+                _tg_send(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_window:"):
@@ -924,39 +1096,39 @@ def telegram_webhook():
                     set_setting("WINDOW_START", parts[1])
                     set_setting("WINDOW_END", parts[2])
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "noop":
                 return jsonify({"ok": True})
 
             if action == "show_risk":
-                _tg_send_async(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
+                _tg_send(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_aplus:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_APLUS_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_a:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_A_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_b:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_B_PCT", val)
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_interval":
-                _tg_send_async(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
+                _tg_send(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
                 return jsonify({"ok": True})
 
             if action.startswith("set_interval:"):
@@ -973,25 +1145,25 @@ def telegram_webhook():
                     pass
 
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
-                _tg_send_async(str(chat_id), "⏳ جاري التحليل...")
+                _tg_send(str(chat_id), "⏳ جاري التحليل...")
 
                 def _job():
                     try:
                         msg, _ = _run_scan_and_build_message(settings)
                         send_telegram(msg)
                     except Exception as e:
-                        _tg_send_async(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+                        _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
 
                 _run_async(_job)
                 return jsonify({"ok": True})
 
             # Unknown action
-            _tg_send_async(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
+            _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         # Handle normal messages
@@ -1015,26 +1187,26 @@ def telegram_webhook():
                 set_setting("CAPITAL_USD", str(val))
                 clear_user_state(str(chat_id), "pending")
                 s = _settings()
-                _tg_send_async(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
+                _tg_send(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
             except Exception:
-                _tg_send_async(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
+                _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
                 return jsonify({"ok": True})
 
         if not _is_admin(user_id):
             # Ignore silently for channels, but reply in private
             if str(message.get("chat", {}).get("type")) == "private":
-                _tg_send_async(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
             return jsonify({"ok": True})
 
         settings = _settings()
 
         if text.startswith("/start"):
-            _tg_send_async(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
+            _tg_send(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         if text.startswith("/menu"):
-            _tg_send_async(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+            _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         if text.startswith("/wl"):
@@ -1042,37 +1214,37 @@ def telegram_webhook():
             if len(parts) == 1 or (len(parts) >= 2 and parts[1].lower() in ("list","show")):
                 wl = get_watchlist()
                 if not wl:
-                    _tg_send_async(str(chat_id), "📌 الـ Watchlist فاضي.\nاستخدم: /wl add TSLA")
+                    _tg_send(str(chat_id), "📌 الـ Watchlist فاضي.\nاستخدم: /wl add TSLA")
                     return jsonify({"ok": True})
-                _tg_send_async(str(chat_id), "📌 Watchlist:\n" + "\n".join(wl))
+                _tg_send(str(chat_id), "📌 Watchlist:\n" + "\n".join(wl))
                 return jsonify({"ok": True})
 
             if len(parts) >= 3 and parts[1].lower() in ("add","+"):
                 sym = parts[2].upper()
                 add_watchlist(sym)
-                _tg_send_async(str(chat_id), f"✅ تم إضافة {sym} للـ Watchlist.")
+                _tg_send(str(chat_id), f"✅ تم إضافة {sym} للـ Watchlist.")
                 return jsonify({"ok": True})
 
             if len(parts) >= 3 and parts[1].lower() in ("del","remove","rm","-"):
                 sym = parts[2].upper()
                 remove_watchlist(sym)
-                _tg_send_async(str(chat_id), f"✅ تم حذف {sym} من الـ Watchlist.")
+                _tg_send(str(chat_id), f"✅ تم حذف {sym} من الـ Watchlist.")
                 return jsonify({"ok": True})
 
-            _tg_send_async(str(chat_id), "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
+            _tg_send(str(chat_id), "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
             return jsonify({"ok": True})
 
 
 
         if text.startswith("/analyze"):
-            _tg_send_async(str(chat_id), "⏳ جاري التحليل...")
+            _tg_send(str(chat_id), "⏳ جاري التحليل...")
 
             def _job():
                 try:
                     msg, _ = _run_scan_and_build_message(settings)
                     send_telegram(msg)
                 except Exception as e:
-                    _tg_send_async(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+                    _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
 
             _run_async(_job)
             return jsonify({"ok": True})
@@ -1080,28 +1252,28 @@ def telegram_webhook():
         if text.startswith("/ai"):
             parts = text.split()
             if len(parts) < 2:
-                _tg_send_async(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
+                _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
                 return jsonify({"ok": True})
 
             symbol = parts[1].upper().strip()
-            _tg_send_async(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
+            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
 
             def _job_ai():
                 try:
                     feats = get_symbol_features(symbol)
                     if isinstance(feats, dict) and feats.get("error"):
-                        _tg_send_async(str(chat_id), f"❌ {symbol}: {feats['error']}")
+                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}")
                         return
                     ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
-                    _tg_send_async(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
+                    _tg_send(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
                 except Exception as e:
-                    _tg_send_async(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
+                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
 
             _run_async(_job_ai)
             return jsonify({"ok": True})
 
         if text.startswith("/settings"):
-            _tg_send_async(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
+            _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         return jsonify({"ok": True})
