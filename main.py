@@ -80,10 +80,17 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_notification": bool(silent)}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=20)
+        requests.post(url, json=payload, timeout=5)
     except Exception:
         pass
 
+
+
+
+
+def _tg_send_async(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
+    """Fire-and-forget Telegram send to keep webhook responses snappy."""
+    _run_async(_tg_send, chat_id, text, reply_markup, silent)
 
 
 # --- Telegram callback responsiveness / anti-duplicate ---
@@ -141,10 +148,10 @@ def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> N
         send_dm = True
 
     if send_group and channel_id:
-        _tg_send(channel_id, text, reply_markup=reply_markup, silent=silent)
+        _tg_send_async(channel_id, text, reply_markup=reply_markup, silent=silent)
 
     if send_dm and admin_id:
-        _tg_send(admin_id, text, reply_markup=reply_markup, silent=silent)
+        _tg_send_async(admin_id, text, reply_markup=reply_markup, silent=silent)
 def _admin_id_int() -> int:
     try:
         return int(str(TELEGRAM_ADMIN_ID).strip()) if str(TELEGRAM_ADMIN_ID).strip() else 0
@@ -758,47 +765,47 @@ def telegram_webhook():
 
 
             if not _is_admin(user_id):
-                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                _tg_send_async(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
                 return jsonify({"ok": True})
 
             settings = _settings()
 
             if action == "menu":
-                _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+                _tg_send_async(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "show_modes":
-                _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
+                _tg_send_async(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_mode:"):
                 mode = action.split(":", 1)[1]
                 set_setting("PLAN_MODE", mode)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "show_entry":
-                _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
+                _tg_send_async(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_entry:"):
                 entry = action.split(":", 1)[1]
                 set_setting("ENTRY_MODE", entry)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
+                _tg_send_async(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "toggle_notify":
                 cur = _get_bool(settings, "AUTO_NOTIFY", True)
                 set_setting("AUTO_NOTIFY", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
+                _tg_send_async(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
 
 
             if action == "show_notify_route":
-                _tg_send(str(chat_id), "📨 اختر وجهة التنبيهات:", reply_markup=_build_notify_route_kb())
+                _tg_send_async(str(chat_id), "📨 اختر وجهة التنبيهات:", reply_markup=_build_notify_route_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_notify_route:"):
@@ -807,14 +814,14 @@ def telegram_webhook():
                     route = "dm"
                 set_setting("NOTIFY_ROUTE", route)
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
+                _tg_send_async(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
             if action == "toggle_silent":
                 cur = _get_bool(settings, "NOTIFY_SILENT", True)
                 set_setting("NOTIFY_SILENT", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
+                _tg_send_async(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
@@ -833,62 +840,62 @@ def telegram_webhook():
                     f"- إعادة إرسال إذا صار أقوى: {'نعم' if _get_bool(s,'ALLOW_RESEND_IF_STRONGER',True) else 'لا'}\n"
                     f"- نافذة السوق: {_get_str(s,'WINDOW_START','17:30')} إلى {_get_str(s,'WINDOW_END','00:00')} ({LOCAL_TZ})\n"
                 )
-                _tg_send(str(chat_id), txt, reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), txt, reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_capital":
                 reply = _build_capital_kb() if "_build_capital_kb" in globals() else {"inline_keyboard":[[{"text":"✍️ قيمة مخصصة","callback_data":"set_capital_custom"}],[{"text":"⬅️ رجوع","callback_data":"show_settings"}]]}
-                _tg_send(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
+                _tg_send_async(str(chat_id), "💰 اختر رأس المال بالدولار:", reply_markup=reply)
                 return jsonify({"ok": True})
 
             if action == "set_capital_custom":
                 from storage import set_user_state
                 set_user_state(str(chat_id), "pending", "capital")
-                _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
+                _tg_send_async(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
                 return jsonify({"ok": True})
 
             if action.startswith("set_capital:"):
                 val = action.split(":", 1)[1]
                 set_setting("CAPITAL_USD", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_position":
-                _tg_send(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
+                _tg_send_async(str(chat_id), "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_position:"):
                 val = action.split(":", 1)[1]
                 set_setting("POSITION_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط حجم الصفقة: {float(val)*100:.0f}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_sl":
-                _tg_send(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
+                _tg_send_async(str(chat_id), "📉 اختر وقف الخسارة %:", reply_markup=_build_sl_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_sl:"):
                 val = action.split(":", 1)[1]
                 set_setting("SL_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط وقف الخسارة: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_tp":
-                _tg_send(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
+                _tg_send_async(str(chat_id), "📈 اختر جني الربح % (لضعيف/متوسط):", reply_markup=_build_tp_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_tp:"):
                 val = action.split(":", 1)[1]
                 set_setting("TP_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط جني الربح (لضعيف/متوسط): {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_send":
-                _tg_send(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
+                _tg_send_async(str(chat_id), "🎛 اختر عدد الفرص في كل فحص:", reply_markup=_build_send_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_send:"):
@@ -897,18 +904,18 @@ def telegram_webhook():
                     set_setting("MIN_SEND", parts[1])
                     set_setting("MAX_SEND", parts[2])
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط عدد الفرص: {s.get('MIN_SEND','7')} إلى {s.get('MAX_SEND','10')}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "toggle_resend":
                 cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
                 set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
                 s = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_window":
-                _tg_send(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
+                _tg_send_async(str(chat_id), "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("set_window:"):
@@ -917,39 +924,39 @@ def telegram_webhook():
                     set_setting("WINDOW_START", parts[1])
                     set_setting("WINDOW_END", parts[2])
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط النافذة: {s.get('WINDOW_START','17:30')}→{s.get('WINDOW_END','00:00')}", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "noop":
                 return jsonify({"ok": True})
 
             if action == "show_risk":
-                _tg_send(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
+                _tg_send_async(str(chat_id), "⚖️ اختر نسب المخاطرة حسب التصنيف (A+/A/B):", reply_markup=_build_risk_kb(settings))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_aplus:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_APLUS_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة A+: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_a:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_A_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة A: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action.startswith("set_risk_b:"):
                 val = action.split(":", 1)[1]
                 set_setting("RISK_B_PCT", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط مخاطرة B: {val}%", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action == "show_interval":
-                _tg_send(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
+                _tg_send_async(str(chat_id), "⏱️ اختر فترة الفحص:", reply_markup=_build_interval_kb(settings))
                 return jsonify({"ok": True})
 
             if action.startswith("set_interval:"):
@@ -966,25 +973,25 @@ def telegram_webhook():
                     pass
 
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
-                _tg_send(str(chat_id), "⏳ جاري التحليل...")
+                _tg_send_async(str(chat_id), "⏳ جاري التحليل...")
 
                 def _job():
                     try:
                         msg, _ = _run_scan_and_build_message(settings)
                         send_telegram(msg)
                     except Exception as e:
-                        _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+                        _tg_send_async(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
 
                 _run_async(_job)
                 return jsonify({"ok": True})
 
             # Unknown action
-            _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
+            _tg_send_async(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         # Handle normal messages
@@ -1008,26 +1015,26 @@ def telegram_webhook():
                 set_setting("CAPITAL_USD", str(val))
                 clear_user_state(str(chat_id), "pending")
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
+                _tg_send_async(str(chat_id), f"✅ تم تحديث رأس المال إلى {val}$", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
             except Exception:
-                _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
+                _tg_send_async(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
                 return jsonify({"ok": True})
 
         if not _is_admin(user_id):
             # Ignore silently for channels, but reply in private
             if str(message.get("chat", {}).get("type")) == "private":
-                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                _tg_send_async(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
             return jsonify({"ok": True})
 
         settings = _settings()
 
         if text.startswith("/start"):
-            _tg_send(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
+            _tg_send_async(str(chat_id), "🤖 البوت شغال.\nاكتب /menu للأزرار.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         if text.startswith("/menu"):
-            _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
+            _tg_send_async(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         if text.startswith("/wl"):
@@ -1035,37 +1042,37 @@ def telegram_webhook():
             if len(parts) == 1 or (len(parts) >= 2 and parts[1].lower() in ("list","show")):
                 wl = get_watchlist()
                 if not wl:
-                    _tg_send(str(chat_id), "📌 الـ Watchlist فاضي.\nاستخدم: /wl add TSLA")
+                    _tg_send_async(str(chat_id), "📌 الـ Watchlist فاضي.\nاستخدم: /wl add TSLA")
                     return jsonify({"ok": True})
-                _tg_send(str(chat_id), "📌 Watchlist:\n" + "\n".join(wl))
+                _tg_send_async(str(chat_id), "📌 Watchlist:\n" + "\n".join(wl))
                 return jsonify({"ok": True})
 
             if len(parts) >= 3 and parts[1].lower() in ("add","+"):
                 sym = parts[2].upper()
                 add_watchlist(sym)
-                _tg_send(str(chat_id), f"✅ تم إضافة {sym} للـ Watchlist.")
+                _tg_send_async(str(chat_id), f"✅ تم إضافة {sym} للـ Watchlist.")
                 return jsonify({"ok": True})
 
             if len(parts) >= 3 and parts[1].lower() in ("del","remove","rm","-"):
                 sym = parts[2].upper()
                 remove_watchlist(sym)
-                _tg_send(str(chat_id), f"✅ تم حذف {sym} من الـ Watchlist.")
+                _tg_send_async(str(chat_id), f"✅ تم حذف {sym} من الـ Watchlist.")
                 return jsonify({"ok": True})
 
-            _tg_send(str(chat_id), "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
+            _tg_send_async(str(chat_id), "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
             return jsonify({"ok": True})
 
 
 
         if text.startswith("/analyze"):
-            _tg_send(str(chat_id), "⏳ جاري التحليل...")
+            _tg_send_async(str(chat_id), "⏳ جاري التحليل...")
 
             def _job():
                 try:
                     msg, _ = _run_scan_and_build_message(settings)
                     send_telegram(msg)
                 except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
+                    _tg_send_async(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
 
             _run_async(_job)
             return jsonify({"ok": True})
@@ -1073,28 +1080,28 @@ def telegram_webhook():
         if text.startswith("/ai"):
             parts = text.split()
             if len(parts) < 2:
-                _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
+                _tg_send_async(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
                 return jsonify({"ok": True})
 
             symbol = parts[1].upper().strip()
-            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
+            _tg_send_async(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
 
             def _job_ai():
                 try:
                     feats = get_symbol_features(symbol)
                     if isinstance(feats, dict) and feats.get("error"):
-                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}")
+                        _tg_send_async(str(chat_id), f"❌ {symbol}: {feats['error']}")
                         return
                     ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
-                    _tg_send(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
+                    _tg_send_async(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
                 except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
+                    _tg_send_async(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
 
             _run_async(_job_ai)
             return jsonify({"ok": True})
 
         if text.startswith("/settings"):
-            _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
+            _tg_send_async(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
 
         return jsonify({"ok": True})
