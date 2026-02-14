@@ -707,19 +707,20 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=dedup_hours)
     mode_label = _mode_label(mode)
-# Optional: require multi-timeframe alignment (safer entries)
-req_daily = _get_bool(settings, "REQUIRE_DAILY_OK", True)
-req_weekly = _get_bool(settings, "REQUIRE_WEEKLY_OK", True)
-req_monthly = _get_bool(settings, "REQUIRE_MONTHLY_OK", False)
+    # Optional: require multi-timeframe alignment (safer entries)
+    req_daily = _get_bool(settings, "REQUIRE_DAILY_OK", True)
+    req_weekly = _get_bool(settings, "REQUIRE_WEEKLY_OK", True)
+    req_monthly = _get_bool(settings, "REQUIRE_MONTHLY_OK", False)
 
-def _tf_ok(c: Candidate) -> bool:
-    if req_daily and not bool(getattr(c, "daily_ok", False)):
-        return False
-    if req_weekly and not bool(getattr(c, "weekly_ok", False)):
-        return False
-    if req_monthly and not bool(getattr(c, "monthly_ok", False)):
-        return False
-    return True
+    def _tf_ok(c: Candidate) -> bool:
+        if req_daily and not bool(getattr(c, "daily_ok", False)):
+            return False
+        if req_weekly and not bool(getattr(c, "weekly_ok", False)):
+            return False
+        if req_monthly and not bool(getattr(c, "monthly_ok", False)):
+            return False
+        return True
+
     # filter + sort
     candidates = [c for c in picks if _mode_matches(c, mode) and _tf_ok(c)]
     candidates.sort(key=lambda x: x.score, reverse=True)
