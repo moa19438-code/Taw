@@ -51,6 +51,9 @@ from storage import (
     pending_signals_for_eval,
     mark_signal_evaluated,
     last_signals,
+    get_watchlist,
+    add_watchlist,
+    remove_watchlist,
 )
 from scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -129,6 +132,168 @@ def _seen_and_mark(d: Dict[str, float], key: str, ttl_sec: float) -> bool:
         return True
     d[key] = now
     return False
+
+# ================= Telegram keyboards =================
+def _ikb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
+    """Build Telegram inline keyboard markup from rows of (text, callback_data)."""
+    return {
+        "inline_keyboard": [
+            [{"text": t, "callback_data": d} for (t, d) in row]
+            for row in rows
+        ]
+    }
+
+def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
+    # Main menu
+    return _ikb([
+        [("📊 فحص السوق", "do_analyze"), ("⚙️ الإعدادات", "show_settings")],
+        [("🔥 أفضل فرص الآن (D1)", "pick_d1"), ("⚡ سكالبينغ (M5)", "pick_m5")],
+        [("🧠 AI تحليل سهم", "ai_start"), ("🔁 تحديث القائمة", "menu")],
+    ])
+
+def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
+    ai_on = "ON" if _get_bool(s, "AI_PREDICT_ENABLED", False) else "OFF"
+    notify_on = "ON" if _get_bool(s, "AUTO_NOTIFY", True) else "OFF"
+    silent_on = "ON" if _get_bool(s, "NOTIFY_SILENT", True) else "OFF"
+    route = (_get_str(s, "NOTIFY_ROUTE", "dm") or "dm").upper()
+    return _ikb([
+        [("📆 الخطة الزمنية", "show_modes"), ("🎯 نوع الدخول", "show_entry")],
+        [("💰 رأس المال", "show_capital"), ("📦 حجم الصفقة", "show_position")],
+        [("📉 وقف الخسارة SL%", "show_sl"), ("📈 جني الربح TP%", "show_tp")],
+        [("🎛 عدد الفرص", "show_send"), ("🕒 نافذة السوق", "show_window")],
+        [("⏱️ فترة الفحص", "show_interval"), ("⚖️ المخاطرة", "show_risk")],
+        [(f"🔔 التنبيهات: {notify_on}", "toggle_notify"), (f"🔕 صامت: {silent_on}", "toggle_silent")],
+        [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), (f"📨 الوجهة: {route}", "show_notify_route")],
+        [("⬅️ رجوع", "menu")],
+    ])
+
+def _build_modes_kb() -> Dict[str, Any]:
+    return _ikb([
+        [("📅 يومي D1", "set_mode:daily"), ("⏱️ سكالبينغ M5", "set_mode:scalp")],
+        [("📈 سونق/سوينغ", "set_mode:swing"), ("⬅️ رجوع", "menu")],
+    ])
+
+def _build_entry_kb() -> Dict[str, Any]:
+    return _ikb([
+        [("🧠 تلقائي", "set_entry:auto"), ("✅ كسر/تأكيد", "set_entry:breakout")],
+        [("🎯 حد/Limit", "set_entry:limit"), ("⬅️ رجوع", "menu")],
+    ])
+
+def _build_horizon_kb(s: Dict[str, str]) -> Dict[str, Any]:
+    cur = (_get_str(s, "PREDICT_FRAME", "D1") or "D1").upper()
+    def lab(v: str) -> str:
+        return f"✅ {v}" if v == cur else v
+    return _ikb([
+        [(lab("D1"), "set_horizon:D1"), (lab("M5"), "set_horizon:M5"), (lab("M5+"), "set_horizon:M5+")],
+        [("⬅️ رجوع", "show_settings")],
+    ])
+
+def _build_notify_route_kb() -> Dict[str, Any]:
+    return _ikb([
+        [("📩 خاص (DM)", "set_notify_route:dm"), ("👥 مجموعة", "set_notify_route:group")],
+        [("🔁 الاثنين", "set_notify_route:both"), ("⬅️ رجوع", "show_settings")],
+    ])
+
+def _build_capital_kb() -> Dict[str, Any]:
+    opts = [200, 500, 800, 1000, 2000, 5000, 10000]
+    rows = []
+    for i in range(0, len(opts), 3):
+        row = []
+        for v in opts[i:i+3]:
+            row.append((f"{v}$", f"set_capital:{v}"))
+        rows.append(row)
+    rows.append([("✍️ قيمة مخصصة", "set_capital_custom"), ("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_position_kb() -> Dict[str, Any]:
+    opts = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    rows=[]
+    for i in range(0, len(opts), 3):
+        row=[]
+        for v in opts[i:i+3]:
+            row.append((f"{int(v*100)}%", f"set_position:{v}"))
+        rows.append(row)
+    rows.append([("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_sl_kb() -> Dict[str, Any]:
+    opts = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    rows=[]
+    for i in range(0, len(opts), 3):
+        row=[]
+        for v in opts[i:i+3]:
+            row.append((f"{v}%", f"set_sl:{v}"))
+        rows.append(row)
+    rows.append([("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_tp_kb() -> Dict[str, Any]:
+    opts = [3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
+    rows=[]
+    for i in range(0, len(opts), 3):
+        row=[]
+        for v in opts[i:i+3]:
+            row.append((f"{v}%", f"set_tp:{v}"))
+        rows.append(row)
+    rows.append([("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_send_kb() -> Dict[str, Any]:
+    presets = [("5-7", (5,7)), ("7-10", (7,10)), ("10-15", (10,15))]
+    rows=[[(p[0], f"set_send:{p[1][0]}:{p[1][1]}") for p in presets],
+          [("⬅️ رجوع", "show_settings")]]
+    return _ikb(rows)
+
+def _build_window_kb() -> Dict[str, Any]:
+    # Times are in LOCAL_TZ (Asia/Riyadh). Keep a few common presets.
+    presets = [("17:30→00:00", ("17:30","00:00")), ("16:30→23:30", ("16:30","23:30")), ("18:00→01:00", ("18:00","01:00"))]
+    rows=[]
+    for label,(a,b) in presets:
+        rows.append([(label, f"set_window:{a}:{b}")])
+    rows.append([("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_risk_kb(s: Dict[str, str]) -> Dict[str, Any]:
+    """Risk per trade presets (as % of capital) by grade A+/A/B."""
+    aplus_cur = _get_float(s, "RISK_APLUS_PCT", 1.0)
+    a_cur = _get_float(s, "RISK_A_PCT", 0.75)
+    b_cur = _get_float(s, "RISK_B_PCT", 0.5)
+
+    def _btn(label, cb):
+        return (label, cb)
+
+    def _mark(v, cur):
+        try:
+            return f"✅ {v}%" if float(v) == float(cur) else f"{v}%"
+        except Exception:
+            return f"{v}%"
+
+    return _ikb([
+        [(_mark(0.5, aplus_cur), "set_risk_aplus:0.5"), (_mark(1.0, aplus_cur), "set_risk_aplus:1.0"), (_mark(1.5, aplus_cur), "set_risk_aplus:1.5")],
+        [(_mark(0.5, a_cur), "set_risk_a:0.5"), (_mark(0.75, a_cur), "set_risk_a:0.75"), (_mark(1.0, a_cur), "set_risk_a:1.0")],
+        [(_mark(0.25, b_cur), "set_risk_b:0.25"), (_mark(0.5, b_cur), "set_risk_b:0.5"), (_mark(0.75, b_cur), "set_risk_b:0.75")],
+        [("⬅️ رجوع", "show_settings")],
+    ])
+
+def _build_interval_kb(s: Dict[str, str]) -> Dict[str, Any]:
+    cur = int(_get_int(s, "SCAN_INTERVAL_MIN", 15))
+    opts = [5, 10, 15, 30, 60]
+    rows=[]
+    row=[]
+    for v in opts:
+        t = f"✅ {v}m" if v == cur else f"{v}m"
+        row.append((t, f"set_interval:{v}"))
+        if len(row)==3:
+            rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([("⬅️ رجوع", "show_settings")])
+    return _ikb(rows)
+
+def _build_ai_start_kb() -> Dict[str, Any]:
+    return _ikb([
+        [("❌ إلغاء", "ai_cancel"), ("⬅️ القائمة", "menu")]
+    ])
+
 # --- Fast-pick cache for M5/D1 buttons (precompute in background) ---
 _PICK_CACHE: Dict[str, Dict[str, Any]] = {
     "m5": {"ts": 0.0, "items": [], "idx_by_chat": {}},
@@ -891,6 +1056,17 @@ def telegram_webhook():
             if action == "menu":
                 _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
+
+            if action == "ai_start":
+                from storage import set_user_state
+                set_user_state(str(chat_id), "pending", "ai_symbol")
+                _tg_send(str(chat_id), "🧠 اكتب رمز السهم الآن (مثال: TSLA)\nأو اكتب /ai TSLA", reply_markup=_build_ai_start_kb())
+                return jsonify({"ok": True})
+            if action == "ai_cancel":
+                from storage import clear_user_state
+                clear_user_state(str(chat_id), "pending")
+                _tg_send(str(chat_id), "✅ تم الإلغاء.", reply_markup=_build_menu(_settings()))
+                return jsonify({"ok": True})
             if action == "show_modes":
                 _tg_send(str(chat_id), "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
                 return jsonify({"ok": True})
@@ -1152,6 +1328,90 @@ def telegram_webhook():
             except Exception:
                 _tg_send(str(chat_id), "❌ رقم غير صحيح. أرسل رقم مثل: 5000")
                 return jsonify({"ok": True})
+        
+        if pending == "ai_symbol" and text:
+            symbol = re.sub(r"[^A-Za-z\.]", "", text.strip().upper())
+            if not symbol:
+                _tg_send(str(chat_id), "❌ اكتب رمز صحيح مثل: TSLA")
+                return jsonify({"ok": True})
+            from storage import clear_user_state
+            clear_user_state(str(chat_id), "pending")
+            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol}...")
+            def _job_ai_btn():
+                try:
+                    s = _settings()
+                    # Base features (D1)
+                    feats = get_symbol_features(symbol)
+                    if isinstance(feats, dict) and feats.get("error"):
+                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}", reply_markup=_build_menu(s))
+                        return
+                    # Optional M5 features (for scalping context)
+                    feats_m5 = None
+                    try:
+                        feats_m5 = get_symbol_features_m5(symbol)
+                    except Exception:
+                        feats_m5 = None
+                    # AI filter + score (deterministic)
+                    side = "buy"
+                    passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
+                    if AI_FILTER_ENABLED:
+                        passed, ai_score, ai_reasons, ai_features = should_alert(symbol, side, min_score=AI_FILTER_MIN_SCORE)
+                    # ML probability
+                    ml_p = None
+                    ev_r = None
+                    try:
+                        if ML_ENABLED and _get_bool(s, "ML_ENABLED", True):
+                            w = parse_weights(_get_str(s, "ML_WEIGHTS", ""))
+                            x = featurize(ai_features if ai_features else (feats if isinstance(feats, dict) else {}))
+                            ml_p = float(predict_prob(w, x))
+                            tp_r = float(_get_float(s, "DEFAULT_TP_R", 1.5))
+                            ev_r = (ml_p * tp_r) - ((1.0 - ml_p) * 1.0)
+                    except Exception:
+                        ml_p = None
+                        ev_r = None
+                    # Gemini narrative
+                    ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
+                    # Compose message
+                    lines = [f"🧠 AI تحليل سهم: {symbol}"]
+                    if ai_score is not None:
+                        tag = "✅ مناسب" if passed else "⛔ غير مناسب"
+                        lines.append(f"{tag} | Score: {ai_score}/100 (min {AI_FILTER_MIN_SCORE})")
+                    if ml_p is not None:
+                        lines.append(f"📈 احتمال (Model): {ml_p*100:.1f}%")
+                    if ev_r is not None:
+                        lines.append(f"🧮 EV (بالـ R): {ev_r:.2f}  *(إحصائي وليس ضمان)*")
+                    # Show few reasons
+                    if ai_reasons:
+                        lines.append("🔎 أسباب مختصرة:")
+                        for r in ai_reasons[:6]:
+                            lines.append(f"- {r}")
+                    # Add quick snapshot
+                    try:
+                        p = (ai_features or feats).get("price") if isinstance((ai_features or feats), dict) else None
+                        rsi = (ai_features or feats).get("rsi14") if isinstance((ai_features or feats), dict) else None
+                        if p is not None:
+                            lines.append(f"💵 Price: {float(p):.2f}")
+                        if rsi is not None:
+                            lines.append(f"📌 RSI14: {float(rsi):.1f}")
+                    except Exception:
+                        pass
+                    # Append Gemini text (trim)
+                    if ai_text:
+                        lines.append("")
+                        lines.append(ai_text[:3500])
+                    # Mention M5 context if available
+                    if isinstance(feats_m5, dict) and feats_m5 and not feats_m5.get("error"):
+                        try:
+                            sc, direction = _m5_score_from_features(feats_m5)
+                            lines.append("")
+                            lines.append(f"⚡ M5 Snapshot: {sc:.0f}/100 | dir: {direction}")
+                        except Exception:
+                            pass
+                    _tg_send(str(chat_id), "\n".join(lines), reply_markup=_build_menu(s))
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}", reply_markup=_build_menu(_settings()))
+            _run_async(_job_ai_btn)
+            return jsonify({"ok": True})
         if not _is_admin(user_id):
             # Ignore silently for channels, but reply in private
             if str(message.get("chat", {}).get("type")) == "private":
