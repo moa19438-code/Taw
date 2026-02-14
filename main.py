@@ -1876,41 +1876,30 @@ def _start_scheduler() -> None:
     
     # Precompute fast-pick caches for instant Telegram buttons
     try:
-        _scheduler.add_job(
-            _update_cache_m5,
-            IntervalTrigger(minutes=max(1, int(M5_CACHE_MIN))),
-            id="cache_m5_job",
-            replace_existing=True,
-        )
-        _scheduler.add_job(
-            _update_cache_d1,
-            IntervalTrigger(minutes=max(5, int(D1_CACHE_MIN))),
-            id="cache_d1_job",
-            replace_existing=True,
-        )
+def _start_scheduler():
+    global _scheduler
+    try:
+        if _scheduler and getattr(_scheduler, "running", False):
+            return
     except Exception:
         pass
 
-_scheduler.add_job(
+    _scheduler.add_job(
         _run_scan_and_notify,
         IntervalTrigger(minutes=max(5, interval)),
         kwargs={"force_summary": True},
         id="scan_job",
         replace_existing=True,
     )
+
     _scheduler.start()
     atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler else None)
+
 
 try:
     if os.getenv("ENABLE_SCHEDULER", "1") == "1":
         _start_scheduler()
-
-        # Warm caches in background (so first button press is instant)
-        try:
-            _run_async(_update_cache_d1)
-            _run_async(_update_cache_m5)
-        except Exception:
-            pass
+        # warm caches...
 except Exception:
     pass
 
