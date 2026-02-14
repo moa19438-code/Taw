@@ -7,6 +7,7 @@ import json
 import time
 import re
 import requests
+import xml.etree.ElementTree as ET
 import atexit
 import traceback
 import threading
@@ -14,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
 from ai_analyzer import gemini_analyze, gemini_predict_direction
-from ai_filter import should_alert, decide_signal
+from ai_filter import should_alert, decide_signal, score_signal
 from ml_model import parse_weights, dumps_weights, featurize, predict_prob, update_online
 from executor import trade_symbol
 from alpaca_client import bars, clock
@@ -54,6 +55,8 @@ from storage import (
     get_watchlist,
     add_watchlist,
     remove_watchlist,
+    log_signal_review,
+    last_signal_reviews,
 )
 from scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -132,6 +135,20 @@ def _seen_and_mark(d: Dict[str, float], key: str, ttl_sec: float) -> bool:
         return True
     d[key] = now
     return False
+@app.get("/api/review")
+def api_review():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    lookback = int(request.args.get("days") or 2)
+    msg = _review_recent_signals(lookback_days=lookback, limit=80)
+    # send to default telegram (admin/channel)
+    try:
+        send_telegram(msg)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "reviewed_days": lookback})
+
 
 # ================= Telegram keyboards =================
 def _ikb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
@@ -148,8 +165,11 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
     return _ikb([
         [("📊 فحص السوق", "do_analyze"), ("⚙️ الإعدادات", "show_settings")],
         [("🔥 أفضل فرص الآن (D1)", "pick_d1"), ("⚡ سكالبينغ (M5)", "pick_m5")],
-        [("🧠 AI تحليل سهم", "ai_start"), ("🔁 تحديث القائمة", "menu")],
+        [("🧠 1- أفضل EV", "ai_top_ev"), ("🧠 2- أعلى احتمال", "ai_top_prob")],
+        [("🧠 3- سكالبينغ M5", "ai_top_m5"), ("🔎 AI سهم معين", "ai_symbol_start")],
+        [("📈 مراجعة إشاراتي", "review_signals"), ("🔁 تحديث القائمة", "menu")],
     ])
+
 
 def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
     ai_on = "ON" if _get_bool(s, "AI_PREDICT_ENABLED", False) else "OFF"
@@ -288,6 +308,167 @@ def _build_interval_kb(s: Dict[str, str]) -> Dict[str, Any]:
     if row: rows.append(row)
     rows.append([("⬅️ رجوع", "show_settings")])
     return _ikb(rows)
+
+
+def _fetch_news_headlines(symbol: str, limit: int = 5) -> list[dict]:
+    """Fetch latest trading-relevant headlines (best-effort, no key required).
+
+    Uses Google News RSS by default. If NEWSAPI_KEY is set, uses NewsAPI.org.
+    Returns list of dicts: {title, source, published, url}
+    """
+    sym = re.sub(r"[^A-Za-z\.]", "", (symbol or "").upper()).strip()
+    if not sym:
+        return []
+    # 1) Optional NewsAPI (if user provides key)
+    newsapi_key = (os.getenv("NEWSAPI_KEY") or "").strip()
+    if newsapi_key:
+        try:
+            q = f"{sym} stock OR shares"
+            url = "https://newsapi.org/v2/everything"
+            r = requests.get(url, params={
+                "q": q,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": int(limit),
+                "apiKey": newsapi_key,
+            }, timeout=12)
+            data = r.json() if r.ok else {}
+            out = []
+            for a in (data.get("articles") or [])[:limit]:
+                out.append({
+                    "title": a.get("title"),
+                    "source": (a.get("source") or {}).get("name"),
+                    "published": a.get("publishedAt"),
+                    "url": a.get("url"),
+                })
+            return [x for x in out if x.get("title")]
+        except Exception:
+            pass
+
+    # 2) Google News RSS (no key)
+    try:
+        q = f"{sym}%20stock"
+        rss = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+        r = requests.get(rss, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if not r.ok or not (r.text or "").strip():
+            return []
+        root = ET.fromstring(r.text)
+        out = []
+        for item in root.findall(".//item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            source = None
+            s = item.find("source")
+            if s is not None and (s.text or "").strip():
+                source = s.text.strip()
+            if title:
+                out.append({"title": title, "source": source, "published": pub, "url": link})
+        return out
+    except Exception:
+        return []
+
+def _build_top10_kb(items: list[dict], title: str = "") -> Dict[str, Any]:
+    rows = []
+    for it in items[:10]:
+        sym = it.get("symbol") or ""
+        if not sym:
+            continue
+        label = it.get("label") or sym
+        rows.append([(label, f"ai_pick:{sym}")])
+    rows.append([("⬅️ القائمة", "menu")])
+    return _ikb(rows)
+
+def _start_ai_symbol_analysis(chat_id: str, symbol: str) -> None:
+    symbol = re.sub(r"[^A-Za-z\.]", "", (symbol or "").strip().upper())
+    if not symbol:
+        _tg_send(str(chat_id), "❌ اكتب رمز صحيح مثل: TSLA")
+        return
+    _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol}...")
+    def _job():
+        try:
+            s = _settings()
+            feats = get_symbol_features(symbol)
+            if isinstance(feats, dict) and feats.get("error"):
+                _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}", reply_markup=_build_menu(s))
+                return
+
+            # Attach news headlines (trading catalysts)
+            news = _fetch_news_headlines(symbol, limit=int(_get_int(s, "AI_NEWS_LIMIT", 5)))
+            if news:
+                feats["_news"] = [{"title": n.get("title"), "source": n.get("source"), "published": n.get("published") } for n in news]
+
+            # Optional M5 features (for context)
+            feats_m5 = None
+            try:
+                feats_m5 = get_symbol_features_m5(symbol)
+            except Exception:
+                feats_m5 = None
+
+            # AI filter + score
+            side = "buy"
+            passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
+            if AI_FILTER_ENABLED:
+                try:
+                    ai_score, ai_reasons, ai_features = score_signal(symbol, side=side)
+                except Exception:
+                    ai_score, ai_reasons, ai_features = (None, [], {})
+
+            # Build plan for EV/prob (uses same TP/SL settings)
+            plan = _build_trade_plan(symbol, side=side, entry=float(feats.get("close") or feats.get("last_close") or 0.0),
+                                     atr=float(feats.get("atr") or feats.get("atr14") or 0.0),
+                                     settings=s)
+
+            # ML probability / expected value (optional)
+            try:
+                if ML_ENABLED and AI_FILTER_ENABLED and (ai_features is not None):
+                    w = parse_weights(s.get("ML_WEIGHTS") or "")
+                    x = featurize(ai_features)
+                    p = float(predict_prob(w, x))
+                    plan["ml_prob"] = round(p, 4)
+                    tp_r = float(plan.get("tp_r_mult") or 0.0)
+                    plan["ev_r"] = round((p * tp_r) - ((1.0 - p) * 1.0), 3)
+            except Exception:
+                pass
+
+            # Gemini analysis (with news)
+            gem = None
+            try:
+                gem = gemini_analyze(symbol, feats)
+            except Exception:
+                gem = None
+
+            lines = []
+            lines.append(f"🧠 تحليل AI للسهم: {symbol}")
+            if ai_score is not None:
+                lines.append(f"• AI Score: {ai_score}/100")
+            if plan.get("ml_prob") is not None:
+                lines.append(f"• Probability (ML): {plan['ml_prob']}")
+            if plan.get("ev_r") is not None:
+                lines.append(f"• EV (R): {plan['ev_r']}")
+            if ai_reasons:
+                lines.append("\n✅ أهم الأسباب:")
+                for r in ai_reasons[:6]:
+                    lines.append(f"- {r}")
+            if feats_m5 and not feats_m5.get("error"):
+                lines.append("\n⚡ لمحة M5:")
+                for k in ("last","rsi14","atr14","pattern","liquidity","spread_risk"):
+                    if k in feats_m5:
+                        lines.append(f"- {k}: {feats_m5.get(k)}")
+            if news:
+                lines.append("\n🗞️ آخر الأخبار (مختصر):")
+                for n in news[:5]:
+                    t = n.get("title")
+                    src = n.get("source")
+                    if t:
+                        lines.append(f"- {t}" + (f" ({src})" if src else ""))
+            if gem:
+                lines.append("\n🤖 Gemini:\n" + str(gem).strip())
+
+            _tg_send(str(chat_id), "\n".join(lines), reply_markup=_build_menu(s))
+        except Exception as e:
+            _tg_send(str(chat_id), f"❌ خطأ أثناء التحليل: {e}")
+    _run_async(_job)
 
 def _build_ai_start_kb() -> Dict[str, Any]:
     return _ikb([
@@ -1057,7 +1238,120 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
-            if action == "ai_start":
+            if action == "review_signals":
+                _tg_send(str(chat_id), "⏳ جاري مراجعة الإشارات...")
+                def _job():
+                    try:
+                        msg = _review_recent_signals(lookback_days=int(_get_int(_settings(), "REVIEW_LOOKBACK_DAYS", 2)), limit=80)
+                        _tg_send(str(chat_id), msg)
+                    except Exception as e:
+                        _tg_send(str(chat_id), f"❌ خطأ أثناء المراجعة:\n{e}")
+                _run_async(_job)
+                return jsonify({"ok": True})
+
+            
+            if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
+                s = _settings()
+                # 3) M5 uses intraday cache (fast)
+                if action == "ai_top_m5":
+                    try:
+                        _update_cache_m5()
+                    except Exception:
+                        pass
+                    with _PICK_LOCK:
+                        items = list((_PICK_CACHE.get("m5") or {}).get("items") or [])
+                    items = items[:10]
+                    out = []
+                    for it in items:
+                        sym = it.get("symbol")
+                        if not sym: 
+                            continue
+                        sc = float(it.get("score", 0.0))
+                        direction = it.get("direction") or ""
+                        label = f"{sym} | {direction} | {sc:.0f}"
+                        out.append({"symbol": sym, "label": label})
+                    if not out:
+                        _tg_send(str(chat_id), "❌ لا توجد فرص M5 الآن (قد يكون السوق مغلق).", reply_markup=_build_menu(s))
+                        return jsonify({"ok": True})
+                    _tg_send(str(chat_id), "🧠 Top 10 (3- سكالبينغ M5): اختر سهم", reply_markup=_build_top10_kb(out))
+                    return jsonify({"ok": True})
+
+                # 1-2) D1 ranking: compute plans + ML probability/EV (best-effort)
+                picks, universe_size = scan_universe_with_meta()
+                ranked = []
+                for c in (picks or [])[:max(30, min(120, len(picks) if picks else 0))]:
+                    try:
+                        sym = c.symbol
+                        side = "buy" if str(getattr(c, "side", "buy")) in ("buy","long") else "sell"
+                        passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
+                        if AI_FILTER_ENABLED:
+                            try:
+                                ai_score, ai_reasons, ai_features = score_signal(sym, side=side)
+                            except Exception:
+                                ai_score, ai_reasons, ai_features = (None, [], {})
+                        # Plan based on candidate values
+                        entry = float(getattr(c, "last_close", 0.0) or 0.0)
+                        atr = float(getattr(c, "atr", 0.0) or 0.0)
+                        plan = _build_trade_plan(sym, side=side, entry=entry, atr=atr, settings=s)
+                        p = None
+                        ev = None
+                        try:
+                            if ML_ENABLED and AI_FILTER_ENABLED and (ai_features is not None):
+                                w = parse_weights(s.get("ML_WEIGHTS") or "")
+                                x = featurize(ai_features)
+                                p = float(predict_prob(w, x))
+                                tp_r = float(plan.get("tp_r_mult") or 0.0)
+                                ev = (p * tp_r) - ((1.0 - p) * 1.0)
+                        except Exception:
+                            p, ev = (None, None)
+                        ranked.append({
+                            "symbol": sym,
+                            "ai_score": ai_score,
+                            "ml_prob": p,
+                            "ev_r": ev,
+                        })
+                    except Exception:
+                        continue
+
+                if not ranked:
+                    _tg_send(str(chat_id), "❌ لا توجد نتائج الآن.", reply_markup=_build_menu(s))
+                    return jsonify({"ok": True})
+
+                if action == "ai_top_prob":
+                    ranked.sort(key=lambda x: (x["ml_prob"] is None, -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
+                    title = "🧠 Top 10 (2- أعلى احتمال): اختر سهم"
+                    out=[]
+                    for it in ranked[:10]:
+                        sym=it["symbol"]
+                        p=it["ml_prob"]
+                        sc=it["ai_score"]
+                        label=f"{sym} | P {p:.2f}" if p is not None else f"{sym} | P ?"
+                        if sc is not None:
+                            label += f" | S {sc}"
+                        out.append({"symbol": sym, "label": label})
+                    _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
+                    return jsonify({"ok": True})
+
+                # ai_top_ev
+                ranked.sort(key=lambda x: (x["ev_r"] is None, -(x["ev_r"] or -999.0), -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
+                title = "🧠 Top 10 (1- أفضل EV): اختر سهم"
+                out=[]
+                for it in ranked[:10]:
+                    sym=it["symbol"]
+                    ev=it["ev_r"]
+                    p=it["ml_prob"]
+                    label=f"{sym} | EV {ev:.2f}" if ev is not None else f"{sym} | EV ?"
+                    if p is not None:
+                        label += f" | P {p:.2f}"
+                    out.append({"symbol": sym, "label": label})
+                _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
+                return jsonify({"ok": True})
+
+            if action.startswith("ai_pick:"):
+                sym = action.split(":", 1)[1].strip().upper()
+                _start_ai_symbol_analysis(str(chat_id), sym)
+                return jsonify({"ok": True})
+            if action == "ai_symbol_start":
                 from storage import set_user_state
                 set_user_state(str(chat_id), "pending", "ai_symbol")
                 _tg_send(str(chat_id), "🧠 اكتب رمز السهم الآن (مثال: TSLA)\nأو اكتب /ai TSLA", reply_markup=_build_ai_start_kb())
@@ -1336,82 +1630,9 @@ def telegram_webhook():
                 return jsonify({"ok": True})
             from storage import clear_user_state
             clear_user_state(str(chat_id), "pending")
-            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol}...")
-            def _job_ai_btn():
-                try:
-                    s = _settings()
-                    # Base features (D1)
-                    feats = get_symbol_features(symbol)
-                    if isinstance(feats, dict) and feats.get("error"):
-                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}", reply_markup=_build_menu(s))
-                        return
-                    # Optional M5 features (for scalping context)
-                    feats_m5 = None
-                    try:
-                        feats_m5 = get_symbol_features_m5(symbol)
-                    except Exception:
-                        feats_m5 = None
-                    # AI filter + score (deterministic)
-                    side = "buy"
-                    passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
-                    if AI_FILTER_ENABLED:
-                        passed, ai_score, ai_reasons, ai_features = should_alert(symbol, side, min_score=AI_FILTER_MIN_SCORE)
-                    # ML probability
-                    ml_p = None
-                    ev_r = None
-                    try:
-                        if ML_ENABLED and _get_bool(s, "ML_ENABLED", True):
-                            w = parse_weights(_get_str(s, "ML_WEIGHTS", ""))
-                            x = featurize(ai_features if ai_features else (feats if isinstance(feats, dict) else {}))
-                            ml_p = float(predict_prob(w, x))
-                            tp_r = float(_get_float(s, "DEFAULT_TP_R", 1.5))
-                            ev_r = (ml_p * tp_r) - ((1.0 - ml_p) * 1.0)
-                    except Exception:
-                        ml_p = None
-                        ev_r = None
-                    # Gemini narrative
-                    ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
-                    # Compose message
-                    lines = [f"🧠 AI تحليل سهم: {symbol}"]
-                    if ai_score is not None:
-                        tag = "✅ مناسب" if passed else "⛔ غير مناسب"
-                        lines.append(f"{tag} | Score: {ai_score}/100 (min {AI_FILTER_MIN_SCORE})")
-                    if ml_p is not None:
-                        lines.append(f"📈 احتمال (Model): {ml_p*100:.1f}%")
-                    if ev_r is not None:
-                        lines.append(f"🧮 EV (بالـ R): {ev_r:.2f}  *(إحصائي وليس ضمان)*")
-                    # Show few reasons
-                    if ai_reasons:
-                        lines.append("🔎 أسباب مختصرة:")
-                        for r in ai_reasons[:6]:
-                            lines.append(f"- {r}")
-                    # Add quick snapshot
-                    try:
-                        p = (ai_features or feats).get("price") if isinstance((ai_features or feats), dict) else None
-                        rsi = (ai_features or feats).get("rsi14") if isinstance((ai_features or feats), dict) else None
-                        if p is not None:
-                            lines.append(f"💵 Price: {float(p):.2f}")
-                        if rsi is not None:
-                            lines.append(f"📌 RSI14: {float(rsi):.1f}")
-                    except Exception:
-                        pass
-                    # Append Gemini text (trim)
-                    if ai_text:
-                        lines.append("")
-                        lines.append(ai_text[:3500])
-                    # Mention M5 context if available
-                    if isinstance(feats_m5, dict) and feats_m5 and not feats_m5.get("error"):
-                        try:
-                            sc, direction = _m5_score_from_features(feats_m5)
-                            lines.append("")
-                            lines.append(f"⚡ M5 Snapshot: {sc:.0f}/100 | dir: {direction}")
-                        except Exception:
-                            pass
-                    _tg_send(str(chat_id), "\n".join(lines), reply_markup=_build_menu(s))
-                except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}", reply_markup=_build_menu(_settings()))
-            _run_async(_job_ai_btn)
+            _start_ai_symbol_analysis(str(chat_id), symbol)
             return jsonify({"ok": True})
+
         if not _is_admin(user_id):
             # Ignore silently for channels, but reply in private
             if str(message.get("chat", {}).get("type")) == "private":
@@ -1458,22 +1679,12 @@ def telegram_webhook():
         if text.startswith("/ai"):
             parts = text.split()
             if len(parts) < 2:
-                _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai AXTA")
+                _tg_send(str(chat_id), "اكتب: /ai SYMBOL  مثال: /ai TSLA")
                 return jsonify({"ok": True})
             symbol = parts[1].upper().strip()
-            _tg_send(str(chat_id), f"🧠 جاري تحليل {symbol} بالذكاء الاصطناعي...")
-            def _job_ai():
-                try:
-                    feats = get_symbol_features(symbol)
-                    if isinstance(feats, dict) and feats.get("error"):
-                        _tg_send(str(chat_id), f"❌ {symbol}: {feats['error']}")
-                        return
-                    ai_text = gemini_analyze(symbol, feats if isinstance(feats, dict) else {"data": str(feats)})
-                    _tg_send(str(chat_id), f"🧠 تحليل AI لـ {symbol}\n\n{ai_text}")
-                except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ تحليل AI:\n{e}")
-            _run_async(_job_ai)
+            _start_ai_symbol_analysis(str(chat_id), symbol)
             return jsonify({"ok": True})
+
         if text.startswith("/settings"):
             _tg_send(str(chat_id), "⚙️", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
@@ -1726,6 +1937,85 @@ def _run_scan_and_notify(force_summary: bool=True) -> None:
             send_telegram(b)
     elif force_summary:
         send_telegram(_fmt_scan_summary_ar(s, universe_size, picks))
+
+def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
+    """Build a Telegram message that reviews recent signals using latest available daily close.
+    This does NOT place trades. It simply measures how signals performed so far (exploration mode)."
+    """
+    now = datetime.now(timezone.utc)
+    # pull last signals regardless of evaluated status (we want recent performance snapshots)
+    rows = last_signals(limit=max(20, int(limit)))
+    if not rows:
+        return "لا توجد إشارات لمراجعتها الآن."
+    reviewed = 0
+    winners = 0
+    losers = 0
+    lines = []
+    for r in rows:
+        try:
+            ts = r.get("ts") or ""
+            if not ts:
+                continue
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if (now - dt).days > int(lookback_days):
+                continue
+            symbol = (r.get("symbol") or "").upper().strip()
+            side = (r.get("side") or "buy").lower().strip()
+            entry = float(r.get("entry") or 0.0)
+            if entry <= 0:
+                continue
+            # get daily bars from signal date to now (few days only)
+            data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
+            blist = (data.get("bars", {}).get(symbol) or [])
+            if not blist:
+                continue
+            last_close = float(blist[-1].get("c") or entry)
+            highs = [float(b.get("h") or b.get("c") or entry) for b in blist]
+            lows = [float(b.get("l") or b.get("c") or entry) for b in blist]
+            max_high = max(highs) if highs else entry
+            min_low = min(lows) if lows else entry
+            if side == "sell":
+                ret = (entry - last_close) / entry * 100.0
+                mfe = (entry - min_low) / entry * 100.0
+                mae = (entry - max_high) / entry * 100.0
+            else:
+                ret = (last_close - entry) / entry * 100.0
+                mfe = (max_high - entry) / entry * 100.0
+                mae = (min_low - entry) / entry * 100.0
+            label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
+            if ret > 0:
+                winners += 1
+            elif ret < 0:
+                losers += 1
+            reviewed += 1
+            # store snapshot
+            try:
+                log_signal_review(
+                    ts=now.isoformat(),
+                    signal_id=int(r.get("id")),
+                    close=float(last_close),
+                    return_pct=float(ret),
+                    mfe_pct=float(mfe),
+                    mae_pct=float(mae),
+                    note="daily_review",
+                )
+            except Exception:
+                pass
+            mode = r.get("mode") or ""
+            score = r.get("score")
+            lines.append(f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}" if score is not None else f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}")
+        except Exception:
+            continue
+
+    if reviewed == 0:
+        return "لا توجد إشارات حديثة ضمن فترة المراجعة."
+    header = f"📈 مراجعة الإشارات (آخر {lookback_days} يوم):\n" \
+             f"— تمت مراجعة: {reviewed}\n" \
+             f"— رابحة: {winners} | خاسرة: {losers}\n" \
+             f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
+    body = "\n".join(lines[:25])
+    return header + "\n" + body
+
 def _evaluate_pending_signals() -> None:
     """Evaluate old signals (after horizon) and optionally update lightweight model weights."""
     try:

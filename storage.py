@@ -107,6 +107,22 @@ def init_db() -> None:
                     );
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id);")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS signal_reviews (
+                        id BIGSERIAL PRIMARY KEY,
+                        ts TEXT NOT NULL,
+                        signal_id BIGINT NOT NULL,
+                        close DOUBLE PRECISION,
+                        return_pct DOUBLE PRECISION,
+                        mfe_pct DOUBLE PRECISION,
+                        mae_pct DOUBLE PRECISION,
+                        note TEXT
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_signal_id ON signal_reviews(signal_id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_ts ON signal_reviews(ts);")
+
             con.commit()
         return
 
@@ -761,3 +777,45 @@ def get_recent_stats(limit: int = 200) -> Dict[str, Any]:
     avg_r = (sum(rs) / len(rs)) if rs else None
     winrate = (wins / (wins + losses)) if (wins + losses) else 0.0
     return {"total": total, "wins": wins, "losses": losses, "skips": skips, "winrate": winrate, "avg_r": avg_r}
+
+
+def log_signal_review(
+    ts: str,
+    signal_id: int,
+    close: float,
+    return_pct: float,
+    mfe_pct: float,
+    mae_pct: float,
+    note: str = "",
+) -> None:
+    """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or ""),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note)
+            VALUES (?,?,?,?,?,?,?)""",
+            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or ""),
+        )
+        con.commit()
+
+
+def last_signal_reviews(limit: int = 50) -> List[Dict[str, Any]]:
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("""SELECT * FROM signal_reviews ORDER BY id DESC LIMIT %s""", (limit,))
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM signal_reviews ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
