@@ -2,6 +2,14 @@ import os
 import sqlite3
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+import json
+
+
+def json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return ""
 
 DB_PATH = "trades.db"
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
@@ -87,6 +95,18 @@ def init_db() -> None:
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_mode ON signals(symbol, mode);")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS signal_outcomes (
+                        id BIGSERIAL PRIMARY KEY,
+                        ts TEXT NOT NULL,
+                        signal_id BIGINT NOT NULL,
+                        result TEXT NOT NULL,
+                        r_mult DOUBLE PRECISION,
+                        notes TEXT
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id);")
             con.commit()
         return
 
@@ -157,6 +177,18 @@ def init_db() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_mode ON signals(symbol, mode)")
+
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS signal_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                signal_id INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                r_mult REAL,
+                notes TEXT
+            )"""
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id)")
         con.commit()
 
 
@@ -402,6 +434,13 @@ def _env_defaults() -> Dict[str, str]:
             "MIN_SEND": "7",
             "DEDUP_HOURS": "6",
             "ALLOW_RESEND_IF_STRONGER": "1",
+# Multi-timeframe confirmation
+"REQUIRE_DAILY_OK": "1",
+"REQUIRE_WEEKLY_OK": "1",
+"REQUIRE_MONTHLY_OK": "0",
+
+# Intraday confirmation before execution (VWAP/EMA on 5m)
+"INTRADAY_CONFIRM": "1",
             "PLAN_MODE": "daily",  # daily|weekly|monthly|daily_weekly|weekly_monthly
             "ENTRY_MODE": "auto",  # auto|market|limit
             "CAPITAL_USD": "800",
@@ -670,3 +709,55 @@ def remove_watchlist(symbol: str) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute("DELETE FROM watchlist WHERE symbol=?", (sym,))
         con.commit()
+
+def record_outcome(signal_id: int, result: str, r_mult: float | None = None, notes: str = "") -> None:
+    """Record manual outcome for a signal (WIN/LOSS/SKIP) with optional R multiple."""
+    ts = datetime.utcnow().isoformat()
+    result_u = (result or "").strip().upper()
+    if result_u not in ("WIN", "LOSS", "SKIP"):
+        result_u = "SKIP"
+
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO signal_outcomes (ts,signal_id,result,r_mult,notes) VALUES (%s,%s,%s,%s,%s);",
+                    (ts, int(signal_id), result_u, float(r_mult) if r_mult is not None else None, notes or ""),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO signal_outcomes (ts,signal_id,result,r_mult,notes) VALUES (?,?,?,?,?)",
+            (ts, int(signal_id), result_u, float(r_mult) if r_mult is not None else None, notes or ""),
+        )
+        con.commit()
+
+
+def get_recent_stats(limit: int = 200) -> Dict[str, Any]:
+    """Basic stats for manual outcomes."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT result, r_mult FROM signal_outcomes ORDER BY id DESC LIMIT %s;",
+                    (int(limit),),
+                )
+                rows = cur.fetchall() or []
+    else:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            rows = [dict(r) for r in con.execute(
+                "SELECT result, r_mult FROM signal_outcomes ORDER BY id DESC LIMIT ?;",
+                (int(limit),),
+            ).fetchall() or []]
+
+    total = len(rows)
+    wins = sum(1 for r in rows if (r.get("result") or "").upper() == "WIN")
+    losses = sum(1 for r in rows if (r.get("result") or "").upper() == "LOSS")
+    skips = total - wins - losses
+    rs = [float(r.get("r_mult")) for r in rows if r.get("r_mult") is not None]
+    avg_r = (sum(rs) / len(rs)) if rs else None
+    winrate = (wins / (wins + losses)) if (wins + losses) else 0.0
+    return {"total": total, "wins": wins, "losses": losses, "skips": skips, "winrate": winrate, "avg_r": avg_r}

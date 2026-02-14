@@ -15,6 +15,7 @@ from storage import get_all_settings, parse_int, parse_float, get_watchlist
 @dataclass
 class Candidate:
     symbol: str
+    side: str  # 'buy' (long) or 'sell' (short)
     score: float
     last_close: float
     avg_dollar_vol: float
@@ -471,22 +472,118 @@ def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
                     score -= 1.5
                     notes.append("Big gap")
 
-            daily_ok = bool(e20 > e50)
-            weekly_ok = bool((e200 is not None) and (e50 > e200) and (last > e200))
-            monthly_ok = bool((s200 is not None) and (s100 is not None) and (s100 > s200) and (last > s200))
+            # --- Directional scoring (Long + Short) ---
+            long_score = float(score)
+            long_notes = list(notes)
+
+            # Build a mirrored score for short setups
+            short_score = 0.0
+            short_notes: List[str] = []
+            try:
+                short_score = 0.0
+
+                # Trend (bearish)
+                if e20 is not None and e50 is not None and e20 < e50:
+                    short_score += 2.0
+                    short_notes.append("EMA20<EMA50")
+                if e50 is not None and e200 is not None and e50 < e200 and last < e200:
+                    short_score += 2.0
+                    short_notes.append("Below EMA200")
+
+                # Momentum
+                if macd_vals is not None:
+                    _, _, hist = macd_vals
+                    if hist < 0:
+                        short_score += 1.5
+                        short_notes.append("MACD-")
+                if r14 is not None:
+                    if r14 < 45:
+                        short_score += 1.5
+                        short_notes.append("RSI weak")
+                    elif r14 > 65:
+                        short_score -= 1.0
+                        short_notes.append("RSI high (bad for short)")
+
+                # Trend strength
+                if adx_vals is not None:
+                    adx14, di_p, di_m = adx_vals
+                    if adx14 is not None and di_m is not None and di_p is not None and adx14 > 18 and di_m > di_p:
+                        short_score += 1.2
+                        short_notes.append("ADX bear")
+
+                # Bands / mean reversion (avoid overextended down)
+                if bb is not None:
+                    _, _, _, pct_b = bb
+                    if pct_b < -0.05:
+                        short_score -= 0.6
+                        short_notes.append("BB very low")
+                    elif pct_b > 0.85:
+                        short_score += 0.6
+                        short_notes.append("BB high (pullback short)")
+
+                # VWAP: prefer below for short
+                if vwap20 is not None:
+                    if last < vwap20:
+                        short_score += 0.6
+                        short_notes.append("Below VWAP20")
+                    else:
+                        short_score -= 0.2
+                        short_notes.append("Above VWAP20")
+
+                # Volume confirmation
+                if vol_spike:
+                    short_score += 0.8
+                    short_notes.append("Vol spike")
+                if obv_rising is False:
+                    short_score += 0.3
+                    short_notes.append("OBV falling")
+
+                # Penalize extreme gap days (same)
+                if len(closes) >= 2 and closes[-2] != 0:
+                    gap = abs(closes[-1] - closes[-2]) / closes[-2]
+                    if gap > 0.12:
+                        short_score -= 1.5
+                        short_notes.append("Big gap")
+            except Exception:
+                pass
+
+            # Timeframe alignment flags are computed per-direction
+            long_daily_ok = bool(e20 > e50) if (e20 is not None and e50 is not None) else False
+            long_weekly_ok = bool((e200 is not None) and (e50 is not None) and (e50 > e200) and (last > e200))
+            long_monthly_ok = bool((s200 is not None) and (s100 is not None) and (s100 > s200) and (last > s200))
+
+            short_daily_ok = bool(e20 < e50) if (e20 is not None and e50 is not None) else False
+            short_weekly_ok = bool((e200 is not None) and (e50 is not None) and (e50 < e200) and (last < e200))
+            short_monthly_ok = bool((s200 is not None) and (s100 is not None) and (s100 < s200) and (last < s200))
+
+            # Choose direction: keep the stronger setup. Require some minimum conviction.
+            # You can tune thresholds via settings later.
+            chosen_side = "buy"
+            chosen_score = long_score
+            chosen_notes = long_notes
+            chosen_daily_ok, chosen_weekly_ok, chosen_monthly_ok = long_daily_ok, long_weekly_ok, long_monthly_ok
+            chosen_trend = trend
+
+            if short_score > long_score + 0.75:
+                chosen_side = "sell"
+                chosen_score = short_score
+                chosen_notes = short_notes
+                chosen_daily_ok, chosen_weekly_ok, chosen_monthly_ok = short_daily_ok, short_weekly_ok, short_monthly_ok
+                chosen_trend = "Bear"
 
             results.append(Candidate(
                 symbol=sym,
-                score=score,
+                side=chosen_side,
+                score=float(chosen_score),
                 last_close=last,
                 avg_dollar_vol=adv,
                 atr=a14,
                 rsi14=r14,
-                trend=trend,
-                notes=", ".join(notes),
-                daily_ok=daily_ok,
-                weekly_ok=weekly_ok,
-                monthly_ok=monthly_ok
+                trend=chosen_trend,
+                notes=", ".join(chosen_notes),
+                daily_ok=bool(chosen_daily_ok),
+                weekly_ok=bool(chosen_weekly_ok),
+                monthly_ok=bool(chosen_monthly_ok)
             ))
 
     results.sort(key=lambda x: x.score, reverse=True)

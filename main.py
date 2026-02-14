@@ -579,21 +579,32 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
     """
     خطة يدوية لتطبيق Sahm (ATR):
     - الدخول: سعر الإغلاق الأخير
-    - وقف الخسارة: ATR * SL_ATR_MULT تحت الدخول
-    - جني الربح: (المخاطرة R) * TP_R_MULT فوق الدخول
+    - وقف الخسارة: ATR * SL_ATR_MULT (LONG تحت الدخول / SHORT فوق الدخول)
+    - جني الربح: (المخاطرة R) * TP_R_MULT (LONG فوق الدخول / SHORT تحت الدخول)
     - الكمية: حسب رأس المال والمخاطرة المتغيرة A+/A/B
     """
+    side = (getattr(c, "side", None) or "buy").lower().strip()
+    if side not in ("buy", "sell"):
+        side = "buy"
+
     entry = float(c.last_close)
+
     # إعدادات ATR
     sl_atr_mult = _get_float(settings, "SL_ATR_MULT", 2.0)
     tp_r_mult = _get_float(settings, "TP_R_MULT", 2.0)
     atr_val = float(getattr(c, "atr", 0.0) or 0.0)
     if atr_val <= 0:
-        # fallback
         atr_val = max(entry * 0.01, 0.5)
-    sl = max(0.01, entry - (atr_val * sl_atr_mult))
-    risk_per_share = max(entry - sl, 0.01)
-    tp = entry + (risk_per_share * tp_r_mult)
+
+    if side == "sell":
+        sl = max(0.01, entry + (atr_val * sl_atr_mult))
+        risk_per_share = max(sl - entry, 0.01)
+        tp = max(0.01, entry - (risk_per_share * tp_r_mult))
+    else:
+        sl = max(0.01, entry - (atr_val * sl_atr_mult))
+        risk_per_share = max(entry - sl, 0.01)
+        tp = entry + (risk_per_share * tp_r_mult)
+
     # تصنيف (A+/A/B) حسب القوة
     st = _strength(float(c.score))
     if st == "قوي جداً":
@@ -605,21 +616,28 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
     else:
         grade = "B"
         risk_pct = _get_float(settings, "RISK_B_PCT", 0.5)
+
     capital = _get_float(settings, "CAPITAL_USD", 800.0)
     risk_amount = max(1.0, capital * (risk_pct / 100.0))
     qty_risk = int(risk_amount / risk_per_share)
     if qty_risk < 1:
         qty_risk = 1
+
     # حد أقصى لحجم الصفقة (كنسبة من رأس المال)
     pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
     max_notional = max(0.0, capital * pos_pct)
     qty_cap = int(max_notional / max(entry, 0.01)) if max_notional > 0 else qty_risk
     if qty_cap < 1:
         qty_cap = 1
+
     qty = max(1, min(qty_risk, qty_cap))
     entry_mode = _get_str(settings, "ENTRY_MODE", "auto").lower()
-    rr = (tp - entry) / max(entry - sl, 0.01)
+
+    # RR محسوب على أساس المخاطرة R
+    rr = (abs(tp - entry)) / max(abs(entry - sl), 0.01)
+
     return {
+        "side": side,
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
@@ -636,9 +654,11 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
         "ml_prob": None,
         "ev_r": None,
     }
+
 def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_score: int | None = None) -> str:
     strength = _strength(float(c.score))
     entry_type = _entry_type_label(plan["entry_mode"])
+
     ai_dir = plan.get("ai_dir")
     ai_conf = plan.get("ai_conf")
     ai_h = plan.get("ai_h")
@@ -648,10 +668,18 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
             ai_line = f"تنبؤ AI ({ai_h or ''}): {ai_dir} ({int(ai_conf)}%)\n"
         except Exception:
             ai_line = f"تنبؤ AI ({ai_h or ''}): {ai_dir}\n"
-    # Sahm screen fields (Arabic, as requested)
+
+    side = (plan.get("side") or getattr(c, "side", "buy") or "buy").lower().strip()
+    side_lbl = "LONG 🟢" if side == "buy" else "SHORT 🔴"
+    op_lbl = "شراء" if side == "buy" else "بيع/شورت"
+
     return (
-        f"🚀 سهم: {c.symbol} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}" + (f" | AI: {ai_score}/100" if ai_score is not None else "") + (f" | ML: {int(round(float(plan.get('ml_prob') or 0)*100))}%" if plan.get('ml_prob') is not None else "") + (f" | EV(R): {float(plan.get('ev_r')):.2f}" if plan.get('ev_r') is not None else "") + "\n"
-        f"العملية: شراء\n"
+        f"🚀 سهم: {c.symbol} | {side_lbl} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}"
+        + (f" | AI: {ai_score}/100" if ai_score is not None else "")
+        + (f" | ML: {int(round(float(plan.get('ml_prob') or 0)*100))}%" if plan.get('ml_prob') is not None else "")
+        + (f" | EV(R): {float(plan.get('ev_r')):.2f}" if plan.get('ev_r') is not None else "")
+        + "\n"
+        f"العملية: {op_lbl}\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
         f"الكمية: {plan['qty']}\n"
@@ -659,222 +687,12 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
         f"{ai_line}"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
-        f"جني الربح:\n"
-        f"  سعر الإيقاف: {plan['tp']}\n"
-        f"  سعر الأمر: {plan['tp']}\n"
-        f"وقف الخسارة:\n"
-        f"  سعر الإيقاف: {plan['sl']}\n"
-        f"  سعر الأمر: {plan['sl']}\n"
-        f"تاريخ الاستحقاق: {mode_label}\n"
+        f"جني الربح: {plan['tp']}\n"
+        f"وقف الخسارة: {plan['sl']}\n"
+        f"الخطة: {mode_label}\n"
         f"ملاحظة: {c.notes}\n"
     )
-def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
-    mode = _get_str(settings, "PLAN_MODE", "daily")
-    entry = _get_str(settings, "ENTRY_MODE", "auto")
-    auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
-    route = _get_str(settings, "NOTIFY_ROUTE", "dm").lower()
-    silent = _get_bool(settings, "NOTIFY_SILENT", True)
-    def _route_label(r: str) -> str:
-        if r == "group":
-            return "القروب فقط"
-        if r == "both":
-            return "الخاص+القروب"
-        return "الخاص فقط"
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "⏱️ M5 سهم سريع", "callback_data": "pick_m5"},
-                {"text": "📈 D1 سهم يومي", "callback_data": "pick_d1"},
-            ],
-            [
-                {"text": "🔎 تحليل الآن", "callback_data": "do_analyze"},
-                {"text": "⭐ أفضل الفرص", "callback_data": "do_top"},
-            ],
-            [
-                {"text": f"📆 الخطة: {_mode_label(mode)}", "callback_data": "show_modes"},
-                {"text": f"🎯 الدخول: {_entry_type_label(entry)}", "callback_data": "show_entry"},
-            ],
-            [
-                {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
-                {"text": "⚙️ الإعدادات", "callback_data": "show_settings"},
-            ],
-            [
-                {"text": f"📨 الوجهة: {_route_label(route)}", "callback_data": "show_notify_route"},
-                {"text": f"🔕 صامت: {'ON' if silent else 'OFF'}", "callback_data": "toggle_silent"},
-            ],
-        ]
-    }
-def _build_modes_kb() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "يومي", "callback_data": "set_mode:daily"},
-                {"text": "أسبوعي", "callback_data": "set_mode:weekly"},
-                {"text": "شهري", "callback_data": "set_mode:monthly"},
-            ],
-            [
-                {"text": "يومي+أسبوعي", "callback_data": "set_mode:daily_weekly"},
-                {"text": "أسبوعي+شهري", "callback_data": "set_mode:weekly_monthly"},
-            ],
-            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
-        ]
-    }
-def _build_entry_kb() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "تلقائي", "callback_data": "set_entry:auto"},
-                {"text": "سوق", "callback_data": "set_entry:market"},
-                {"text": "محدد", "callback_data": "set_entry:limit"},
-            ],
-            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
-        ]
-    }
-def _build_notify_route_kb() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "الخاص فقط", "callback_data": "set_notify_route:dm"},
-                {"text": "القروب فقط", "callback_data": "set_notify_route:group"},
-            ],
-            [
-                {"text": "الخاص + القروب", "callback_data": "set_notify_route:both"},
-            ],
-            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
-        ]
-    }
-def _build_settings_kb(settings: Dict[str, str]) -> Dict[str, Any]:
-    auto_notify = _get_bool(settings, "AUTO_NOTIFY", True)
-    allow_resend = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
-    predict_frame = _get_str(settings, "PREDICT_FRAME", "D1").upper()
-    ai_pred = _get_bool(settings, "AI_PREDICT_ENABLED", False)
-    def _pf_label(p: str) -> str:
-        p = (p or "D1").upper()
-        if p == "M5":
-            return "M5"
-        if p in ("M5+", "M5PLUS", "HYBRID"):
-            return "M5+"
-        return "D1"
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "💰 رأس المال", "callback_data": "show_capital"},
-                {"text": "⚖️ المخاطرة", "callback_data": "show_risk"},
-            ],
-            [
-                {"text": "⏱️ وقت الفحص", "callback_data": "show_interval"},
-                {"text": "📦 حجم الصفقة", "callback_data": "show_position"},
-            ],
-            [
-                {"text": "📉 وقف الخسارة%", "callback_data": "show_sl"},
-                {"text": "📈 جني الربح%", "callback_data": "show_tp"},
-            ],
-            [
-                {"text": "🎛 عدد الفرص", "callback_data": "show_send"},
-                {"text": f"🔁 إعادة الإرسال إذا أقوى: {'نعم' if allow_resend else 'لا'}", "callback_data": "toggle_resend"},
-            ],
-            [
-                {"text": f"🔔 التنبيهات: {'ON' if auto_notify else 'OFF'}", "callback_data": "toggle_notify"},
-                {"text": "🕒 نافذة السوق", "callback_data": "show_window"},
-            ],
-            [
-                {"text": f"🤖 إطار التنبؤ: {_pf_label(predict_frame)}", "callback_data": "show_horizon"},
-                {"text": f"🤖 تنبؤ AI: {'ON' if ai_pred else 'OFF'}", "callback_data": "toggle_ai_predict"},
-            ],
-            [{"text": "⬅️ رجوع", "callback_data": "menu"}],
-        ]
-    }
-def _build_horizon_kb(settings: Dict[str, str]) -> Dict[str, Any]:
-    cur = _get_str(settings, "PREDICT_FRAME", "D1").upper()
-    def _mark(val: str) -> str:
-        return "✅" if cur == val else ""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": f"{_mark('D1')} D1 (يومي)", "callback_data": "set_horizon:D1"},
-                {"text": f"{_mark('M5')} M5 (سريع)", "callback_data": "set_horizon:M5"},
-            ],
-            [
-                {"text": f"{_mark('M5+')} M5+ (هجين)", "callback_data": "set_horizon:M5+"},
-            ],
-            [{"text": "⬅️ رجوع", "callback_data": "show_settings"}],
-        ]
-    }
-def _build_risk_kb(settings: Dict[str, str]) -> Dict[str, Any]:
-    presets = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-    aplus = _get_float(settings, "RISK_APLUS_PCT", 1.5)
-    a = _get_float(settings, "RISK_A_PCT", 1.0)
-    b = _get_float(settings, "RISK_B_PCT", 0.5)
-    rows: List[List[Dict[str, str]]] = []
-    rows.append([
-        {"text": f"A+ = {aplus}%", "callback_data": "noop"},
-        {"text": f"A = {a}%", "callback_data": "noop"},
-        {"text": f"B = {b}%", "callback_data": "noop"},
-    ])
-    rows.append([{"text": f"A+ {p}%", "callback_data": f"set_risk_aplus:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"A+ {p}%", "callback_data": f"set_risk_aplus:{p}"} for p in presets[3:]])
-    rows.append([{"text": f"A {p}%", "callback_data": f"set_risk_a:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"A {p}%", "callback_data": f"set_risk_a:{p}"} for p in presets[3:]])
-    rows.append([{"text": f"B {p}%", "callback_data": f"set_risk_b:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"B {p}%", "callback_data": f"set_risk_b:{p}"} for p in presets[3:]])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_interval_kb(settings: Dict[str, str]) -> Dict[str, Any]:
-    presets = [10, 15, 20, 30, 60]
-    cur = _get_int(settings, "SCAN_INTERVAL_MIN", 20)
-    rows: List[List[Dict[str, str]]] = []
-    rows.append([{"text": f"الحالي: {cur} دقيقة", "callback_data": "noop"}])
-    rows.append([{"text": f"{p} دقيقة", "callback_data": f"set_interval:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"{p} دقيقة", "callback_data": f"set_interval:{p}"} for p in presets[3:]])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_capital_kb() -> Dict[str, Any]:
-    presets = [300, 500, 800, 1000, 2000, 5000]
-    rows: List[List[Dict[str, str]]] = []
-    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"{p}$", "callback_data": f"set_capital:{p}"} for p in presets[3:]])
-    rows.append([{"text": "✍️ قيمة مخصصة", "callback_data": "set_capital_custom"}])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_position_kb() -> Dict[str, Any]:
-    # % of capital used per trade suggestion (manual trading)
-    presets = [0.10, 0.15, 0.20, 0.25, 0.30]
-    rows = []
-    rows.append([{"text": f"{int(p*100)}%", "callback_data": f"set_position:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"{int(p*100)}%", "callback_data": f"set_position:{p}"} for p in presets[3:]])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_sl_kb() -> Dict[str, Any]:
-    presets = [2, 3, 4, 5]
-    rows = []
-    rows.append([{"text": f"{p}%", "callback_data": f"set_sl:{p}"} for p in presets[:2]])
-    rows.append([{"text": f"{p}%", "callback_data": f"set_sl:{p}"} for p in presets[2:]])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_tp_kb() -> Dict[str, Any]:
-    # base TP for متوسط/ضعيف; قوي/قوي جداً use TP_PCT_STRONG / TP_PCT_VSTRONG
-    presets = [5, 6, 7, 8, 10]
-    rows = []
-    rows.append([{"text": f"{p}%", "callback_data": f"set_tp:{p}"} for p in presets[:3]])
-    rows.append([{"text": f"{p}%", "callback_data": f"set_tp:{p}"} for p in presets[3:]])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_send_kb() -> Dict[str, Any]:
-    # min,max pairs
-    pairs = [(5, 7), (7, 10), (10, 15)]
-    rows = []
-    rows.append([{"text": f"{a}-{b}", "callback_data": f"set_send:{a}:{b}"} for a, b in pairs])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-def _build_window_kb() -> Dict[str, Any]:
-    # Common US market windows in Riyadh; you can change later
-    presets = [("17:30", "00:00"), ("17:30", "00:30"), ("16:30", "23:30")]
-    rows = []
-    for a, b in presets:
-        rows.append([{"text": f"{a}→{b}", "callback_data": f"set_window:{a}:{b}"}])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "show_settings"}])
-    return {"inline_keyboard": rows}
-# ================= Core scan/notify logic =================
+
 def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, str]) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     Returns:
@@ -889,8 +707,21 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=dedup_hours)
     mode_label = _mode_label(mode)
+# Optional: require multi-timeframe alignment (safer entries)
+req_daily = _get_bool(settings, "REQUIRE_DAILY_OK", True)
+req_weekly = _get_bool(settings, "REQUIRE_WEEKLY_OK", True)
+req_monthly = _get_bool(settings, "REQUIRE_MONTHLY_OK", False)
+
+def _tf_ok(c: Candidate) -> bool:
+    if req_daily and not bool(getattr(c, "daily_ok", False)):
+        return False
+    if req_weekly and not bool(getattr(c, "weekly_ok", False)):
+        return False
+    if req_monthly and not bool(getattr(c, "monthly_ok", False)):
+        return False
+    return True
     # filter + sort
-    candidates = [c for c in picks if _mode_matches(c, mode)]
+    candidates = [c for c in picks if _mode_matches(c, mode) and _tf_ok(c)]
     candidates.sort(key=lambda x: x.score, reverse=True)
     blocks: List[str] = []
     logged: List[Dict[str, Any]] = []
@@ -1019,7 +850,7 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
     # persist
     ts = now_utc.isoformat()
     for d in logged:
-        log_signal(ts=ts, symbol=d["symbol"], source="scan", side="buy", mode=d["mode"], strength=d["strength"], score=float(d["score"]), entry=float(d["entry"]), sl=d.get("sl"), tp=d.get("tp"), features_json=json.dumps(d.get("features") or {}, ensure_ascii=False), reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False), horizon_days=int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS)))
+        log_signal(ts=ts, symbol=d["symbol"], source="scan", side=(getattr(c,"side",None) or "buy"), mode=d["mode"], strength=d["strength"], score=float(d["score"]), entry=float(d["entry"]), sl=d.get("sl"), tp=d.get("tp"), features_json=json.dumps(d.get("features") or {}, ensure_ascii=False), reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False), horizon_days=int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS)))
     return blocks, logged
 def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
     picks, universe_size = scan_universe_with_meta()
@@ -1929,6 +1760,37 @@ def api_signals():
             "ev_r": ev_r,
         })
     return jsonify({"items": out})
+
+@app.post("/api/outcome")
+def api_outcome():
+    key = (request.args.get("key") or request.headers.get("X-Run-Key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"error":"unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    try:
+        signal_id = int(data.get("signal_id") or 0)
+    except Exception:
+        signal_id = 0
+    result = (data.get("result") or "").strip().upper()
+    r_mult = data.get("r_mult")
+    notes = (data.get("notes") or "").strip()
+    if not signal_id:
+        return jsonify({"error":"signal_id required"}), 400
+    try:
+        r_mult_f = float(r_mult) if r_mult is not None and str(r_mult).strip() != "" else None
+    except Exception:
+        r_mult_f = None
+    record_outcome(signal_id, result=result, r_mult=r_mult_f, notes=notes)
+    return jsonify({"ok": True, "signal_id": signal_id, "result": result, "r_mult": r_mult_f})
+
+@app.get("/api/manual_stats")
+def api_manual_stats():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"error":"unauthorized"}), 401
+    limit = int(request.args.get("limit") or 200)
+    return jsonify(get_recent_stats(limit=limit))
+
 @app.get("/api/backtest")
 def api_backtest():
     key = (request.args.get("key") or "").strip()

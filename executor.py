@@ -11,7 +11,7 @@ from config import (
     BLOCK_IF_POSITION_OPEN, BLOCK_IF_ORDER_OPEN
 )
 from alpaca_client import account, place_bracket_order, clock, positions, open_orders, bars
-from indicators import sma, atr
+from indicators import sma, atr, ema, rsi, vwap
 from storage import log_order, last_orders, get_all_settings, parse_bool, parse_int, parse_float
 
 
@@ -61,9 +61,13 @@ def _within_time_window() -> Tuple[bool, str]:
     return True, "OK"
 
 
-def _market_ok() -> Tuple[bool, str]:
+def _market_ok(side: str = "buy") -> Tuple[bool, str]:
     if not USE_MARKET_FILTER:
         return True, "Market filter off"
+
+    side = (side or "buy").lower().strip()
+    if side not in ("buy", "sell"):
+        side = "buy"
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=400)
@@ -83,15 +87,63 @@ def _market_ok() -> Tuple[bool, str]:
         if fast is None or slow is None:
             return True, "Market filter: insufficient SMA"
 
-        if last > slow and fast > slow:
-            return True, f"{MARKET_SYMBOL} bullish (close>{MARKET_SMA_SLOW}SMA & {MARKET_SMA_FAST}>{MARKET_SMA_SLOW})"
-
-        return False, f"{MARKET_SYMBOL} not bullish (filter blocks longs)"
+        if side == "sell":
+            if last < slow and fast < slow:
+                return True, f"{MARKET_SYMBOL} bearish (close<{MARKET_SMA_SLOW}SMA & {MARKET_SMA_FAST}<{MARKET_SMA_SLOW})"
+            return False, f"{MARKET_SYMBOL} not bearish (filter blocks shorts)"
+        else:
+            if last > slow and fast > slow:
+                return True, f"{MARKET_SYMBOL} bullish (close>{MARKET_SMA_SLOW}SMA & {MARKET_SMA_FAST}>{MARKET_SMA_SLOW})"
+            return False, f"{MARKET_SYMBOL} not bullish (filter blocks longs)"
 
     except Exception as e:
         return True, f"Market filter error (ignored): {e}"
 
+def _intraday_confirm(symbol: str, side: str, *, vwap_period: int = 20) -> Tuple[bool, str]:
+    """Lightweight 5m confirmation to avoid bad fills.
+    - Long: price>VWAP, EMA20>EMA50, RSI>45
+    - Short: price<VWAP, EMA20<EMA50, RSI<55
+    """
+    side = (side or "buy").lower().strip()
+    if side not in ("buy", "sell"):
+        side = "buy"
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=7)
+        data = bars([symbol], start=start, end=end, timeframe="5Min", limit=1200)
+        blist = (data.get("bars", {}) or {}).get(symbol, [])
+        if len(blist) < max(120, vwap_period + 5):
+            return True, "Intraday confirm: insufficient bars (ignored)"
+        closes = [float(b.get("c", 0)) for b in blist if "c" in b]
+        highs  = [float(b.get("h", 0)) for b in blist if "h" in b]
+        lows   = [float(b.get("l", 0)) for b in blist if "l" in b]
+        vols   = [float(b.get("v", 0)) for b in blist if "v" in b]
+        if len(closes) < max(120, vwap_period + 5):
+            return True, "Intraday confirm: insufficient data (ignored)"
+        last = closes[-1]
+        e20 = ema(closes, 20)
+        e50 = ema(closes, 50)
+        r14 = rsi(closes, 14)
+        vw = vwap(highs, lows, closes, vols, period=vwap_period)
 
+        if side == "sell":
+            if vw is not None and last > vw:
+                return False, "M5 confirm: price فوق VWAP (سيء للـ short)"
+            if e20 is not None and e50 is not None and e20 > e50:
+                return False, "M5 confirm: EMA20>EMA50 (سيء للـ short)"
+            if r14 is not None and r14 > 60:
+                return False, "M5 confirm: RSI مرتفع (سيء للـ short)"
+            return True, "M5 confirm OK (short)"
+        else:
+            if vw is not None and last < vw:
+                return False, "M5 confirm: price تحت VWAP (سيء للـ long)"
+            if e20 is not None and e50 is not None and e20 < e50:
+                return False, "M5 confirm: EMA20<EMA50 (سيء للـ long)"
+            if r14 is not None and r14 < 40:
+                return False, "M5 confirm: RSI منخفض (سيء للـ long)"
+            return True, "M5 confirm OK (long)"
+    except Exception as e:
+        return True, f"Intraday confirm error (ignored): {e}"
 def _has_position(symbol: str) -> bool:
     try:
         if not BLOCK_IF_POSITION_OPEN:
@@ -164,11 +216,18 @@ def maybe_trade(picks: List[Dict[str, Any]]) -> List[str]:
         return [f"Cannot trade now: clock error ({e})"]
 
     # Market regime filter
-    ok_mkt, mkt_reason = _market_ok()
+    ok_mkt, mkt_reason = _market_ok(side)
     if not ok_mkt:
         return [f"Blocked by market filter: {mkt_reason}"]
     logs.append(mkt_reason)
 
+    # Optional: intraday confirmation (5m) to reduce bad fills
+    intraday_on = parse_bool(settings.get("INTRADAY_CONFIRM"), True)
+    if intraday_on:
+        ok_intra, intra_reason = _intraday_confirm((symbol or "").upper().strip(), side)
+        if not ok_intra:
+            return [f"Blocked by intraday confirm: {intra_reason}"]
+        logs.append(intra_reason)
     if _count_today_orders() >= max_daily:
         return [f"Daily limit reached ({max_daily})"]
 
@@ -255,11 +314,18 @@ def trade_symbol(symbol: str, *, side: str = "buy", risk_pct: float | None = Non
         return [f"Cannot trade now: clock error ({e})"]
 
     # Market regime filter (optional)
-    ok_mkt, mkt_reason = _market_ok()
+    ok_mkt, mkt_reason = _market_ok(side)
     if not ok_mkt:
         return [f"Blocked by market filter: {mkt_reason}"]
     logs.append(mkt_reason)
 
+    # Optional: intraday confirmation (5m) to reduce bad fills
+    intraday_on = parse_bool(settings.get("INTRADAY_CONFIRM"), True)
+    if intraday_on:
+        ok_intra, intra_reason = _intraday_confirm((symbol or "").upper().strip(), side)
+        if not ok_intra:
+            return [f"Blocked by intraday confirm: {intra_reason}"]
+        logs.append(intra_reason)
     if _count_today_orders() >= max_daily:
         return [f"Daily limit reached ({max_daily})"]
 
@@ -303,12 +369,16 @@ def trade_symbol(symbol: str, *, side: str = "buy", risk_pct: float | None = Non
     if side not in ("buy", "sell"):
         side = "buy"
 
-    if side != "buy":
-        return [f"{sym}: only long trades are supported حاليا (side={side})"]
-
-    stop_price = max(last_price - (a14 * eff_sl_atr), 0.01)
-    r = last_price - stop_price
-    take_profit = last_price + (r * eff_tp_r)
+    if side == "sell":
+        # SHORT: SL above entry, TP below entry
+        stop_price = max(last_price + (a14 * eff_sl_atr), 0.01)
+        r = stop_price - last_price
+        take_profit = max(last_price - (r * eff_tp_r), 0.01)
+    else:
+        # LONG
+        stop_price = max(last_price - (a14 * eff_sl_atr), 0.01)
+        r = last_price - stop_price
+        take_profit = last_price + (r * eff_tp_r)
 
     payload = {
         "symbol": sym,
