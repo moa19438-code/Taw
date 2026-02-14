@@ -113,6 +113,28 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
     vol_spike = bool(vavg20 and vols[-1] >= 1.5 * vavg20)
     obv_val = obv(closes, vols)
 
+    # Liquidity / spread risk (heuristic)
+    avg_dollar_vol = (vavg20 * last) if (vavg20 is not None and last) else None
+    if avg_dollar_vol is None:
+        liquidity = None
+        spread_risk = None
+    else:
+        # Classify liquidity using average $ volume (20 bars)
+        if avg_dollar_vol >= 20_000_000:
+            liquidity = "GOOD"
+            spread_risk = "LOW"
+        elif avg_dollar_vol >= 5_000_000:
+            liquidity = "OK"
+            spread_risk = "MED"
+        else:
+            liquidity = "BAD"
+            spread_risk = "HIGH"
+
+    # Candlestick pattern on last 3 daily candles
+    pat_bars = [{"o": float(b.get("o", 0)), "h": float(b.get("h", 0)), "l": float(b.get("l", 0)), "c": float(b.get("c", 0))} for b in blist[-3:]]
+    pat = classify_last_patterns(pat_bars)
+
+
     # Price context
     atr_pct = (a14 / last) if (a14 and last) else None
     hi20 = max(highs[-20:]) if len(highs) >= 20 else None

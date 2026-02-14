@@ -137,16 +137,47 @@ _PICK_CACHE: Dict[str, Dict[str, Any]] = {
 _PICK_LOCK = threading.Lock()
 M5_CACHE_MIN = float(os.getenv("M5_CACHE_MIN", "3"))   # refresh every N minutes
 D1_CACHE_MIN = float(os.getenv("D1_CACHE_MIN", "60"))  # refresh every N minutes
+
+# --- Market open helper (cached) ---
+_MARKET_CACHE = {"ts": 0.0, "open": None, "next_open": None, "next_close": None}
+def _is_us_market_open(ttl_sec: int = 30) -> bool:
+    """Return True if US equities market is open (using Alpaca clock). Cached for ttl_sec."""
+    now = time.time()
+    try:
+        if _MARKET_CACHE["open"] is not None and (now - _MARKET_CACHE["ts"]) < ttl_sec:
+            return bool(_MARKET_CACHE["open"])
+    except Exception:
+        pass
+    try:
+        c = clock()
+        _MARKET_CACHE["ts"] = now
+        _MARKET_CACHE["open"] = bool(c.get("is_open"))
+        _MARKET_CACHE["next_open"] = c.get("next_open")
+        _MARKET_CACHE["next_close"] = c.get("next_close")
+        return bool(_MARKET_CACHE["open"])
+    except Exception:
+        return True  # fail-open; better to still respond than block the bot
+
 M5_TOP_K = int(os.getenv("M5_TOP_K", "40"))            # compute M5 features only for top K daily picks
 M5_RETURN_N = int(os.getenv("M5_RETURN_N", "12"))      # keep N candidates in cache
 def _m5_score_from_features(f: Dict[str, Any]) -> Tuple[float, str]:
-    """Return (score 0..100, direction) from 5Min features."""
+    """Return (score 0..100, direction) from 5Min features.
+
+    This is intentionally lightweight: we score trend + RSI + volume spike + sane volatility,
+    then apply small adjustments for liquidity/spread heuristics + candlestick confirmation.
+    """
     ema20 = f.get("ema20")
     ema50 = f.get("ema50")
     rsi14 = f.get("rsi14")
     atr_pct = f.get("atr_pct")
     vol_spike = bool(f.get("vol_spike"))
+    liquidity = f.get("liquidity")
+    spread_risk = f.get("spread_risk")
+    pat_bias = f.get("pattern_bias")
+    pat_strength = f.get("pattern_strength")
+
     score = 0.0
+
     # Trend
     if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)):
         if ema20 > ema50:
@@ -159,7 +190,8 @@ def _m5_score_from_features(f: Dict[str, Any]) -> Tuple[float, str]:
             direction = "LONG"
     else:
         direction = "LONG"
-    # RSI
+
+    # RSI (prefer 'room' for continuation scalps)
     if isinstance(rsi14, (int, float)):
         if 50 <= rsi14 <= 70:
             score += 30.0
@@ -169,9 +201,11 @@ def _m5_score_from_features(f: Dict[str, Any]) -> Tuple[float, str]:
             score += 12.0
         else:
             score += 6.0
+
     # Vol spike
     if vol_spike:
         score += 20.0
+
     # Volatility sanity (avoid ultra-crazy / ultra-dead)
     if isinstance(atr_pct, (int, float)):
         if 0.003 <= atr_pct <= 0.02:
@@ -180,6 +214,26 @@ def _m5_score_from_features(f: Dict[str, Any]) -> Tuple[float, str]:
             score += 6.0
         else:
             score += 2.0
+
+    # Liquidity / spread adjustments (heuristic)
+    if liquidity == "GOOD":
+        score += 5.0
+    elif liquidity == "BAD":
+        score -= 15.0
+    if spread_risk == "HIGH":
+        score -= 10.0
+
+    # Candlestick confirmation
+    if isinstance(pat_bias, str) and isinstance(pat_strength, str):
+        want = "BULL" if direction == "LONG" else "BEAR"
+        if pat_bias == want:
+            if pat_strength == "STRONG":
+                score += 8.0
+            elif pat_strength == "MED":
+                score += 4.0
+            elif pat_strength == "WEAK":
+                score += 2.0
+
     score = max(0.0, min(100.0, score))
     return score, direction
 def _format_pick_m5(item: Dict[str, Any]) -> str:
@@ -187,33 +241,82 @@ def _format_pick_m5(item: Dict[str, Any]) -> str:
     direction = item.get("direction", "")
     score = item.get("score")
     last = item.get("last")
-    rsi = item.get("rsi14")
-    atr = item.get("atr14")
+    rsi_v = item.get("rsi14")
+    atr_v = item.get("atr14")
     notes = item.get("notes", "")
+    pat = item.get("pattern")
+    liquidity = item.get("liquidity")
+    spread_risk = item.get("spread_risk")
+    ai = item.get("ai") if isinstance(item.get("ai"), dict) else {}
+
+    # Decision block
+    decision = (ai.get("decision") or "").upper() if isinstance(ai, dict) else ""
+    conf = ai.get("confidence")
+    reasons = ai.get("reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+
+    # Use AI direction if provided
+    if ai.get("direction") in ("LONG", "SHORT"):
+        direction = ai.get("direction")
+
     entry = last
     sl = None
     tp = None
     try:
-        if isinstance(atr, (int, float)) and isinstance(entry, (int, float)):
-            # tighter intraday defaults
-            sl = round(entry - (atr * 1.6), 4)
-            tp = round(entry + (atr * 2.0), 4)
+        sl_mult = float(os.getenv("M5_SL_ATR", "1.2"))
+        tp_mult = float(os.getenv("M5_TP_ATR", "1.5"))
+        if isinstance(atr_v, (int, float)) and isinstance(entry, (int, float)):
+            if direction == "SHORT":
+                sl = round(entry + (atr_v * sl_mult), 4)
+                tp = round(entry - (atr_v * tp_mult), 4)
+            else:
+                sl = round(entry - (atr_v * sl_mult), 4)
+                tp = round(entry + (atr_v * tp_mult), 4)
     except Exception:
         pass
+
     lines = [
-        f"⏱️ M5 سهم سريع للتطبيق اليدوي",
-        f"🚀 {sym} | الاتجاه: {direction} | Score: {score:.0f}/100",
-        f"السعر الحالي: {last}",
+        "⏱️ M5 سهم سريع للتطبيق اليدوي",
+        f"🚀 {sym} | {direction} | Score: {float(score):.0f}/100" if score is not None else f"🚀 {sym} | {direction}",
     ]
-    if rsi is not None:
-        lines.append(f"RSI14: {rsi}")
-    if atr is not None:
-        lines.append(f"ATR14(5m): {atr}")
-    if sl is not None and tp is not None:
-        lines.append(f"دخول: {entry} | SL: {sl} | TP: {tp}")
+
+    if decision in ("ENTER", "SKIP"):
+        if decision == "ENTER":
+            conf_txt = f" (ثقة {int(conf)}%)" if isinstance(conf, (int, float)) else ""
+            lines.append(f"قرار AI: ✅ ادخل{conf_txt}")
+        else:
+            conf_txt = f" (ثقة {int(conf)}%)" if isinstance(conf, (int, float)) else ""
+            lines.append(f"قرار AI: ❌ لا تدخل{conf_txt}")
+    elif AI_FILTER_ENABLED:
+        lines.append("قرار AI: (غير متاح الآن)")
+
+    # Quick context
+    if last is not None:
+        lines.append(f"السعر الحالي: {last}")
+    if rsi_v is not None:
+        lines.append(f"RSI14: {rsi_v}")
+    if atr_v is not None:
+        lines.append(f"ATR14(5m): {atr_v}")
+    if sl is not None and tp is not None and entry is not None:
+        lines.append(f"Entry: {entry} | SL: {sl} | TP: {tp}")
+
+    if liquidity or spread_risk:
+        lq = liquidity or "?"
+        sp = spread_risk or "?"
+        lines.append(f"السيولة: {lq} | خطر السبريد: {sp}")
+
+    if pat:
+        lines.append(f"نموذج شموع: {pat}")
+
+    if reasons:
+        # keep it short
+        lines.append("السبب: " + ", ".join(reasons[:3]))
+
     if notes:
         lines.append(f"ملاحظات: {notes}")
-    lines.append("⚠️ تنبيه: هذا اقتراح سريع فقط، راقب السبريد/السيولة قبل الدخول.")
+
+    lines.append("⚠️ تنبيه: هذا اقتراح سريع للتطبيق اليدوي فقط. راقب السبريد/السيولة قبل الدخول.")
     return "\n".join(lines)
 def _format_pick_d1(c: Candidate, settings: Dict[str, str]) -> str:
     plan = _compute_trade_plan(settings, c)
@@ -229,6 +332,11 @@ def _update_cache_d1() -> None:
         _PICK_CACHE["d1"]["ts"] = time.time()
         _PICK_CACHE["d1"]["items"] = items
 def _update_cache_m5() -> None:
+    allow_ah = str(os.getenv("ALLOW_AFTER_HOURS", "0")).strip().lower() in ("1","true","yes","y","on")
+    if not allow_ah and not _is_us_market_open():
+        # Don't compute intraday picks when the market is closed (signals become noisy).
+        return
+
     # Use daily picks as a pre-filter to keep Alpaca calls low.
     picks, _ = scan_universe_with_meta()
     if not picks:
@@ -242,6 +350,12 @@ def _update_cache_m5() -> None:
                 continue
             score, direction = _m5_score_from_features(f)
             ai = decide_signal(sym, f, horizon="M5")
+            # Basic safety filters for manual scalps
+            if f.get("liquidity") == "BAD" or f.get("spread_risk") == "HIGH":
+                continue
+            # If AI explicitly says SKIP, keep it but de-prioritize
+            if isinstance(ai, dict) and str(ai.get("decision","")).upper() == "SKIP":
+                score = max(0.0, float(score) - 15.0)
             items.append({
                 "symbol": sym,
                 "direction": direction,
