@@ -120,6 +120,161 @@ def _seen_and_mark(d: Dict[str, float], key: str, ttl_sec: float) -> bool:
     d[key] = now
     return False
 
+
+# --- Fast-pick cache for M5/D1 buttons (precompute in background) ---
+_PICK_CACHE: Dict[str, Dict[str, Any]] = {
+    "m5": {"ts": 0.0, "items": [], "idx_by_chat": {}},
+    "d1": {"ts": 0.0, "items": [], "idx_by_chat": {}},
+}
+_PICK_LOCK = threading.Lock()
+M5_CACHE_MIN = float(os.getenv("M5_CACHE_MIN", "3"))   # refresh every N minutes
+D1_CACHE_MIN = float(os.getenv("D1_CACHE_MIN", "60"))  # refresh every N minutes
+M5_TOP_K = int(os.getenv("M5_TOP_K", "40"))            # compute M5 features only for top K daily picks
+M5_RETURN_N = int(os.getenv("M5_RETURN_N", "12"))      # keep N candidates in cache
+
+def _m5_score_from_features(f: Dict[str, Any]) -> Tuple[float, str]:
+    """Return (score 0..100, direction) from 5Min features."""
+    ema20 = f.get("ema20")
+    ema50 = f.get("ema50")
+    rsi14 = f.get("rsi14")
+    atr_pct = f.get("atr_pct")
+    vol_spike = bool(f.get("vol_spike"))
+    score = 0.0
+
+    # Trend
+    if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)):
+        if ema20 > ema50:
+            score += 40.0
+            direction = "LONG"
+        elif ema20 < ema50:
+            score += 30.0
+            direction = "SHORT"
+        else:
+            direction = "LONG"
+    else:
+        direction = "LONG"
+
+    # RSI
+    if isinstance(rsi14, (int, float)):
+        if 50 <= rsi14 <= 70:
+            score += 30.0
+        elif 40 <= rsi14 < 50:
+            score += 18.0
+        elif 70 < rsi14 <= 80:
+            score += 12.0
+        else:
+            score += 6.0
+
+    # Vol spike
+    if vol_spike:
+        score += 20.0
+
+    # Volatility sanity (avoid ultra-crazy / ultra-dead)
+    if isinstance(atr_pct, (int, float)):
+        if 0.003 <= atr_pct <= 0.02:
+            score += 10.0
+        elif 0.02 < atr_pct <= 0.05:
+            score += 6.0
+        else:
+            score += 2.0
+
+    score = max(0.0, min(100.0, score))
+    return score, direction
+
+def _format_pick_m5(item: Dict[str, Any]) -> str:
+    sym = item.get("symbol")
+    direction = item.get("direction", "")
+    score = item.get("score")
+    last = item.get("last")
+    rsi = item.get("rsi14")
+    atr = item.get("atr14")
+    notes = item.get("notes", "")
+    entry = last
+    sl = None
+    tp = None
+    try:
+        if isinstance(atr, (int, float)) and isinstance(entry, (int, float)):
+            # tighter intraday defaults
+            sl = round(entry - (atr * 1.6), 4)
+            tp = round(entry + (atr * 2.0), 4)
+    except Exception:
+        pass
+
+    lines = [
+        f"⏱️ M5 سهم سريع للتطبيق اليدوي",
+        f"🚀 {sym} | الاتجاه: {direction} | Score: {score:.0f}/100",
+        f"السعر الحالي: {last}",
+    ]
+    if rsi is not None:
+        lines.append(f"RSI14: {rsi}")
+    if atr is not None:
+        lines.append(f"ATR14(5m): {atr}")
+    if sl is not None and tp is not None:
+        lines.append(f"دخول: {entry} | SL: {sl} | TP: {tp}")
+    if notes:
+        lines.append(f"ملاحظات: {notes}")
+    lines.append("⚠️ تنبيه: هذا اقتراح سريع فقط، راقب السبريد/السيولة قبل الدخول.")
+    return "\n".join(lines)
+
+def _format_pick_d1(c: Candidate, settings: Dict[str, str]) -> str:
+    plan = _compute_trade_plan(settings, c)
+    return _format_sahm_block("D1", c, plan)
+
+def _update_cache_d1() -> None:
+    s = _settings()
+    picks, _ = scan_universe_with_meta()
+    if not picks:
+        return
+    top = picks[:max(5, min(20, len(picks)))]
+    items = [{"symbol": c.symbol, "candidate": c, "score": float(c.score)} for c in top]
+    with _PICK_LOCK:
+        _PICK_CACHE["d1"]["ts"] = time.time()
+        _PICK_CACHE["d1"]["items"] = items
+
+def _update_cache_m5() -> None:
+    # Use daily picks as a pre-filter to keep Alpaca calls low.
+    picks, _ = scan_universe_with_meta()
+    if not picks:
+        return
+    top_syms = [c.symbol for c in picks[:max(10, min(M5_TOP_K, len(picks)))]]
+    items = []
+    for sym in top_syms:
+        try:
+            f = get_symbol_features_m5(sym)
+            if f.get("error"):
+                continue
+            score, direction = _m5_score_from_features(f)
+            items.append({
+                "symbol": sym,
+                "direction": direction,
+                "score": float(score),
+                "last": f.get("last"),
+                "rsi14": f.get("rsi14"),
+                "atr14": f.get("atr14"),
+                "notes": f.get("notes",""),
+            })
+        except Exception:
+            continue
+    items.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    items = items[:max(3, M5_RETURN_N)]
+    with _PICK_LOCK:
+        _PICK_CACHE["m5"]["ts"] = time.time()
+        _PICK_CACHE["m5"]["items"] = items
+
+def _get_next_pick(tf: str, chat_id: str) -> Optional[Dict[str, Any]]:
+    tf = tf.lower()
+    with _PICK_LOCK:
+        cache = _PICK_CACHE.get(tf) or {}
+        items = cache.get("items") or []
+        if not items:
+            return None
+        idx_by_chat = cache.get("idx_by_chat") or {}
+        idx = int(idx_by_chat.get(chat_id, 0)) % len(items)
+        idx_by_chat[chat_id] = (idx + 1) % len(items)
+        cache["idx_by_chat"] = idx_by_chat
+        _PICK_CACHE[tf] = cache
+        return items[idx]
+
 def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     """Send *notifications* according to routing settings.
 
@@ -484,6 +639,10 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
 
     return {
         "inline_keyboard": [
+            [
+                {"text": "⏱️ M5 سهم سريع", "callback_data": "pick_m5"},
+                {"text": "📈 D1 سهم يومي", "callback_data": "pick_d1"},
+            ],
             [
                 {"text": "🔎 تحليل الآن", "callback_data": "do_analyze"},
                 {"text": "⭐ أفضل الفرص", "callback_data": "do_top"},
@@ -1148,6 +1307,38 @@ def telegram_webhook():
                 _tg_send(str(chat_id), f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
 
+
+            if action in ("pick_m5", "pick_d1"):
+                tf = "m5" if action == "pick_m5" else "d1"
+                chat = str(chat_id)
+                # quick response from cache (no Alpaca calls inside webhook)
+                pick = _get_next_pick(tf, chat)
+                if pick:
+                    if tf == "m5":
+                        _tg_send(chat, _format_pick_m5(pick), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                    else:
+                        c = pick.get("candidate")
+                        if isinstance(c, Candidate):
+                            _tg_send(chat, _format_pick_d1(c, _settings()), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        else:
+                            _tg_send(chat, "⚠️ لا توجد نتيجة D1 جاهزة الآن، جاري التحديث...")
+                    return jsonify({"ok": True})
+
+                # If cache empty/stale, acknowledge fast then trigger refresh async
+                _tg_send(chat, "⏳ جاري تجهيز النتائج... اضغط مرة ثانية بعد ثواني.", silent=True)
+
+                def _refresh():
+                    try:
+                        if tf == "m5":
+                            _update_cache_m5()
+                        else:
+                            _update_cache_d1()
+                    except Exception:
+                        pass
+
+                _run_async(_refresh)
+                return jsonify({"ok": True})
+
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
                 _tg_send(str(chat_id), "⏳ جاري التحليل...")
@@ -1682,7 +1873,25 @@ def _start_scheduler() -> None:
         id="eval_job",
         replace_existing=True,
     )
-    _scheduler.add_job(
+    
+    # Precompute fast-pick caches for instant Telegram buttons
+    try:
+        _scheduler.add_job(
+            _update_cache_m5,
+            IntervalTrigger(minutes=max(1, int(M5_CACHE_MIN))),
+            id="cache_m5_job",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            _update_cache_d1,
+            IntervalTrigger(minutes=max(5, int(D1_CACHE_MIN))),
+            id="cache_d1_job",
+            replace_existing=True,
+        )
+    except Exception:
+        pass
+
+_scheduler.add_job(
         _run_scan_and_notify,
         IntervalTrigger(minutes=max(5, interval)),
         kwargs={"force_summary": True},
@@ -1695,6 +1904,13 @@ def _start_scheduler() -> None:
 try:
     if os.getenv("ENABLE_SCHEDULER", "1") == "1":
         _start_scheduler()
+
+        # Warm caches in background (so first button press is instant)
+        try:
+            _run_async(_update_cache_d1)
+            _run_async(_update_cache_m5)
+        except Exception:
+            pass
 except Exception:
     pass
 
