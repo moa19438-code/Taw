@@ -1,9 +1,16 @@
-
 from __future__ import annotations
+
+import os
+import json
+import re
+
+
+
 
 from typing import Any, Dict, List, Tuple, Optional
 
 from scanner import get_symbol_features
+from ai_analyzer import gemini_predict_direction
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -134,3 +141,114 @@ def should_alert(symbol: str, side: str, min_score: int = 70) -> Tuple[bool, int
     score, reasons, features = score_signal(symbol, side)
     ok = score >= int(min_score)
     return ok, score, reasons, features
+
+
+def _safe_json_extract(text: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        return {}
+    # try direct json
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # find first {...} block
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        blob = m.group(0)
+        try:
+            return json.loads(blob)
+        except Exception:
+            return {}
+    return {}
+
+def decide_signal(symbol: str, features: dict, horizon: str = "M5") -> dict:
+    """Return a trading-like decision for manual execution (ENTER/SKIP).
+
+    Uses Gemini if available (GEMINI_API_KEY set). Always falls back to deterministic scoring.
+    Output:
+      {
+        "decision": "ENTER"|"SKIP",
+        "direction": "LONG"|"SHORT"|"NEUTRAL",
+        "confidence": 0-100,
+        "reasons": [..],
+        "risks": [..],
+        "liquidity": "GOOD|OK|BAD|None",
+        "spread_risk": "LOW|MED|HIGH|None",
+        "model": <gemini model or None>,
+      }
+    """
+    horizon = (horizon or "M5").upper()
+    # Deterministic baseline
+    base_side = "buy"
+    # Map current direction hint from features if exists
+    hint_bias = (features.get("pattern_bias") or "").upper()
+    if hint_bias == "BEAR":
+        base_side = "sell"
+    score, base_reasons, _ = score_signal(symbol, side=base_side)
+
+    liq = features.get("liquidity")
+    spread_risk = features.get("spread_risk")
+
+    # If no Gemini key, return deterministic decision
+    has_key = bool((os.getenv("GEMINI_API_KEY") or "").strip())
+    if not has_key:
+        decision = "ENTER" if score >= 75 and spread_risk != "HIGH" else "SKIP"
+        direction = "LONG" if base_side == "buy" else "SHORT"
+        conf = int(max(0, min(100, score)))
+        return {
+            "decision": decision,
+            "direction": direction,
+            "confidence": conf,
+            "reasons": base_reasons[:3],
+            "risks": (["Spread/Liquidity risk"] if spread_risk == "HIGH" else []),
+            "liquidity": liq,
+            "spread_risk": spread_risk,
+            "model": None,
+        }
+
+    # Gemini: ask for UP/DOWN/NEUTRAL plus reasons/risks
+    g = gemini_predict_direction(symbol, features, horizon=horizon)
+    raw = (g.get("raw") or "").strip()
+    parsed = _safe_json_extract(raw)
+    direction_map = {"UP": "LONG", "DOWN": "SHORT", "NEUTRAL": "NEUTRAL"}
+    gdir = direction_map.get(str(parsed.get("direction","")).upper(), "NEUTRAL")
+    conf = parsed.get("confidence")
+    try:
+        conf = int(float(conf))
+    except Exception:
+        conf = None
+
+    reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
+    risks = parsed.get("risks") if isinstance(parsed.get("risks"), list) else []
+
+    # Decision rule: need decent confidence + not high spread risk
+    if conf is None:
+        conf = int(score)
+    if spread_risk == "HIGH":
+        decision = "SKIP"
+        risks = (risks or []) + ["High spread/liquidity risk"]
+    else:
+        decision = "ENTER" if (conf >= 70 and gdir in ("LONG","SHORT")) else "SKIP"
+
+    # Blend deterministic reasons (keeps stability)
+    blended_reasons = []
+    for r in reasons[:3]:
+        if isinstance(r, str) and r.strip():
+            blended_reasons.append(r.strip())
+    for r in base_reasons:
+        if len(blended_reasons) >= 3:
+            break
+        if r not in blended_reasons:
+            blended_reasons.append(r)
+
+    return {
+        "decision": decision,
+        "direction": gdir if gdir != "NEUTRAL" else ("LONG" if base_side=="buy" else "SHORT"),
+        "confidence": int(max(0, min(100, conf))),
+        "reasons": blended_reasons[:3],
+        "risks": [x for x in risks[:3] if isinstance(x,str)],
+        "liquidity": liq,
+        "spread_risk": spread_risk,
+        "model": g.get("model"),
+    }

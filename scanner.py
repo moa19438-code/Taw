@@ -9,6 +9,7 @@ from config import (
 )
 from alpaca_client import list_assets, bars
 from indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
+from candlestick_patterns import classify_last_patterns
 from storage import get_all_settings, parse_int, parse_float, get_watchlist
 
 @dataclass
@@ -144,6 +145,10 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
         notes.append("Near 20D high")
     if vol_spike:
         notes.append("Vol spike")
+    if liquidity:
+        notes.append(f"Liquidity {liquidity}")
+    if pat.get("pattern"):
+        notes.append(f"{pat.get('pattern')} {pat.get('strength') or ''}".strip())
     if vwap20 is not None and last > vwap20:
         notes.append("Above VWAP20")
 
@@ -232,6 +237,10 @@ def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
         notes.append(f"RSI {r14:.0f}")
     if vol_spike:
         notes.append("Vol spike")
+    if liquidity:
+        notes.append(f"Liquidity {liquidity}")
+    if pat.get("pattern"):
+        notes.append(f"{pat.get('pattern')} {pat.get('strength') or ''}".strip())
 
     return {
         "tf": "5Min",
@@ -242,6 +251,12 @@ def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
         "atr14": (round(float(a14), 4) if a14 is not None else None),
         "atr_pct": (round(float(atr_pct), 4) if atr_pct is not None else None),
         "vol_spike": bool(vol_spike),
+        "avg_dollar_vol_5m": (round(float(avg_dollar_vol), 2) if avg_dollar_vol is not None else None),
+        "liquidity": liquidity,
+        "spread_risk": spread_risk,
+        "pattern": pat.get("pattern"),
+        "pattern_strength": pat.get("strength"),
+        "pattern_bias": pat.get("bias"),
         "notes": ",".join(notes),
     }
 
