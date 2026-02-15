@@ -123,6 +123,13 @@ def init_db() -> None:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_signal_id ON signal_reviews(signal_id);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_ts ON signal_reviews(ts);")
 
+            # ensure backwards-compatible schema additions
+            try:
+                ensure_signal_schema()
+                ensure_signal_reviews_schema()
+            except Exception:
+                pass
+
             con.commit()
         return
 
@@ -208,6 +215,38 @@ def init_db() -> None:
         con.commit()
 
 
+
+
+
+# --- Signal reviews schema migrations (backwards compatible) ---
+_REVIEW_COLS = {
+    "high": "REAL",
+    "low": "REAL",
+    "tp_hit": "INTEGER",
+    "sl_hit": "INTEGER",
+    "hit": "TEXT",
+    "hit_ts": "TEXT",
+}
+
+def ensure_signal_reviews_schema() -> None:
+    """Add missing columns to signal_reviews table (SQLite/Postgres)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                for col, typ in _REVIEW_COLS.items():
+                    # Map sqlite-ish types to Postgres
+                    ptyp = "DOUBLE PRECISION" if typ == "REAL" else ("INTEGER" if typ == "INTEGER" else "TEXT")
+                    cur.execute(f"ALTER TABLE signal_reviews ADD COLUMN IF NOT EXISTS {col} {ptyp};")
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("PRAGMA table_info(signal_reviews)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, typ in _REVIEW_COLS.items():
+            if col not in existing:
+                con.execute(f"ALTER TABLE signal_reviews ADD COLUMN {col} {typ}")
+        con.commit()
 
 # --- Signals schema migrations (backwards compatible) ---
 _SIGNAL_COLS = {
@@ -444,6 +483,8 @@ def _env_defaults() -> Dict[str, str]:
             "NOTIFY_ROUTE": str(getattr(config, "NOTIFY_ROUTE_DEFAULT", "dm")),
             "NOTIFY_SILENT": str(int(getattr(config, "NOTIFY_SILENT_DEFAULT", True))),
             "SIGNAL_EVAL_DAYS": str(getattr(config, "SIGNAL_EVAL_DAYS", 5)),
+            "REVIEW_LOOKBACK_DAYS": "2",
+            "WEEKLY_REPORT_DAYS": "7",
             "ML_ENABLED": str(int(getattr(config, "ML_ENABLED", True))),
             "ML_WEIGHTS": "",
             "MAX_SEND": "10",
@@ -787,24 +828,30 @@ def log_signal_review(
     mfe_pct: float,
     mae_pct: float,
     note: str = "",
+    high: float | None = None,
+    low: float | None = None,
+    tp_hit: bool | None = None,
+    sl_hit: bool | None = None,
+    hit: str = "",
+    hit_ts: str = "",
 ) -> None:
     """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or ""),
+                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or ""),
                 )
             con.commit()
         return
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note)
-            VALUES (?,?,?,?,?,?,?)""",
-            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or ""),
+            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or ""),
         )
         con.commit()
 
@@ -819,3 +866,28 @@ def last_signal_reviews(limit: int = 50) -> List[Dict[str, Any]]:
         con.row_factory = sqlite3.Row
         rows = con.execute("SELECT * FROM signal_reviews ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def signal_reviews_since(ts_iso: str) -> List[Dict[str, Any]]:
+    """Return signal_reviews rows since ts_iso (inclusive)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM signal_reviews WHERE ts >= %s ORDER BY ts ASC", (ts_iso,))
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM signal_reviews WHERE ts >= ? ORDER BY ts ASC", (ts_iso,))
+        return [dict(r) for r in cur.fetchall()]
+
+def signals_since(ts_iso: str) -> List[Dict[str, Any]]:
+    """Return signals rows since ts_iso (inclusive)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM signals WHERE ts >= %s ORDER BY ts ASC", (ts_iso,))
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM signals WHERE ts >= ? ORDER BY ts ASC", (ts_iso,))
+        return [dict(r) for r in cur.fetchall()]
