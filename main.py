@@ -432,7 +432,8 @@ def _start_ai_symbol_analysis(chat_id: str, symbol: str) -> None:
             # Build plan for EV/prob (uses same TP/SL settings)
             plan = _build_trade_plan(symbol, side=side, entry=float(feats.get("close") or feats.get("last_close") or 0.0),
                                      atr=float(feats.get("atr") or feats.get("atr14") or 0.0),
-                                     settings=s)
+                                     settings=s,
+                                     score=(float(ai_score)/10.0 if ai_score is not None else None))
 
             # ML probability / expected value (optional)
             try:
@@ -738,37 +739,18 @@ def _update_cache_m5() -> None:
         _PICK_CACHE["m5"]["ts"] = time.time()
         _PICK_CACHE["m5"]["items"] = items
 def _get_next_pick(tf: str, chat_id: str) -> Optional[Dict[str, Any]]:
-    """Return next cached pick for a timeframe, with staleness guard.
-
-    We intentionally refuse to serve stale cached picks to avoid showing "old" symbols.
-    If cache is stale, return None so caller triggers a refresh.
-    """
-    tf = (tf or "").lower().strip()
-    ttl_by_tf = {
-        # D1: refresh at least every ~2 hours (safe for "best opportunities now")
-        "d1": float(_get_int(_settings(), "PICK_CACHE_TTL_D1_SEC", 7200)),
-        # M5: refresh frequently; but we often disable outside market hours anyway
-        "m5": float(_get_int(_settings(), "PICK_CACHE_TTL_M5_SEC", 900)),
-    }
-    ttl = ttl_by_tf.get(tf, 1800.0)
-    now = time.time()
+    tf = tf.lower()
     with _PICK_LOCK:
         cache = _PICK_CACHE.get(tf) or {}
-        ts = float(cache.get("ts") or 0.0)
-        # Staleness: if cache too old, force refresh
-        if ts and (now - ts) > ttl:
-            return None
         items = cache.get("items") or []
         if not items:
             return None
         idx_by_chat = cache.get("idx_by_chat") or {}
         idx = int(idx_by_chat.get(chat_id, 0)) % len(items)
-        pick = items[idx]
         idx_by_chat[chat_id] = (idx + 1) % len(items)
         cache["idx_by_chat"] = idx_by_chat
         _PICK_CACHE[tf] = cache
-        return pick
-
+        return items[idx]
 def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     """Send *notifications* according to routing settings.
     NOTIFY_ROUTE: dm|group|both
@@ -1034,6 +1016,135 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
         "ml_prob": None,
         "ev_r": None,
     }
+
+
+def _build_trade_plan(symbol: str,
+                      side: str,
+                      entry: float,
+                      atr: float = 0.0,
+                      settings: Optional[Dict[str, str]] = None,
+                      score: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Build a trade plan for a single symbol (no execution; used for /ai and Top10).
+    Auto-select between ATR-based and % based plan.
+
+    Rules:
+      - If PLAN_CALC in settings is 'atr' -> force ATR.
+      - If PLAN_CALC is 'pct' -> force percent.
+      - Else (auto):
+          Use ATR when atr is valid and not absurd relative to price, otherwise use percent.
+
+    Score (0-10) is optional; when provided it is used for grade/risk presets and TP% tiering.
+    """
+    s = settings or _settings()
+    side = (side or "buy").lower().strip()
+    entry = float(entry or 0.0)
+    if entry <= 0:
+        entry = 0.01
+
+    # method selection
+    mode = _get_str(s, "PLAN_CALC", "auto").lower().strip()  # auto|atr|pct
+    atr = float(atr or 0.0)
+    atr_ratio = (atr / entry) if entry > 0 else 0.0
+    atr_ok = (atr > 0) and (0.002 <= atr_ratio <= 0.30)  # 0.2% .. 30% of price
+    use_atr = (mode == "atr") or (mode == "auto" and atr_ok)
+    use_pct = (mode == "pct") or (mode == "auto" and not use_atr)
+
+    # grade/risk preset
+    grade = ""
+    risk_pct = _get_float(s, "RISK_A_PCT", 1.0)
+    if score is not None:
+        try:
+            st = _strength(float(score))
+        except Exception:
+            st = "متوسط"
+        if st == "قوي جداً":
+            grade = "A+"
+            risk_pct = _get_float(s, "RISK_APLUS_PCT", 1.5)
+        elif st == "قوي":
+            grade = "A"
+            risk_pct = _get_float(s, "RISK_A_PCT", 1.0)
+        else:
+            grade = "B"
+            risk_pct = _get_float(s, "RISK_B_PCT", 0.5)
+    else:
+        grade = "A"
+
+    capital = _get_float(s, "CAPITAL_USD", 800.0)
+    risk_amount = max(1.0, capital * (risk_pct / 100.0))
+
+    # compute SL/TP
+    sl_atr_mult = _get_float(s, "SL_ATR_MULT", 1.5)
+    tp_r_mult = _get_float(s, "TP_R_MULT", 1.8)
+    sl_pct = _get_float(s, "SL_PCT", 3.0) / 100.0
+
+    # TP% tiers (only used for pct-mode)
+    tp_pct = _get_float(s, "TP_PCT", 5.0) / 100.0
+    if score is not None:
+        # map strength tiers to TP% keys
+        if _strength(float(score)) == "قوي جداً":
+            tp_pct = _get_float(s, "TP_PCT_VSTRONG", 7.5) / 100.0
+        elif _strength(float(score)) == "قوي":
+            tp_pct = _get_float(s, "TP_PCT_STRONG", 7.0) / 100.0
+
+    if use_atr:
+        # fallback ATR when missing
+        atr_val = atr if atr > 0 else max(entry * 0.01, 0.5)
+        if side == "sell":
+            sl = max(0.01, entry + (atr_val * sl_atr_mult))
+            risk_per_share = max(sl - entry, 0.01)
+            tp = max(0.01, entry - (risk_per_share * tp_r_mult))
+        else:
+            sl = max(0.01, entry - (atr_val * sl_atr_mult))
+            risk_per_share = max(entry - sl, 0.01)
+            tp = entry + (risk_per_share * tp_r_mult)
+        calc_mode = "ATR"
+    else:
+        # percent mode
+        if side == "sell":
+            sl = max(0.01, entry * (1.0 + sl_pct))
+            risk_per_share = max(sl - entry, 0.01)
+            tp = max(0.01, entry * (1.0 - tp_pct))
+        else:
+            sl = max(0.01, entry * (1.0 - sl_pct))
+            risk_per_share = max(entry - sl, 0.01)
+            tp = entry * (1.0 + tp_pct)
+        # approximate R/R from pct
+        tp_r_mult = (abs(tp - entry) / risk_per_share) if risk_per_share > 0 else 0.0
+        calc_mode = "PCT"
+
+    # position sizing with caps
+    qty_risk = int(risk_amount / risk_per_share) if risk_per_share > 0 else 1
+    if qty_risk < 1:
+        qty_risk = 1
+
+    pos_pct = _get_float(s, "POSITION_PCT", 0.20)  # max position size as % of capital
+    max_pos_value = max(1.0, capital * pos_pct)
+    qty_cap = int(max_pos_value / entry) if entry > 0 else qty_risk
+    qty = max(1, min(qty_risk, max(1, qty_cap)))
+
+    rr = (abs(tp - entry) / risk_per_share) if risk_per_share > 0 else 0.0
+
+    return {
+        "symbol": symbol,
+        "entry": round(entry, 2),
+        "sl": round(float(sl), 2),
+        "tp": round(float(tp), 2),
+        "atr": round(float(atr or 0.0), 2),
+        "sl_atr_mult": round(float(sl_atr_mult), 2),
+        "tp_r_mult": round(float(tp_r_mult), 2),
+        "risk_pct": round(float(risk_pct), 2),
+        "risk_amount": round(float(risk_amount), 2),
+        "qty": int(qty),
+        "risk_per_share": round(float(risk_per_share), 4),
+        "rr": round(float(rr), 2),
+        "grade": grade,
+        "calc_mode": calc_mode,
+        "entry_mode": _get_str(s, "ENTRY_MODE", "auto"),
+        "ml_prob": None,
+        "ev_r": None,
+    }
+
 
 def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_score: int | None = None) -> str:
     strength = _strength(float(c.score))
@@ -1326,7 +1437,7 @@ def telegram_webhook():
                         # Plan based on candidate values
                         entry = float(getattr(c, "last_close", 0.0) or 0.0)
                         atr = float(getattr(c, "atr", 0.0) or 0.0)
-                        plan = _build_trade_plan(sym, side=side, entry=entry, atr=atr, settings=s)
+                        plan = _build_trade_plan(sym, side=side, entry=entry, atr=atr, settings=s, score=float(getattr(c,'score',0.0) or 0.0))
                         p = None
                         ev = None
                         try:
@@ -1629,19 +1740,6 @@ def telegram_webhook():
                         _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
                 _run_async(_job)
                 return jsonify({"ok": True})
-            if action == "weekly_report":
-                # Weekly summary based on stored reviews (no trading)
-                _tg_send(str(chat_id), "⏳ جاري إعداد التقرير الأسبوعي...")
-                def _job_wr():
-                    try:
-                        days = int(_get_int(_settings(), "WEEKLY_REPORT_DAYS", 7))
-                        msg = _weekly_report(days=days)
-                        _tg_send(str(chat_id), msg, silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
-                    except Exception as e:
-                        _tg_send(str(chat_id), f"❌ خطأ أثناء التقرير الأسبوعي:\n{e}")
-                _run_async(_job_wr)
-                return jsonify({"ok": True})
-
             # Unknown action
             _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
