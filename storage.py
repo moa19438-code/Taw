@@ -226,6 +226,9 @@ _REVIEW_COLS = {
     "sl_hit": "INTEGER",
     "hit": "TEXT",
     "hit_ts": "TEXT",
+    "tp_progress": "REAL",
+    "tp_gap_pct": "REAL",
+    "tp_gap_class": "TEXT",
 }
 
 def ensure_signal_reviews_schema() -> None:
@@ -834,15 +837,18 @@ def log_signal_review(
     sl_hit: bool | None = None,
     hit: str = "",
     hit_ts: str = "",
+    tp_progress: float | None = None,
+    tp_gap_pct: float | None = None,
+    tp_gap_class: str = "",
 ) -> None:
     """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or ""),
+                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
                 )
             con.commit()
         return
@@ -851,7 +857,7 @@ def log_signal_review(
         con.execute(
             """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or ""),
+            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
         )
         con.commit()
 
@@ -891,3 +897,47 @@ def signals_since(ts_iso: str) -> List[Dict[str, Any]]:
         con.row_factory = sqlite3.Row
         cur = con.execute("SELECT * FROM signals WHERE ts >= ? ORDER BY ts ASC", (ts_iso,))
         return [dict(r) for r in cur.fetchall()]
+
+
+
+def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
+    """Return latest review row per signal within last `days` days."""
+    cutoff = (datetime.utcnow() - timedelta(days=int(days))).isoformat()
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
+                    FROM signal_reviews r
+                    JOIN (
+                        SELECT signal_id, MAX(ts) AS max_ts
+                        FROM signal_reviews
+                        WHERE ts >= %s
+                        GROUP BY signal_id
+                    ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
+                    JOIN signals s ON s.id = r.signal_id
+                    ORDER BY r.ts DESC
+                    """,
+                    (cutoff,),
+                )
+                return cur.fetchall()
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
+            FROM signal_reviews r
+            JOIN (
+                SELECT signal_id, MAX(ts) AS max_ts
+                FROM signal_reviews
+                WHERE ts >= ?
+                GROUP BY signal_id
+            ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
+            JOIN signals s ON s.id = r.signal_id
+            ORDER BY r.ts DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(r) for r in rows]

@@ -150,6 +150,20 @@ def api_review():
     return jsonify({"ok": True, "reviewed_days": lookback})
 
 
+
+
+@app.get("/api/weekly_report")
+def api_weekly_report():
+    key = (request.args.get("key") or "").strip()
+    if RUN_KEY and key != RUN_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    days = int(request.args.get("days") or 7)
+    msg = _weekly_report(days=days)
+    try:
+        send_telegram(msg)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "days": days})
 # ================= Telegram keyboards =================
 def _ikb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
     """Build Telegram inline keyboard markup from rows of (text, callback_data)."""
@@ -167,7 +181,8 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
         [("🔥 أفضل فرص الآن (D1)", "pick_d1"), ("⚡ سكالبينغ (M5)", "pick_m5")],
         [("🧠 1- أفضل EV", "ai_top_ev"), ("🧠 2- أعلى احتمال", "ai_top_prob")],
         [("🧠 3- سكالبينغ M5", "ai_top_m5"), ("🔎 AI سهم معين", "ai_symbol_start")],
-        [("📈 مراجعة إشاراتي", "review_signals"), ("🔁 تحديث القائمة", "menu")],
+        [("📈 مراجعة إشاراتي", "review_signals"), ("📅 تقرير أسبوعي", "weekly_report")],
+        [("🔁 تحديث القائمة", "menu")],
     ])
 
 
@@ -2015,6 +2030,50 @@ def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
              f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
     body = "\n".join(lines[:25])
     return header + "\n" + body
+
+
+def _weekly_report(days: int = 7) -> str:
+    """Weekly summary based on latest stored reviews (no trading)."""
+    try:
+        rows = latest_signal_reviews_since(days=int(days))
+    except Exception:
+        rows = []
+    if not rows:
+        return f"📅 تقرير أسبوعي (آخر {days} يوم):\nلا توجد بيانات مراجعة كافية. شغّل زر (مراجعة إشاراتي) أو فعّل Cron /api/review."
+    n = len(rows)
+    wins = sum(1 for r in rows if (r.get("return_pct") or 0) > 0)
+    losses = sum(1 for r in rows if (r.get("return_pct") or 0) < 0)
+    flat = n - wins - losses
+    winrate = (wins / max(1, (wins + losses))) * 100.0
+    avg_ret = sum((r.get("return_pct") or 0) for r in rows) / n
+    avg_mfe = sum((r.get("mfe_pct") or 0) for r in rows) / n
+    avg_mae = sum((r.get("mae_pct") or 0) for r in rows) / n
+    tp_hits = sum(1 for r in rows if (r.get("tp_hit") or 0) in (1, True))
+    sl_hits = sum(1 for r in rows if (r.get("sl_hit") or 0) in (1, True))
+
+    # Top/Bottom by return_pct
+    rows_sorted = sorted(rows, key=lambda x: float(x.get("return_pct") or 0), reverse=True)
+    top5 = rows_sorted[:5]
+    bot5 = list(reversed(rows_sorted[-5:]))
+
+    def fmt_row(r):
+        sym = (r.get("symbol") or "").upper()
+        mode = r.get("mode") or ""
+        ret = float(r.get("return_pct") or 0)
+        cls = (r.get("tp_gap_class") or "").strip()
+        extra = f" | {cls}" if cls else ""
+        return f"• {sym} ({mode}) {ret:+.2f}%{extra}"
+
+    header = (
+        f"📅 تقرير أسبوعي (آخر {days} يوم)\n"
+        f"— إشارات: {n}\n"
+        f"— Win/Loss/Flat: {wins}/{losses}/{flat} | Winrate: {winrate:.1f}%\n"
+        f"— Avg Ret: {avg_ret:+.2f}% | Avg MFE: {avg_mfe:+.2f}% | Avg MAE: {avg_mae:+.2f}%\n"
+        f"— TP Hits: {tp_hits} | SL Hits: {sl_hits}\n"
+    )
+    body = "🏆 أفضل 5\n" + "\n".join(fmt_row(r) for r in top5) + "\n\n" + "🧊 أسوأ 5\n" + "\n".join(fmt_row(r) for r in bot5)
+    footer = "\n\nملاحظة: التقرير يعتمد على آخر مراجعة محفوظة لكل إشارة ضمن الفترة (استكشاف/تعليم)."
+    return header + "\n" + body + footer
 
 def _evaluate_pending_signals() -> None:
     """Evaluate old signals (after horizon) and optionally update lightweight model weights."""
