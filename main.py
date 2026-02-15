@@ -738,18 +738,37 @@ def _update_cache_m5() -> None:
         _PICK_CACHE["m5"]["ts"] = time.time()
         _PICK_CACHE["m5"]["items"] = items
 def _get_next_pick(tf: str, chat_id: str) -> Optional[Dict[str, Any]]:
-    tf = tf.lower()
+    """Return next cached pick for a timeframe, with staleness guard.
+
+    We intentionally refuse to serve stale cached picks to avoid showing "old" symbols.
+    If cache is stale, return None so caller triggers a refresh.
+    """
+    tf = (tf or "").lower().strip()
+    ttl_by_tf = {
+        # D1: refresh at least every ~2 hours (safe for "best opportunities now")
+        "d1": float(_get_int(_settings(), "PICK_CACHE_TTL_D1_SEC", 7200)),
+        # M5: refresh frequently; but we often disable outside market hours anyway
+        "m5": float(_get_int(_settings(), "PICK_CACHE_TTL_M5_SEC", 900)),
+    }
+    ttl = ttl_by_tf.get(tf, 1800.0)
+    now = time.time()
     with _PICK_LOCK:
         cache = _PICK_CACHE.get(tf) or {}
+        ts = float(cache.get("ts") or 0.0)
+        # Staleness: if cache too old, force refresh
+        if ts and (now - ts) > ttl:
+            return None
         items = cache.get("items") or []
         if not items:
             return None
         idx_by_chat = cache.get("idx_by_chat") or {}
         idx = int(idx_by_chat.get(chat_id, 0)) % len(items)
+        pick = items[idx]
         idx_by_chat[chat_id] = (idx + 1) % len(items)
         cache["idx_by_chat"] = idx_by_chat
         _PICK_CACHE[tf] = cache
-        return items[idx]
+        return pick
+
 def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     """Send *notifications* according to routing settings.
     NOTIFY_ROUTE: dm|group|both
@@ -1610,6 +1629,19 @@ def telegram_webhook():
                         _tg_send(str(chat_id), f"❌ خطأ أثناء الفحص:\n{e}")
                 _run_async(_job)
                 return jsonify({"ok": True})
+            if action == "weekly_report":
+                # Weekly summary based on stored reviews (no trading)
+                _tg_send(str(chat_id), "⏳ جاري إعداد التقرير الأسبوعي...")
+                def _job_wr():
+                    try:
+                        days = int(_get_int(_settings(), "WEEKLY_REPORT_DAYS", 7))
+                        msg = _weekly_report(days=days)
+                        _tg_send(str(chat_id), msg, silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                    except Exception as e:
+                        _tg_send(str(chat_id), f"❌ خطأ أثناء التقرير الأسبوعي:\n{e}")
+                _run_async(_job_wr)
+                return jsonify({"ok": True})
+
             # Unknown action
             _tg_send(str(chat_id), "❓ أمر غير معروف.", reply_markup=_build_menu(settings))
             return jsonify({"ok": True})
