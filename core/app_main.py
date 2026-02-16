@@ -1768,13 +1768,15 @@ def telegram_webhook():
             if action in ("pick_m5", "pick_d1"):
                 tf = "m5" if action == "pick_m5" else "d1"
                 chat = str(chat_id)
+
                 # Market-hours filter for scalping signals
                 if tf == "m5":
                     ms = _market_status_cached()
                     if not ms.get("is_open", True):
-                        _tg_send(chat, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1 للتجهيز.", silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        _tg_send(chat, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1.", silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
                         return jsonify({"ok": True})
-                # quick response from cache (no Alpaca calls inside webhook)
+
+                # 1) Try immediate response from cache
                 pick = _get_next_pick(tf, chat)
                 if pick:
                     if tf == "m5":
@@ -1786,19 +1788,49 @@ def telegram_webhook():
                         else:
                             _tg_send(chat, "⚠️ لا توجد نتيجة D1 جاهزة الآن، جاري التحديث...")
                     return jsonify({"ok": True})
-                # If cache empty/stale, acknowledge fast then trigger refresh async
-                _tg_send(chat, "⏳ جاري تجهيز النتائج... اضغط مرة ثانية بعد ثواني.", silent=True)
-                def _refresh():
+
+                # 2) If cache empty/stale: start refresh in background and AUTO-SEND when ready
+                key = f"{chat}:{tf}"
+                now = time.time()
+                started = _PICK_IN_PROGRESS.get(key)
+                if started and (now - float(started)) < 180:
+                    # already running
+                    _tg_send(chat, "⏳ لا يزال جاري تجهيز النتائج... سيتم إرسالها تلقائياً عند الجاهزية.", silent=True)
+                    return jsonify({"ok": True})
+
+                _PICK_IN_PROGRESS[key] = now
+                _tg_send(chat, "⏳ جاري تجهيز النتائج... سيتم إرسالها تلقائياً عند الجاهزية.", silent=True)
+
+                def _refresh_and_send():
                     try:
                         if tf == "m5":
                             _update_cache_m5()
                         else:
                             _update_cache_d1()
-                    except Exception:
-                        pass
-                _run_async(_refresh)
+
+                        # After refresh, pull a pick and send it
+                        pick2 = _get_next_pick(tf, chat)
+                        if not pick2:
+                            _tg_send(chat, "❌ ما قدرت أجهز فرص حالياً (قد يكون السوق مغلق/بيانات غير كافية). جرّب لاحقاً.", silent=True)
+                            return
+
+                        if tf == "m5":
+                            _tg_send(chat, _format_pick_m5(pick2), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        else:
+                            c2 = pick2.get("candidate")
+                            if isinstance(c2, Candidate):
+                                _tg_send(chat, _format_pick_d1(c2, _settings()), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                            else:
+                                _tg_send(chat, "⚠️ تم تحديث D1 لكن النتيجة غير صالحة.", silent=True)
+                    except Exception as e:
+                        # IMPORTANT: show error to admin instead of swallowing it
+                        _tg_send(chat, f"❌ خطأ أثناء تجهيز فرص {tf.upper()}:\n{e}", silent=True)
+                    finally:
+                        _PICK_IN_PROGRESS.pop(key, None)
+
+                _run_async(_refresh_and_send)
                 return jsonify({"ok": True})
-            if action in ("do_analyze", "do_top"):
+if action in ("do_analyze", "do_top"):
                 settings = _settings()
                 _tg_send(str(chat_id), "⏳ جاري التحليل...")
                 def _job():
