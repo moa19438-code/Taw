@@ -1393,10 +1393,103 @@ def telegram_webhook():
                         _tg_send(str(chat_id), f"❌ خطأ أثناء المراجعة:\n{e}")
                 _run_async(_job)
                 return jsonify({"ok": True})
+            if action == "weekly_report":
+                _tg_send(str(chat_id), "⏳ جاري إعداد التقرير الأسبوعي...")
+                def _job():
+                    try:
+                        days = int(_get_int(_settings(), "WEEKLY_REPORT_DAYS", 7))
+                        msg = _weekly_report(days=days)
+                        _tg_send(str(chat_id), msg, reply_markup=_build_menu(_settings()))
+                    except Exception as e:
+                        _tg_send(str(chat_id), f"❌ خطأ أثناء التقرير الأسبوعي:\n{e}", reply_markup=_build_menu(_settings()))
+                _run_async(_job)
+                return jsonify({"ok": True})
+
+
 
             
             if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
                 s = _settings()
+
+                if action in ("ai_top_ev", "ai_top_prob"):
+                    _tg_send(str(chat_id), "⏳ جاري تجهيز النتائج الذكية... قد يستغرق قليلًا")
+                    def _job():
+                        try:
+                            # 1-2) D1 ranking: compute plans + ML probability/EV (best-effort)
+                            picks, universe_size = scan_universe_with_meta()
+                            ranked = []
+                            for c in (picks or [])[:max(30, min(120, len(picks) if picks else 0))]:
+                                try:
+                                    sym = c.symbol
+                                    side = "buy" if str(getattr(c, "side", "buy")) in ("buy","long") else "sell"
+                                    passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
+                                    if AI_FILTER_ENABLED:
+                                        try:
+                                            ai_score, ai_reasons, ai_features = score_signal(sym, side=side)
+                                        except Exception:
+                                            ai_score, ai_reasons, ai_features = (None, [], {})
+                                    # Plan based on candidate values
+                                    entry = float(getattr(c, "last_close", 0.0) or 0.0)
+                                    atr = float(getattr(c, "atr", 0.0) or 0.0)
+                                    plan = _build_trade_plan(sym, side=side, entry=entry, atr=atr, settings=s, score=float(getattr(c,'score',0.0) or 0.0))
+                                    p = None
+                                    ev = None
+                                    try:
+                                        if ML_ENABLED and AI_FILTER_ENABLED and (ai_features is not None):
+                                            w = parse_weights(s.get("ML_WEIGHTS") or "")
+                                            x = featurize(ai_features)
+                                            p = float(predict_prob(w, x))
+                                            tp_r = float(plan.get("tp_r_mult") or 0.0)
+                                            ev = (p * tp_r) - ((1.0 - p) * 1.0)
+                                    except Exception:
+                                        p, ev = (None, None)
+                                    ranked.append({
+                                        "symbol": sym,
+                                        "ai_score": ai_score,
+                                        "ml_prob": p,
+                                        "ev_r": ev,
+                                    })
+                                except Exception:
+                                    continue
+
+                            if not ranked:
+                                _tg_send(str(chat_id), "❌ لا توجد نتائج الآن.", reply_markup=_build_menu(s))
+                                return
+
+                            if action == "ai_top_prob":
+                                ranked.sort(key=lambda x: (x["ml_prob"] is None, -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
+                                title = "🧠 Top 10 (2- أعلى احتمال): اختر سهم"
+                                out=[]
+                                for it in ranked[:10]:
+                                    sym=it["symbol"]
+                                    p=it["ml_prob"]
+                                    sc=it["ai_score"]
+                                    label=f"{sym} | P {p:.2f}" if p is not None else f"{sym} | P ?"
+                                    if sc is not None:
+                                        label += f" | S {sc}"
+                                    out.append({"symbol": sym, "label": label})
+                                _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
+                                return
+
+                            # ai_top_ev
+                            ranked.sort(key=lambda x: (x["ev_r"] is None, -(x["ev_r"] or -999.0), -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
+                            title = "🧠 Top 10 (1- أفضل EV): اختر سهم"
+                            out=[]
+                            for it in ranked[:10]:
+                                sym=it["symbol"]
+                                ev=it["ev_r"]
+                                p=it["ml_prob"]
+                                label=f"{sym} | EV {ev:.2f}" if ev is not None else f"{sym} | EV ?"
+                                if p is not None:
+                                    label += f" | P {p:.2f}"
+                                out.append({"symbol": sym, "label": label})
+                            _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
+                            return
+                        except Exception as e:
+                            _tg_send(str(chat_id), f"❌ خطأ أثناء التحليل الذكي:\n{e}", reply_markup=_build_menu(_settings()))
+                    _run_async(_job)
+                    return jsonify({"ok": True})
+
                 # 3) M5 uses intraday cache (fast)
                 if action == "ai_top_m5":
                     try:
@@ -1421,76 +1514,6 @@ def telegram_webhook():
                     _tg_send(str(chat_id), "🧠 Top 10 (3- سكالبينغ M5): اختر سهم", reply_markup=_build_top10_kb(out))
                     return jsonify({"ok": True})
 
-                # 1-2) D1 ranking: compute plans + ML probability/EV (best-effort)
-                picks, universe_size = scan_universe_with_meta()
-                ranked = []
-                for c in (picks or [])[:max(30, min(120, len(picks) if picks else 0))]:
-                    try:
-                        sym = c.symbol
-                        side = "buy" if str(getattr(c, "side", "buy")) in ("buy","long") else "sell"
-                        passed, ai_score, ai_reasons, ai_features = (True, None, [], {})
-                        if AI_FILTER_ENABLED:
-                            try:
-                                ai_score, ai_reasons, ai_features = score_signal(sym, side=side)
-                            except Exception:
-                                ai_score, ai_reasons, ai_features = (None, [], {})
-                        # Plan based on candidate values
-                        entry = float(getattr(c, "last_close", 0.0) or 0.0)
-                        atr = float(getattr(c, "atr", 0.0) or 0.0)
-                        plan = _build_trade_plan(sym, side=side, entry=entry, atr=atr, settings=s, score=float(getattr(c,'score',0.0) or 0.0))
-                        p = None
-                        ev = None
-                        try:
-                            if ML_ENABLED and AI_FILTER_ENABLED and (ai_features is not None):
-                                w = parse_weights(s.get("ML_WEIGHTS") or "")
-                                x = featurize(ai_features)
-                                p = float(predict_prob(w, x))
-                                tp_r = float(plan.get("tp_r_mult") or 0.0)
-                                ev = (p * tp_r) - ((1.0 - p) * 1.0)
-                        except Exception:
-                            p, ev = (None, None)
-                        ranked.append({
-                            "symbol": sym,
-                            "ai_score": ai_score,
-                            "ml_prob": p,
-                            "ev_r": ev,
-                        })
-                    except Exception:
-                        continue
-
-                if not ranked:
-                    _tg_send(str(chat_id), "❌ لا توجد نتائج الآن.", reply_markup=_build_menu(s))
-                    return jsonify({"ok": True})
-
-                if action == "ai_top_prob":
-                    ranked.sort(key=lambda x: (x["ml_prob"] is None, -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
-                    title = "🧠 Top 10 (2- أعلى احتمال): اختر سهم"
-                    out=[]
-                    for it in ranked[:10]:
-                        sym=it["symbol"]
-                        p=it["ml_prob"]
-                        sc=it["ai_score"]
-                        label=f"{sym} | P {p:.2f}" if p is not None else f"{sym} | P ?"
-                        if sc is not None:
-                            label += f" | S {sc}"
-                        out.append({"symbol": sym, "label": label})
-                    _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
-                    return jsonify({"ok": True})
-
-                # ai_top_ev
-                ranked.sort(key=lambda x: (x["ev_r"] is None, -(x["ev_r"] or -999.0), -(x["ml_prob"] or 0.0), -(x["ai_score"] or 0)), reverse=False)
-                title = "🧠 Top 10 (1- أفضل EV): اختر سهم"
-                out=[]
-                for it in ranked[:10]:
-                    sym=it["symbol"]
-                    ev=it["ev_r"]
-                    p=it["ml_prob"]
-                    label=f"{sym} | EV {ev:.2f}" if ev is not None else f"{sym} | EV ?"
-                    if p is not None:
-                        label += f" | P {p:.2f}"
-                    out.append({"symbol": sym, "label": label})
-                _tg_send(str(chat_id), title, reply_markup=_build_top10_kb(out))
-                return jsonify({"ok": True})
 
             if action.startswith("ai_pick:"):
                 sym = action.split(":", 1)[1].strip().upper()
