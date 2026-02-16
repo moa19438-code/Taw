@@ -1362,6 +1362,19 @@ def telegram_webhook():
         # Handle button clicks
         cb = data.get("callback_query")
         if cb:
+                    # ===== التقرير الأسبوعي =====
+        if action == "weekly_report":
+            _tg_send(str(chat_id), "⏳ جاري إعداد التقرير الأسبوعي...")
+
+            def _job():
+                try:
+                    msg = _weekly_report(days=7)
+                    _tg_send(str(chat_id), msg)
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ أثناء إنشاء التقرير:\\n{e}")
+
+            _run_async(_job)
+            return jsonify({"ok": True})
             user_id = cb.get("from", {}).get("id")
             chat_id = cb.get("message", {}).get("chat", {}).get("id")
             action = (cb.get("data") or "").strip()
