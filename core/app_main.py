@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 import os
@@ -2563,7 +2563,6 @@ def api_summary():
     items = last_signals(limit=100) or []
     signals_7d = 0
     try:
-        from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=7)
         for it in items:
