@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 
 
@@ -901,43 +901,49 @@ def signals_since(ts_iso: str) -> List[Dict[str, Any]]:
 
 
 def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
-    """Return latest review row per signal within last `days` days."""
-    cutoff = (datetime.utcnow() - timedelta(days=int(days))).isoformat()
-    if IS_POSTGRES:
-        with _pg_connect() as con:
-            with con.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
-                    FROM signal_reviews r
-                    JOIN (
-                        SELECT signal_id, MAX(ts) AS max_ts
-                        FROM signal_reviews
-                        WHERE ts >= %s
-                        GROUP BY signal_id
-                    ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
-                    JOIN signals s ON s.id = r.signal_id
-                    ORDER BY r.ts DESC
-                    """,
-                    (cutoff,),
-                )
-                return cur.fetchall()
+    """Return latest review row per signal within last `days` days.
+    Safe on fresh deploys (returns [] if tables are missing).
+    """
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=int(days))).isoformat()
+        if IS_POSTGRES:
+            with _pg_connect() as con:
+                with con.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        """
+                        SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
+                        FROM signal_reviews r
+                        JOIN (
+                            SELECT signal_id, MAX(ts) AS max_ts
+                            FROM signal_reviews
+                            WHERE ts >= %s
+                            GROUP BY signal_id
+                        ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
+                        JOIN signals s ON s.id = r.signal_id
+                        ORDER BY r.ts DESC
+                        """,
+                        (cutoff,),
+                    )
+                    return cur.fetchall()
 
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
-            FROM signal_reviews r
-            JOIN (
-                SELECT signal_id, MAX(ts) AS max_ts
-                FROM signal_reviews
-                WHERE ts >= ?
-                GROUP BY signal_id
-            ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
-            JOIN signals s ON s.id = r.signal_id
-            ORDER BY r.ts DESC
-            """,
-            (cutoff,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT r.*, s.symbol, s.mode, s.score, s.entry, s.tp, s.sl
+                FROM signal_reviews r
+                JOIN (
+                    SELECT signal_id, MAX(ts) AS max_ts
+                    FROM signal_reviews
+                    WHERE ts >= ?
+                    GROUP BY signal_id
+                ) x ON x.signal_id = r.signal_id AND x.max_ts = r.ts
+                JOIN signals s ON s.id = r.signal_id
+                ORDER BY r.ts DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+

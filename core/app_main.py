@@ -1830,7 +1830,7 @@ def telegram_webhook():
 
                 _run_async(_refresh_and_send)
                 return jsonify({"ok": True})
-if action in ("do_analyze", "do_top"):
+            if action in ("do_analyze", "do_top"):
                 settings = _settings()
                 _tg_send(str(chat_id), "⏳ جاري التحليل...")
                 def _job():
