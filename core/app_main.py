@@ -57,6 +57,7 @@ from core.storage import (
     remove_watchlist,
     log_signal_review,
     last_signal_reviews,
+    latest_signal_reviews_since,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -1176,6 +1177,8 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         f"الكمية: {plan['qty']}\n"
         f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"
         f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
+        f"TF: D:{'✅' if getattr(c, 'daily_ok', False) else '❌'} W:{'✅' if getattr(c, 'weekly_ok', False) else '❌'} M:{'✅' if getattr(c, 'monthly_ok', False) else '❌'} | Liquidity(ADV$): {round(float(getattr(c, 'avg_dollar_vol', 0) or 0)/1e6,1)}M\n"
+
         f"{ai_line}"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
         f"جني الربح: {plan['tp']}\n"
@@ -1244,11 +1247,14 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                         should_send = True
         if not should_send:
             continue
-        ai_score = None
-        if AI_FILTER_ENABLED:
-            ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, "buy", min_score=AI_FILTER_MIN_SCORE)
-            if not ok_ai:
-                continue
+
+            ai_score = None
+            _ai_reasons: List[str] = []
+            _ai_features: Dict[str, Any] = {}
+            if AI_FILTER_ENABLED:
+                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, (getattr(c, "side", "buy") or "buy"), min_score=AI_FILTER_MIN_SCORE)
+                if not ok_ai:
+                    continue
         plan = _compute_trade_plan(settings, c)
         # Optional AI direction prediction (run only on top N to avoid slowness)
         if _get_bool(settings, "AI_PREDICT_ENABLED", False) and ai_used < max(0, ai_topn):
@@ -1278,6 +1284,7 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
         blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
         logged.append({
             "symbol": c.symbol,
+            "side": (getattr(c, "side", "buy") or "buy"),
             "strength": st,
             "score": float(c.score),
             "entry": float(plan["entry"]),
@@ -1285,6 +1292,7 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
             "tp": float(plan["tp"]),
             "mode": mode,
             "ai_score": ai_score,
+            "ml_prob": plan.get("ml_prob"),
             "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
             "features": (_ai_features if AI_FILTER_ENABLED else None),
         })
@@ -1297,9 +1305,12 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 break
             if c.symbol in chosen:
                 continue
+
             ai_score = None
+            _ai_reasons: List[str] = []
+            _ai_features: Dict[str, Any] = {}
             if AI_FILTER_ENABLED:
-                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, "buy", min_score=AI_FILTER_MIN_SCORE)
+                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, (getattr(c, "side", "buy") or "buy"), min_score=AI_FILTER_MIN_SCORE)
                 if not ok_ai:
                     continue
             plan = _compute_trade_plan(settings, c)
@@ -1336,14 +1347,35 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 "tp": float(plan["tp"]),
                 "mode": mode,
             "ai_score": ai_score,
+            "ml_prob": plan.get("ml_prob"),
             "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
             "features": (_ai_features if AI_FILTER_ENABLED else None),
             })
     # persist
     ts = now_utc.isoformat()
+    horizon_days = int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS))
     for d in logged:
-        log_signal(ts=ts, symbol=d["symbol"], source="scan", side=(getattr(c,"side",None) or "buy"), mode=d["mode"], strength=d["strength"], score=float(d["score"]), entry=float(d["entry"]), sl=d.get("sl"), tp=d.get("tp"), features_json=json.dumps(d.get("features") or {}, ensure_ascii=False), reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False), horizon_days=int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS)))
+        try:
+            log_signal(
+                ts=ts,
+                symbol=d["symbol"],
+                source="scan",
+                side=(d.get("side") or "buy"),
+                mode=d["mode"],
+                strength=d["strength"],
+                score=float(d["score"]),
+                entry=float(d["entry"]),
+                sl=d.get("sl"),
+                tp=d.get("tp"),
+                features_json=json.dumps(d.get("features") or {}, ensure_ascii=False),
+                reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False),
+                horizon_days=horizon_days,
+                model_prob=(float(d.get("ml_prob")) if d.get("ml_prob") is not None else None),
+            )
+        except Exception:
+            continue
     return blocks, logged
+
 def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
     picks, universe_size = scan_universe_with_meta()
     blocks, _ = _select_and_log_new_candidates(picks, settings)
@@ -1996,6 +2028,56 @@ def signals_export():
             line.append(s)
         lines.append(",".join(line))
     return ("\n".join(lines), 200, {"Content-Type": "text/csv; charset=utf-8"})
+
+@app.get("/stats")
+def stats_route():
+    """Quick stats for monitoring (no trading).
+    Requires RUN_KEY.
+    Query params:
+      - days: lookback window for latest reviews (default 14)
+    """
+    if request.args.get("key") != RUN_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        days = int(request.args.get("days") or 14)
+    except Exception:
+        days = 14
+
+    rows = latest_signal_reviews_since(days=max(1, min(120, days)))
+    n = len(rows)
+    wins = sum(1 for r in rows if float(r.get("return_pct") or 0) > 0)
+    losses = sum(1 for r in rows if float(r.get("return_pct") or 0) < 0)
+    flat = n - wins - losses
+    winrate = (wins / max(1, wins + losses)) * 100.0
+
+    def _avg(key: str) -> float:
+        if not rows:
+            return 0.0
+        return sum(float(r.get(key) or 0) for r in rows) / len(rows)
+
+    avg_ret = _avg("return_pct")
+    avg_mfe = _avg("mfe_pct")
+    avg_mae = _avg("mae_pct")
+
+    # best/worst symbols
+    rows_sorted = sorted(rows, key=lambda x: float(x.get("return_pct") or 0), reverse=True)
+    top = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[:5]]
+    bottom = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[-5:]][::-1]
+
+    return jsonify({
+        "ok": True,
+        "days": days,
+        "signals_reviewed": n,
+        "wins": wins,
+        "losses": losses,
+        "flat": flat,
+        "winrate_pct": round(winrate, 2),
+        "avg_return_pct": round(avg_ret, 3),
+        "avg_mfe_pct": round(avg_mfe, 3),
+        "avg_mae_pct": round(avg_mae, 3),
+        "top5": top,
+        "bottom5": bottom,
+    })
 @app.get("/scan")
 def scan():
     """
