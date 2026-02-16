@@ -1,4 +1,6 @@
-from core.app_main import app
+import os, sys
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+BASE_DIR = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(BASE_DIR, "core"))
+
+from app_main import app
