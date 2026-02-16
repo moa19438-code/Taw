@@ -141,16 +141,26 @@ def api_review():
     key = (request.args.get("key") or "").strip()
     if RUN_KEY and key != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 403
-    lookback = int(request.args.get("days") or 2)
-    msg = _review_recent_signals(lookback_days=lookback, limit=80)
-    # send to default telegram (admin/channel)
     try:
-        send_telegram(msg)
+        lookback = int(request.args.get("days") or 2)
     except Exception:
-        pass
-    return jsonify({"ok": True, "reviewed_days": lookback})
+        lookback = 2
+    lookback = max(1, min(30, lookback))
 
-
+    try:
+        msg = _review_recent_signals(lookback_days=lookback, limit=80)
+        try:
+            send_telegram(msg)
+        except Exception:
+            pass
+        return jsonify({"ok": True, "reviewed_days": lookback})
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "review_failed",
+            "message": str(e),
+            "hint": "If you just deployed, run /scan first. Reviews need stored signals and market data access."
+        }), 500
 
 
 @app.get("/api/weekly_report")
@@ -158,13 +168,27 @@ def api_weekly_report():
     key = (request.args.get("key") or "").strip()
     if RUN_KEY and key != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 403
-    days = int(request.args.get("days") or 7)
-    msg = _weekly_report(days=days)
     try:
-        send_telegram(msg)
+        days = int(request.args.get("days") or 7)
     except Exception:
-        pass
-    return jsonify({"ok": True, "days": days})
+        days = 7
+    days = max(1, min(90, days))
+
+    try:
+        msg = _weekly_report(days=days)
+        try:
+            send_telegram(msg)
+        except Exception:
+            pass
+        return jsonify({"ok": True, "days": days})
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "weekly_report_failed",
+            "message": str(e),
+            "hint": "This report needs stored signals/reviews. If there is no data yet, run /scan on market days and then /api/review after a couple of days."
+        }), 500
+
 # ================= Telegram keyboards =================
 def _ikb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
     """Build Telegram inline keyboard markup from rows of (text, callback_data)."""
@@ -2038,46 +2062,57 @@ def stats_route():
     """
     if request.args.get("key") != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
     try:
         days = int(request.args.get("days") or 14)
     except Exception:
         days = 14
+    days = max(1, min(120, days))
 
-    rows = latest_signal_reviews_since(days=max(1, min(120, days)))
-    n = len(rows)
-    wins = sum(1 for r in rows if float(r.get("return_pct") or 0) > 0)
-    losses = sum(1 for r in rows if float(r.get("return_pct") or 0) < 0)
-    flat = n - wins - losses
-    winrate = (wins / max(1, wins + losses)) * 100.0
+    try:
+        rows = latest_signal_reviews_since(days=days)
+        n = len(rows)
+        wins = sum(1 for r in rows if float(r.get("return_pct") or 0) > 0)
+        losses = sum(1 for r in rows if float(r.get("return_pct") or 0) < 0)
+        flat = n - wins - losses
+        winrate = (wins / max(1, wins + losses)) * 100.0
 
-    def _avg(key: str) -> float:
-        if not rows:
-            return 0.0
-        return sum(float(r.get(key) or 0) for r in rows) / len(rows)
+        def _avg(key: str) -> float:
+            if not rows:
+                return 0.0
+            return sum(float(r.get(key) or 0) for r in rows) / len(rows)
 
-    avg_ret = _avg("return_pct")
-    avg_mfe = _avg("mfe_pct")
-    avg_mae = _avg("mae_pct")
+        avg_ret = _avg("return_pct")
+        avg_mfe = _avg("mfe_pct")
+        avg_mae = _avg("mae_pct")
 
-    # best/worst symbols
-    rows_sorted = sorted(rows, key=lambda x: float(x.get("return_pct") or 0), reverse=True)
-    top = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[:5]]
-    bottom = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[-5:]][::-1]
+        rows_sorted = sorted(rows, key=lambda x: float(x.get("return_pct") or 0), reverse=True)
+        top = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[:5]]
+        bottom = [{"symbol": r.get("symbol"), "mode": r.get("mode"), "ret": float(r.get("return_pct") or 0)} for r in rows_sorted[-5:]][::-1]
 
-    return jsonify({
-        "ok": True,
-        "days": days,
-        "signals_reviewed": n,
-        "wins": wins,
-        "losses": losses,
-        "flat": flat,
-        "winrate_pct": round(winrate, 2),
-        "avg_return_pct": round(avg_ret, 3),
-        "avg_mfe_pct": round(avg_mfe, 3),
-        "avg_mae_pct": round(avg_mae, 3),
-        "top5": top,
-        "bottom5": bottom,
-    })
+        return jsonify({
+            "ok": True,
+            "days": days,
+            "signals_reviewed": n,
+            "wins": wins,
+            "losses": losses,
+            "flat": flat,
+            "winrate_pct": round(winrate, 2),
+            "avg_return_pct": round(avg_ret, 3),
+            "avg_mfe_pct": round(avg_mfe, 3),
+            "avg_mae_pct": round(avg_mae, 3),
+            "top5": top,
+            "bottom5": bottom,
+        })
+    except Exception as e:
+        # Never crash the service on an empty DB / schema mismatch / missing env vars.
+        return jsonify({
+            "ok": False,
+            "error": "stats_failed",
+            "message": str(e),
+            "hint": "Check DATABASE_URL/DB_PATH and that init_db() ran. If this is a fresh deploy, run /scan first then /api/review later."
+        }), 500
+
 @app.get("/scan")
 def scan():
     """
