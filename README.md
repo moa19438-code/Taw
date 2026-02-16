@@ -56,6 +56,10 @@ Risk & execution:
 - `/scan?key=RUN_KEY` run scan (and optional trade)
 - `/orders?key=RUN_KEY` last stored orders
 - `/status?key=RUN_KEY` quick status snapshot
+- `/stats?key=RUN_KEY&days=14` monitoring stats (winrate/avg ret)
+- `/api/review?key=RUN_KEY&days=2` snapshot review for recent signals
+- `/api/weekly_report?key=RUN_KEY&days=7` weekly report (based on stored reviews)
+
 
 ## Telegram commands
 - `/analyze` run scan now
