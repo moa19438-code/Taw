@@ -3,14 +3,14 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
-from config import (
+from core.config import (
     UNIVERSE_MAX, MIN_PRICE, MAX_PRICE, MIN_AVG_DOLLAR_VOL,
     LOOKBACK_DAYS, TOP_N, SYMBOL_BATCH
 )
-from alpaca_client import list_assets, bars
-from indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
-from candlestick_patterns import classify_last_patterns
-from storage import get_all_settings, parse_int, parse_float, get_watchlist
+from core.alpaca_client import list_assets, bars
+from core.indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
+from core.candlestick_patterns import classify_last_patterns
+from core.storage import get_all_settings, parse_int, parse_float, get_watchlist
 
 @dataclass
 class Candidate:

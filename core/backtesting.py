@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from alpaca_client import bars
-from indicators import ema, rsi, atr, macd
+from core.alpaca_client import bars
+from core.indicators import ema, rsi, atr, macd
 
 @dataclass
 class Trade:

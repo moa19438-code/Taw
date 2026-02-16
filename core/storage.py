@@ -473,7 +473,7 @@ def last_scans(limit: int = 50) -> List[Dict[str, Any]]:
 def _env_defaults() -> Dict[str, str]:
     """Defaults written once (if missing) at startup."""
     try:
-        import config
+        import core.config
         return {
             "TOP_N": str(config.TOP_N),
             "AUTO_TRADE": str(int(config.AUTO_TRADE)),

@@ -9,8 +9,8 @@ import re
 
 from typing import Any, Dict, List, Tuple, Optional
 
-from scanner import get_symbol_features
-from ai_analyzer import gemini_predict_direction
+from core.scanner import get_symbol_features
+from core.ai_analyzer import gemini_predict_direction
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:

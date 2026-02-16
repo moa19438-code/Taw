@@ -3,7 +3,7 @@ import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
-from config import (
+from core.config import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET,
     ALPACA_BASE_URL,
