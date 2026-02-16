@@ -1,5 +1,5 @@
 import math
-from indicators import sma, ema, rsi, bollinger_bands, macd, stochastic, adx, vwap, obv
+from core.indicators import sma, ema, rsi, bollinger_bands, macd, stochastic, adx, vwap, obv
 
 
 def test_sma_basic():
