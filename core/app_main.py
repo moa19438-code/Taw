@@ -223,15 +223,14 @@ def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
         [("🎛 عدد الفرص", "show_send"), ("🕒 نافذة السوق", "show_window")],
         [("⏱️ فترة الفحص", "show_interval"), ("⚖️ المخاطرة", "show_risk")],
         [(f"🔔 التنبيهات: {notify_on}", "toggle_notify"), (f"🔕 صامت: {silent_on}", "toggle_silent")],
-        [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), ("🧭 إطار التنبؤ (AI)", "show_horizon")],
-        [(f"📨 الوجهة: {route}", "show_notify_route")],
-        [("⬅️ رجوع", "menu")],
+        [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), (f"📨 الوجهة: {route}", "show_notify_route")],
+        [("🧪 فحص ذاتي", "self_check"), ("⬅️ رجوع", "menu")],
     ])
 
 def _build_modes_kb() -> Dict[str, Any]:
     return _ikb([
         [("📅 يومي D1", "set_mode:daily"), ("⏱️ سكالبينغ M5", "set_mode:scalp")],
-        [("📈 سوينغ", "set_mode:swing"), ("⬅️ رجوع", "show_settings")],
+        [("📈 سونق/سوينغ", "set_mode:swing"), ("⬅️ رجوع", "show_settings")],
     ])
 
 def _build_entry_kb() -> Dict[str, Any]:
@@ -350,6 +349,174 @@ def _build_interval_kb(s: Dict[str, str]) -> Dict[str, Any]:
     rows.append([("⬅️ رجوع", "show_settings")])
     return _ikb(rows)
 
+
+# ================= Self-check (buttons / handlers / settings) =================
+def _extract_callbacks(markup: Optional[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    if not markup:
+        return out
+    try:
+        rows = (markup or {}).get("inline_keyboard") or []
+        for r in rows:
+            for b in (r or []):
+                d = (b or {}).get("callback_data")
+                if d:
+                    out.append(str(d))
+    except Exception:
+        pass
+    return out
+
+def _cb_matches(cb: str, allowed_exact: set[str], allowed_prefixes: List[str]) -> bool:
+    if cb in allowed_exact:
+        return True
+    for p in allowed_prefixes:
+        if cb.startswith(p):
+            return True
+    return False
+
+def _self_check(fix: bool = True) -> Dict[str, Any]:
+    """
+    Runtime self-check to reduce 'hidden' button logic bugs.
+    - Validates that every callback_data used in keyboards has a handler match (exact or prefix).
+    - Validates labels cover all option values shown to user.
+    - Validates 'Back' buttons in settings submenus return to settings.
+    Returns a report dict (errors/warnings/info).
+    """
+    s = _settings()
+    allowed_exact = {
+        # menus / pages
+        "menu", "show_settings", "show_modes", "show_entry", "show_capital", "show_position",
+        "show_sl", "show_tp", "show_send", "show_window", "show_interval", "show_risk",
+        "show_notify_route", "show_horizon",
+        # actions
+        "do_analyze", "do_top", "pick_d1", "pick_m5",
+        "ai_top_ev", "ai_top_prob", "ai_top_m5", "ai_symbol_start", "ai_cancel",
+        "review_signals", "weekly_report",
+        # toggles / misc
+        "toggle_notify", "toggle_silent", "toggle_ai_predict", "toggle_resend",
+        "set_capital_custom",
+        "self_check",
+        "noop",
+    }
+    allowed_prefixes = [
+        "ai_pick:",
+        "set_mode:", "set_entry:", "set_horizon:",
+        "set_notify_route:",
+        "set_capital:", "set_position:",
+        "set_sl:", "set_tp:", "set_send:",
+        "set_window:",
+        "set_risk_aplus:", "set_risk_a:", "set_risk_b:",
+        "set_interval:",
+    ]
+
+    markups = [
+        ("menu", _build_menu(s)),
+        ("settings", _build_settings_kb(s)),
+        ("modes", _build_modes_kb()),
+        ("entry", _build_entry_kb()),
+        ("horizon", _build_horizon_kb(s)),
+        ("notify_route", _build_notify_route_kb()),
+        ("capital", _build_capital_kb()),
+        ("position", _build_position_kb()),
+        ("sl", _build_sl_kb()),
+        ("tp", _build_tp_kb()),
+        ("send", _build_send_kb()),
+        ("window", _build_window_kb()),
+        ("risk", _build_risk_kb(s)),
+        ("interval", _build_interval_kb(s)),
+    ]
+
+    callbacks: List[Tuple[str, str]] = []
+    for name, mk in markups:
+        for cb in _extract_callbacks(mk):
+            callbacks.append((name, cb))
+
+    missing: List[Dict[str, str]] = []
+    for where, cb in callbacks:
+        if not _cb_matches(cb, allowed_exact, allowed_prefixes):
+            missing.append({"where": where, "callback": cb})
+
+    # Label coverage checks
+    label_issues: List[str] = []
+    for v in ["daily", "scalp", "swing"]:
+        lab = _mode_label(v)
+        if not lab or lab == "يومي":
+            label_issues.append(f"mode label missing for '{v}' -> '{lab}'")
+    for v in ["auto", "limit", "breakout"]:
+        lab = _entry_type_label(v)
+        if not lab or lab == "تلقائي":
+            # auto is valid 'تلقائي'
+            if v != "auto":
+                label_issues.append(f"entry label missing for '{v}' -> '{lab}'")
+
+    # Back button checks for settings submenus
+    back_issues: List[str] = []
+    for name, mk in [("modes", _build_modes_kb()), ("entry", _build_entry_kb())]:
+        for cb in _extract_callbacks(mk):
+            # detect any back buttons by callback target
+            pass
+        try:
+            rows = (mk or {}).get("inline_keyboard") or []
+            for r in rows:
+                for b in (r or []):
+                    if (b or {}).get("text","").strip().startswith("⬅️"):
+                        if (b or {}).get("callback_data") != "show_settings":
+                            back_issues.append(f"Back button in {name} should go to show_settings")
+        except Exception:
+            pass
+
+    ok = (len(missing)==0 and len(label_issues)==0 and len(back_issues)==0)
+
+    return {
+        "ok": ok,
+        "counts": {
+            "callbacks_total": len(callbacks),
+            "missing_handlers": len(missing),
+            "label_issues": len(label_issues),
+            "back_issues": len(back_issues),
+        },
+        "missing_handlers": missing[:50],
+        "label_issues": label_issues,
+        "back_issues": back_issues,
+        "notes": [
+            "هذا الفحص يتحقق من أزرار التليجرام فقط (callback_data) وتغطيتها في الهاندلرز.",
+            "إذا ظهرت 'لا توجد فرص' فهذا غالباً بسبب فلترة/منع تكرار وليس خطأ أزرار.",
+        ],
+    }
+
+def _self_check_text(rep: Dict[str, Any]) -> str:
+    c = rep.get("counts") or {}
+    lines = []
+    lines.append("🧪 تقرير الفحص الذاتي للأزرار")
+    lines.append(f"✅ الحالة: {'سليم' if rep.get('ok') else 'يوجد مشاكل'}")
+    lines.append(f"• إجمالي الأزرار: {c.get('callbacks_total', 0)}")
+    lines.append(f"• أزرار بدون معالج: {c.get('missing_handlers', 0)}")
+    lines.append(f"• مشاكل تسميات: {c.get('label_issues', 0)}")
+    lines.append(f"• مشاكل رجوع: {c.get('back_issues', 0)}")
+    if rep.get("missing_handlers"):
+        lines.append("\n🔻 أزرار بدون handler (أول 10):")
+        for it in (rep.get("missing_handlers") or [])[:10]:
+            lines.append(f"- [{it.get('where')}] {it.get('callback')}")
+    if rep.get("label_issues"):
+        lines.append("\n🔻 مشاكل التسميات:")
+        for it in rep.get("label_issues")[:10]:
+            lines.append(f"- {it}")
+    if rep.get("back_issues"):
+        lines.append("\n🔻 مشاكل أزرار الرجوع:")
+        for it in rep.get("back_issues")[:10]:
+            lines.append(f"- {it}")
+    return "\n".join(lines)
+
+@app.get("/selfcheck")
+def http_selfcheck():
+    try:
+        key = (request.args.get("key") or "").strip()
+        if RUN_KEY and key != RUN_KEY:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        rep = _self_check(fix=False)
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def _fetch_news_headlines(symbol: str, limit: int = 5) -> list[dict]:
     """Fetch latest trading-relevant headlines (best-effort, no key required).
@@ -961,7 +1128,7 @@ def _mode_label(mode: str) -> str:
         "monthly": "شهري",
         "daily_weekly": "يومي + أسبوعي",
         "weekly_monthly": "أسبوعي + شهري",
-    }.get(m, m)
+    }.get(m, m or "يومي D1")
 def _entry_type_label(entry_mode: str) -> str:
     em = (entry_mode or "auto").lower()
     return {
@@ -969,7 +1136,7 @@ def _entry_type_label(entry_mode: str) -> str:
         "market": "سوق",
         "limit": "Limit",
         "breakout": "كسر/تأكيد",
-    }.get(em, em)
+    }.get(em, em or "تلقائي")
 def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any]:
     """
     خطة يدوية لتطبيق Sahm (ATR):
@@ -1429,6 +1596,31 @@ def telegram_webhook():
             user_id = cb.get("from", {}).get("id")
             chat_id = cb.get("message", {}).get("chat", {}).get("id")
             action = (cb.get("data") or "").strip()
+            callback_id = cb.get("id")
+
+            # Dedupe / Debounce BEFORE ack text so user gets immediate feedback
+            if callback_id and _seen_and_mark(_CB_SEEN, str(callback_id), float(_CB_TTL_SEC)):
+                _tg_answer_callback(callback_id, text="⏳ تم تنفيذ هذا الزر للتو", show_alert=False)
+                return jsonify({"ok": True})
+
+            if chat_id is not None and action:
+                if _seen_and_mark(_ACTION_SEEN, f"{chat_id}:{action}", float(_ACTION_DEBOUNCE_SEC)):
+                    _tg_answer_callback(callback_id, text="⏳ انتظر لحظة...", show_alert=False)
+                    return jsonify({"ok": True})
+
+            # IMPORTANT: acknowledge callback fast to avoid spinner/retries
+            _tg_answer_callback(callback_id)
+            if not _is_admin(user_id):
+                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                return jsonify({"ok": True})
+            settings = _settings()
+            if action == "self_check":
+                try:
+                    rep = _self_check(fix=False)
+                    _tg_send(str(chat_id), _self_check_text(rep), reply_markup=_build_menu(_settings()))
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ في الفحص الذاتي:\n{e}", reply_markup=_build_menu(_settings()))
+                return jsonify({"ok": True})
 
             # ================= التقرير الأسبوعي =================
             if action == "weekly_report":
@@ -1442,20 +1634,8 @@ def telegram_webhook():
                         _tg_send(str(chat_id), f"❌ خطأ أثناء إنشاء التقرير الأسبوعي:\n{e}", reply_markup=_build_menu(_settings()))
                 _run_async(_job)
                 return jsonify({"ok": True})
-            callback_id = cb.get("id")
-            # IMPORTANT: acknowledge callback fast to avoid spinner/retries
-            _tg_answer_callback(callback_id)
-            # Dedupe: Telegram may deliver the same callback update more than once
-            if callback_id and _seen_and_mark(_CB_SEEN, str(callback_id), float(_CB_TTL_SEC)):
-                return jsonify({"ok": True})
-            # Debounce: prevent accidental double-click from triggering twice
-            if chat_id is not None and action:
-                if _seen_and_mark(_ACTION_SEEN, f"{chat_id}:{action}", float(_ACTION_DEBOUNCE_SEC)):
-                    return jsonify({"ok": True})
-            if not _is_admin(user_id):
-                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
-                return jsonify({"ok": True})
-            settings = _settings()
+
+
             if action == "menu":
                 _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
@@ -1590,7 +1770,7 @@ def telegram_webhook():
                 mode = action.split(":", 1)[1]
                 set_setting("PLAN_MODE", mode)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_settings_kb(settings))
+                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "show_entry":
                 _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
@@ -1599,7 +1779,7 @@ def telegram_webhook():
                 entry = action.split(":", 1)[1]
                 set_setting("ENTRY_MODE", entry)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_settings_kb(settings))
+                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "toggle_notify":
                 cur = _get_bool(settings, "AUTO_NOTIFY", True)
@@ -1635,13 +1815,13 @@ def telegram_webhook():
                     route = "dm"
                 set_setting("NOTIFY_ROUTE", route)
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_settings_kb(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "toggle_silent":
                 cur = _get_bool(settings, "NOTIFY_SILENT", True)
                 set_setting("NOTIFY_SILENT", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_settings_kb(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
