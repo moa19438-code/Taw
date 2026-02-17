@@ -223,20 +223,21 @@ def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
         [("🎛 عدد الفرص", "show_send"), ("🕒 نافذة السوق", "show_window")],
         [("⏱️ فترة الفحص", "show_interval"), ("⚖️ المخاطرة", "show_risk")],
         [(f"🔔 التنبيهات: {notify_on}", "toggle_notify"), (f"🔕 صامت: {silent_on}", "toggle_silent")],
-        [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), (f"📨 الوجهة: {route}", "show_notify_route")],
+        [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), ("🧭 إطار التنبؤ (AI)", "show_horizon")],
+        [(f"📨 الوجهة: {route}", "show_notify_route")],
         [("⬅️ رجوع", "menu")],
     ])
 
 def _build_modes_kb() -> Dict[str, Any]:
     return _ikb([
         [("📅 يومي D1", "set_mode:daily"), ("⏱️ سكالبينغ M5", "set_mode:scalp")],
-        [("📈 سونق/سوينغ", "set_mode:swing"), ("⬅️ رجوع", "menu")],
+        [("📈 سوينغ", "set_mode:swing"), ("⬅️ رجوع", "show_settings")],
     ])
 
 def _build_entry_kb() -> Dict[str, Any]:
     return _ikb([
         [("🧠 تلقائي", "set_entry:auto"), ("✅ كسر/تأكيد", "set_entry:breakout")],
-        [("🎯 حد/Limit", "set_entry:limit"), ("⬅️ رجوع", "menu")],
+        [("🎯 حد/Limit", "set_entry:limit"), ("⬅️ رجوع", "show_settings")],
     ])
 
 def _build_horizon_kb(s: Dict[str, str]) -> Dict[str, Any]:
@@ -251,7 +252,7 @@ def _build_horizon_kb(s: Dict[str, str]) -> Dict[str, Any]:
 def _build_notify_route_kb() -> Dict[str, Any]:
     return _ikb([
         [("📩 خاص (DM)", "set_notify_route:dm"), ("👥 مجموعة", "set_notify_route:group")],
-        [("🔁 الاثنين", "set_notify_route:both"), ("⬅️ رجوع", "show_settings")],
+        [("🔁 الاثنين معاً", "set_notify_route:both"), ("⬅️ رجوع", "show_settings")],
     ])
 
 def _build_capital_kb() -> Dict[str, Any]:
@@ -953,15 +954,22 @@ def _mode_matches(c: Candidate, mode: str) -> bool:
 def _mode_label(mode: str) -> str:
     m = (mode or "daily").lower()
     return {
-        "daily": "يومي",
+        "daily": "يومي D1",
+        "scalp": "سكالبينغ M5",
+        "swing": "سوينغ",
         "weekly": "أسبوعي",
         "monthly": "شهري",
         "daily_weekly": "يومي + أسبوعي",
         "weekly_monthly": "أسبوعي + شهري",
-    }.get(m, "يومي")
+    }.get(m, m)
 def _entry_type_label(entry_mode: str) -> str:
     em = (entry_mode or "auto").lower()
-    return {"auto": "تلقائي", "market": "سوق", "limit": "محدد"}.get(em, "تلقائي")
+    return {
+        "auto": "تلقائي",
+        "market": "سوق",
+        "limit": "Limit",
+        "breakout": "كسر/تأكيد",
+    }.get(em, em)
 def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any]:
     """
     خطة يدوية لتطبيق Sahm (ATR):
@@ -1582,7 +1590,7 @@ def telegram_webhook():
                 mode = action.split(":", 1)[1]
                 set_setting("PLAN_MODE", mode)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), f"✅ تم ضبط الخطة: {_mode_label(mode)}", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "show_entry":
                 _tg_send(str(chat_id), "🎯 اختر نوع الدخول:", reply_markup=_build_entry_kb())
@@ -1591,7 +1599,7 @@ def telegram_webhook():
                 entry = action.split(":", 1)[1]
                 set_setting("ENTRY_MODE", entry)
                 settings = _settings()
-                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), f"✅ نوع الدخول: {_entry_type_label(entry)}", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "toggle_notify":
                 cur = _get_bool(settings, "AUTO_NOTIFY", True)
@@ -1627,13 +1635,13 @@ def telegram_webhook():
                     route = "dm"
                 set_setting("NOTIFY_ROUTE", route)
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث الوجهة.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "toggle_silent":
                 cur = _get_bool(settings, "NOTIFY_SILENT", True)
                 set_setting("NOTIFY_SILENT", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
+                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
