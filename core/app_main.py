@@ -58,6 +58,9 @@ from core.storage import (
     log_signal_review,
     last_signal_reviews,
     latest_signal_reviews_since,
+    add_paper_trade,
+    due_paper_trades,
+    mark_paper_trade_notified,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -109,6 +112,8 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
 # --- Telegram callback responsiveness / anti-duplicate ---
 _CB_SEEN: Dict[str, float] = {}  # callback_query.id -> ts
 _ACTION_SEEN: Dict[str, float] = {}  # f"{chat_id}:{action}" -> ts
+_PICK_IN_PROGRESS: Dict[str, float] = {}  # f"{chat}:{tf}" -> start_ts
+_LAST_PAPER_REVIEW_RUN = 0.0
 _CB_TTL_SEC = int(os.getenv('TG_CB_TTL_SEC', '600'))  # 10 minutes default
 _ACTION_DEBOUNCE_SEC = float(os.getenv('TG_ACTION_DEBOUNCE_SEC', '2.5'))
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
@@ -208,6 +213,14 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
         [("🧠 3- سكالبينغ M5", "ai_top_m5"), ("🔎 AI سهم معين", "ai_symbol_start")],
         [("📈 مراجعة إشاراتي", "review_signals"), ("📅 تقرير أسبوعي", "weekly_report")],
         [("🔁 تحديث القائمة", "menu")],
+    ])
+
+
+def _build_pick_kb() -> Dict[str, Any]:
+    """Actions for a single pick (manual simulation)."""
+    return _ikb([
+        [("📝 سجّل كأني دخلت", "paper_log")],
+        [("⬅️ رجوع", "menu")],
     ])
 
 
@@ -874,8 +887,40 @@ def _format_pick_m5(item: Dict[str, Any]) -> str:
     lines.append("⚠️ تنبيه: هذا اقتراح سريع للتطبيق اليدوي فقط. راقب السبريد/السيولة قبل الدخول.")
     return "\n".join(lines)
 def _format_pick_d1(c: Candidate, settings: Dict[str, str]) -> str:
-    plan = _compute_trade_plan(settings, c)
+    # D1 "Best now" should be live when market is open:
+    # use latest trade price as entry reference (manual execution),
+    # while keeping daily ATR/score/timeframe filters from the daily scan.
+    live_p, live_ts = _get_live_trade_price(c.symbol)
+    entry_override = live_p if (live_p is not None and _is_us_market_open()) else None
+    plan = _compute_trade_plan(settings, c, entry_override=entry_override)
+    if live_p is not None:
+        plan["live_price"] = round(float(live_p), 4)
+        plan["live_ts"] = live_ts
+        plan["ref_close"] = round(float(getattr(c, "last_close", 0.0) or 0.0), 4)
+        plan["price_source"] = "LIVE" if entry_override is not None else "LAST_CLOSE"
     return _format_sahm_block("D1", c, plan)
+
+
+def _get_live_trade_price(symbol: str) -> tuple[float | None, str | None]:
+    """Return (price, iso_ts) from Alpaca latest trade (IEX feed).
+
+    Notes:
+      - On free plans, quotes/trades may be delayed for some symbols.
+      - We still show it to the user as the *reference* price for manual execution.
+    """
+    try:
+        from core.alpaca_client import latest_trade
+        data = latest_trade(symbol)
+        trade = (data or {}).get("trade") if isinstance(data, dict) else None
+        if not isinstance(trade, dict):
+            return None, None
+        p = trade.get("p")
+        ts = trade.get("t")
+        if p is None:
+            return None, None
+        return float(p), (str(ts) if ts is not None else None)
+    except Exception:
+        return None, None
 def _update_cache_d1() -> None:
     s = _settings()
     picks, _ = scan_universe_with_meta()
@@ -1137,7 +1182,7 @@ def _entry_type_label(entry_mode: str) -> str:
         "limit": "Limit",
         "breakout": "كسر/تأكيد",
     }.get(em, em or "تلقائي")
-def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any]:
+def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: float | None = None) -> Dict[str, Any]:
     """
     خطة يدوية لتطبيق Sahm (ATR):
     - الدخول: سعر الإغلاق الأخير
@@ -1149,7 +1194,9 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate) -> Dict[str, Any
     if side not in ("buy", "sell"):
         side = "buy"
 
-    entry = float(c.last_close)
+    # Default entry reference is the last daily close.
+    # For "Best now" use-cases we may override this with a live trade price.
+    entry = float(entry_override) if entry_override is not None else float(c.last_close)
 
     # إعدادات ATR
     sl_atr_mult = _get_float(settings, "SL_ATR_MULT", 2.0)
@@ -1364,6 +1411,18 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
     side_lbl = "LONG 🟢" if side == "buy" else "SHORT 🔴"
     op_lbl = "شراء" if side == "buy" else "بيع/شورت"
 
+    # Live price context (for manual execution)
+    live_line = ""
+    if plan.get("live_price") is not None:
+        src = str(plan.get("price_source") or "")
+        lp = plan.get("live_price")
+        ts = plan.get("live_ts")
+        rc = plan.get("ref_close")
+        if src == "LIVE":
+            live_line = f"سعر مباشر: {lp} ({ts}) | إغلاق D1: {rc}\n"
+        else:
+            live_line = f"سعر مباشر (مرجعي): {lp} ({ts}) | الدخول محسوب على إغلاق D1: {rc}\n"
+
     return (
         f"🚀 سهم: {c.symbol} | {side_lbl} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}"
         + (f" | AI: {ai_score}/100" if ai_score is not None else "")
@@ -1373,6 +1432,7 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         f"العملية: {op_lbl}\n"
         f"النوع: {entry_type}\n"
         f"السعر: {plan['entry']}\n"
+        f"{live_line}"
         f"الكمية: {plan['qty']}\n"
         f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"
         f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
@@ -1584,6 +1644,77 @@ def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
     msg = header + "\n\n".join(blocks)
     return msg, universe_size
 # ================= Telegram webhook =================
+
+
+def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
+    """Check for due 24h paper trades and send results to their chats (throttled)."""
+    global _LAST_PAPER_REVIEW_RUN
+    now = time.time()
+    if (now - float(_LAST_PAPER_REVIEW_RUN or 0.0)) < float(ttl_sec):
+        return
+    _LAST_PAPER_REVIEW_RUN = now
+
+    try:
+        rows = due_paper_trades(limit=200)
+    except Exception:
+        return
+    if not rows:
+        return
+
+    for r in rows:
+        paper_id = 0
+        try:
+            paper_id = int(r.get("id") or 0)
+            chat = str(r.get("chat_id") or "")
+            symbol = (r.get("symbol") or "").upper().strip()
+            mode = (r.get("mode") or "").upper().strip()
+            side = (r.get("side") or "buy").lower().strip()
+            entry = float(r.get("entry") or 0.0)
+            if not chat or not symbol or entry <= 0:
+                continue
+
+            # Use live price now if possible; fallback to last close for last 1D bar
+            live_p, live_ts = _get_live_trade_price(symbol)
+            exit_price = float(live_p) if live_p is not None else None
+            price_src = "LIVE" if exit_price is not None else "LAST_CLOSE"
+
+            if exit_price is None:
+                try:
+                    dt = datetime.now(timezone.utc)
+                    data = bars([symbol], start=dt - timedelta(days=3), end=dt, timeframe="1Day", limit=5)
+                    bl = (data.get("bars", {}).get(symbol) or [])
+                    if bl:
+                        exit_price = float(bl[-1].get("c") or entry)
+                except Exception:
+                    exit_price = entry
+
+            if exit_price is None:
+                exit_price = entry
+
+            if side == "sell":
+                ret_pct = (entry - exit_price) / entry * 100.0
+            else:
+                ret_pct = (exit_price - entry) / entry * 100.0
+
+            res = "✅ ربح" if ret_pct > 0 else ("❌ خسارة" if ret_pct < 0 else "➖ تعادل")
+            ts_line = f"وقت المراجعة: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            src_line = f"مصدر سعر الخروج: {price_src}" + (f" ({live_ts})" if live_ts and price_src == "LIVE" else "")
+            msg = (
+                f"📊 مراجعة بعد 24 ساعة — {symbol} ({mode})\n\n"
+                f"الدخول (افتراضي): {entry:.4g}$\n"
+                f"سعر الآن: {float(exit_price):.4g}$\n"
+                f"النتيجة: {res} ({ret_pct:+.2f}%)\n\n"
+                f"{src_line}\n{ts_line}"
+            )
+            _tg_send(chat, msg, silent=True)
+        except Exception:
+            pass
+        finally:
+            try:
+                if paper_id:
+                    mark_paper_trade_notified(paper_id)
+            except Exception:
+                pass
 @app.post("/webhook")
 def telegram_webhook():
     try:
@@ -1614,6 +1745,7 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
                 return jsonify({"ok": True})
             settings = _settings()
+            _run_due_paper_reviews()
             if action == "self_check":
                 try:
                     rep = _self_check(fix=False)
@@ -1621,6 +1753,56 @@ def telegram_webhook():
                 except Exception as e:
                     _tg_send(str(chat_id), f"❌ خطأ في الفحص الذاتي:\n{e}", reply_markup=_build_menu(_settings()))
                 return jsonify({"ok": True})
+
+            if action == "paper_log":
+                try:
+                    from core.storage import get_user_state, set_user_state
+                    raw = get_user_state(str(chat_id), "last_pick") or ""
+                    if not raw:
+                        _tg_send(str(chat_id), "⚠️ لا يوجد آخر سهم محفوظ. اضغط D1 أو M5 أولاً.")
+                        return jsonify({"ok": True})
+                    info = json.loads(raw)
+                    symbol = (info.get("symbol") or "").upper().strip()
+                    mode = (info.get("mode") or "").lower().strip() or "d1"
+                    side = (info.get("side") or "buy").lower().strip()
+                    entry = float(info.get("entry") or 0.0)
+                    sl = info.get("sl")
+                    tp = info.get("tp")
+                    score = float(info.get("score") or 0.0)
+                    strength = (info.get("strength") or "B")
+                    if not symbol or entry <= 0:
+                        _tg_send(str(chat_id), "⚠️ بيانات الإشارة غير مكتملة.")
+                        return jsonify({"ok": True})
+
+                    ts = datetime.now(timezone.utc).isoformat()
+                    sig_id = log_signal(
+                        ts=ts,
+                        symbol=symbol,
+                        source="paper_log",
+                        side=side,
+                        mode=mode,
+                        strength=strength,
+                        score=score,
+                        entry=entry,
+                        sl=float(sl) if sl is not None else None,
+                        tp=float(tp) if tp is not None else None,
+                        features_json="",
+                        reasons_json="",
+                        horizon_days=1,
+                        model_prob=None,
+                    )
+                    if sig_id is None:
+                        _tg_send(str(chat_id), f"📝 تم تسجيل صفقة وهمية لـ {symbol}. سأراجعها بعد 24 ساعة.")
+                        return jsonify({"ok": True})
+
+                    due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+                    add_paper_trade(str(chat_id), int(sig_id), due)
+                    set_user_state(str(chat_id), "last_pick_logged", ts)
+                    _tg_send(str(chat_id), f"📝 تم تسجيل صفقة وهمية لـ {symbol} بسعر {entry:.4g}$\nسأراجعها بعد 24 ساعة تلقائياً ✅", silent=True)
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ خطأ أثناء تسجيل الصفقة الوهمية:\n{e}")
+                return jsonify({"ok": True})
+
 
             # ================= التقرير الأسبوعي =================
             if action == "weekly_report":
@@ -1968,11 +2150,28 @@ def telegram_webhook():
                 pick = _get_next_pick(tf, chat)
                 if pick:
                     if tf == "m5":
-                        _tg_send(chat, _format_pick_m5(pick), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        try:
+                            from core.storage import set_user_state
+                            entry_p = float(pick.get("last") or 0.0)
+                            info = {"symbol": str(pick.get("symbol") or "").upper(), "mode": "m5", "side": "buy", "entry": entry_p, "score": float(pick.get("score") or 0.0), "strength": "B"}
+                            set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
+                        except Exception:
+                            pass
+                        _tg_send(chat, _format_pick_m5(pick), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
                     else:
                         c = pick.get("candidate")
                         if isinstance(c, Candidate):
-                            _tg_send(chat, _format_pick_d1(c, _settings()), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                            try:
+                                from core.storage import set_user_state
+                                s0 = _settings()
+                                live_p0, _ = _get_live_trade_price(c.symbol)
+                                entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
+                                plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
+                                info = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                                set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
+                            except Exception:
+                                pass
+                            _tg_send(chat, _format_pick_d1(c, _settings()), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
                         else:
                             _tg_send(chat, "⚠️ لا توجد نتيجة D1 جاهزة الآن، جاري التحديث...")
                     return jsonify({"ok": True})
@@ -2003,11 +2202,28 @@ def telegram_webhook():
                             return
 
                         if tf == "m5":
-                            _tg_send(chat, _format_pick_m5(pick2), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                            try:
+                                from core.storage import set_user_state
+                                entry_p = float(pick2.get("last") or 0.0)
+                                info = {"symbol": str(pick2.get("symbol") or "").upper(), "mode": "m5", "side": "buy", "entry": entry_p, "score": float(pick2.get("score") or 0.0), "strength": "B"}
+                                set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
+                            except Exception:
+                                pass
+                            _tg_send(chat, _format_pick_m5(pick2), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
                         else:
                             c2 = pick2.get("candidate")
                             if isinstance(c2, Candidate):
-                                _tg_send(chat, _format_pick_d1(c2, _settings()), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                                try:
+                                    from core.storage import set_user_state
+                                    s0 = _settings()
+                                    live_p0, _ = _get_live_trade_price(c2.symbol)
+                                    entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
+                                    plan0 = _compute_trade_plan(s0, c2, entry_override=entry_override0)
+                                    info = {"symbol": c2.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c2, "score", 0.0) or 0.0), "strength": str(getattr(c2,"grade","B") or "B")}
+                                    set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
+                                except Exception:
+                                    pass
+                                _tg_send(chat, _format_pick_d1(c2, _settings()), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
                             else:
                                 _tg_send(chat, "⚠️ تم تحديث D1 لكن النتيجة غير صالحة.", silent=True)
                     except Exception as e:
@@ -2343,6 +2559,7 @@ def scan():
     if request.args.get("key") != RUN_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     settings = _settings()
+    _run_due_paper_reviews()
     # Log scan (always)
     picks, universe_size = scan_universe_with_meta()
     top_syms = ",".join([c.symbol for c in picks[:20]])

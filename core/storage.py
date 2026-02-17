@@ -123,6 +123,19 @@ def init_db() -> None:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_signal_id ON signal_reviews(signal_id);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_ts ON signal_reviews(ts);")
 
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS paper_trades (
+                        id BIGSERIAL PRIMARY KEY,
+                        chat_id TEXT NOT NULL,
+                        signal_id BIGINT NOT NULL,
+                        due_ts TEXT NOT NULL,
+                        notified INTEGER DEFAULT 0
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_due ON paper_trades(due_ts);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_chat ON paper_trades(chat_id);")
+
+
             # ensure backwards-compatible schema additions
             try:
                 ensure_signal_schema()
@@ -212,6 +225,34 @@ def init_db() -> None:
             )"""
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_signal_id ON signal_outcomes(signal_id)")
+
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS signal_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                signal_id INTEGER NOT NULL,
+                close REAL,
+                return_pct REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                note TEXT
+            )"""
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_signal_id ON signal_reviews(signal_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_signal_reviews_ts ON signal_reviews(ts)")
+
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                signal_id INTEGER NOT NULL,
+                due_ts TEXT NOT NULL,
+                notified INTEGER DEFAULT 0
+            )"""
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_due ON paper_trades(due_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_chat ON paper_trades(chat_id)")
+
         con.commit()
 
 
@@ -302,29 +343,43 @@ def log_signal(
     reasons_json: str = "",
     horizon_days: int = 5,
     model_prob: float | None = None,
-) -> None:
-    """Persist a signal so we can evaluate and learn later."""
+) -> int | None:
+    """Persist a signal so we can evaluate and learn later.
+    Returns inserted signal id when possible.
+    """
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
                     """INSERT INTO signals
                     (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, evaluated, model_prob)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s)""",
-                    (ts, symbol, mode, strength, float(score), float(entry), float(sl) if sl is not None else None,
-                     float(tp) if tp is not None else None, source, side, features_json, reasons_json, int(horizon_days), float(model_prob) if model_prob is not None else None),
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s)
+                    RETURNING id""",
+                    (ts, symbol, mode, strength, float(score), float(entry),
+                     float(sl) if sl is not None else None,
+                     float(tp) if tp is not None else None,
+                     source, side, features_json, reasons_json, int(horizon_days),
+                     float(model_prob) if model_prob is not None else None),
                 )
+                row = cur.fetchone()
             con.commit()
-        return
+        try:
+            return int(row[0]) if row else None
+        except Exception:
+            return None
 
     with sqlite3.connect(DB_PATH) as con:
-        con.execute(
+        cur = con.execute(
             """INSERT INTO signals
             (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, evaluated, model_prob)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
             (ts, symbol, mode, strength, score, entry, sl, tp, source, side, features_json, reasons_json, horizon_days, model_prob),
         )
         con.commit()
+        try:
+            return int(cur.lastrowid)
+        except Exception:
+            return None
 
 
 def pending_signals_for_eval(limit: int = 200) -> List[Dict[str, Any]]:
@@ -947,3 +1002,68 @@ def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+
+
+# --- Paper trades (manual simulation tracking) ---
+def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
+    """Link a saved signal to a chat_id for 24h later review."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (%s,%s,%s,0)",
+                    (str(chat_id), int(signal_id), due_ts),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (?,?,?,0)",
+            (str(chat_id), int(signal_id), due_ts),
+        )
+        con.commit()
+
+
+def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
+    """Paper trades that are due for review and not yet notified."""
+    now_ts = datetime.utcnow().isoformat()
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+                       FROM paper_trades p
+                       JOIN signals s ON s.id = p.signal_id
+                       WHERE COALESCE(p.notified,0)=0 AND p.due_ts <= %s
+                       ORDER BY p.due_ts ASC
+                       LIMIT %s""",
+                    (now_ts, int(limit)),
+                )
+                return cur.fetchall()
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+               FROM paper_trades p
+               JOIN signals s ON s.id = p.signal_id
+               WHERE COALESCE(p.notified,0)=0 AND p.due_ts <= ?
+               ORDER BY p.due_ts ASC
+               LIMIT ?""",
+            (now_ts, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_paper_trade_notified(paper_id: int) -> None:
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("UPDATE paper_trades SET notified=1 WHERE id=%s", (int(paper_id),))
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE paper_trades SET notified=1 WHERE id=?", (int(paper_id),))
+        con.commit()
