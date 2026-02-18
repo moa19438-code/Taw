@@ -1,0 +1,97 @@
+{% extends "admin/base.html" %}
+{% set title = "الرئيسية" %}
+{% block content %}
+  <div class="row g-3">
+    <div class="col-12 col-md-4">
+      <div class="card border-info">
+        <div class="card-body">
+          <div class="h5">شاراتي (Paper)</div>
+          <div class="display-6">{{ paper_count }}</div>
+          <div class="small-muted">آخر {{ lookback_days }} أيام</div>
+          <a class="btn btn-outline-info mt-3" href="{{ url_for('admin.paper') }}">فتح</a>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-md-4">
+      <div class="card border-success">
+        <div class="card-body">
+          <div class="h5">Signals للتعلّم</div>
+          <div class="display-6">{{ signals_count }}</div>
+          <div class="small-muted">آخر {{ lookback_days }} أيام (من آخر 200)</div>
+          <a class="btn btn-outline-success mt-3" href="{{ url_for('admin.signals') }}">فتح</a>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-md-4">
+      <div class="card border-warning">
+        <div class="card-body">
+          <div class="h5">صيانة</div>
+          <div class="small-muted mb-2">تنظيف تلقائي موجود، وهذا زر تنظيف يدوي إذا احتجت</div>
+          <form method="post" action="{{ url_for('admin.cleanup') }}" class="d-flex gap-2">
+            <input class="form-control" name="days" type="number" min="1" max="365" value="{{ lookback_days }}">
+            <button class="btn btn-warning" type="submit">تنظيف</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mt-2">
+    <div class="col-12 col-lg-5">
+      <div class="card">
+        <div class="card-header">أكثر الأسهم ظهورًا (Signals)</div>
+        <div class="card-body">
+          {% if top_symbols %}
+            <ul class="list-group list-group-flush">
+              {% for sym, c in top_symbols %}
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                  <span class="mono">{{ sym }}</span>
+                  <span class="badge bg-secondary rounded-pill">{{ c }}</span>
+                </li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <div class="small-muted">لا توجد بيانات كافية.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-7">
+      <div class="card">
+        <div class="card-header">آخر شارات (Paper)</div>
+        <div class="card-body table-responsive">
+          <table class="table table-sm table-hover">
+            <thead>
+              <tr>
+                <th>وقت</th>
+                <th>السهم</th>
+                <th>Mode</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>SL</th>
+                <th>TP</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in recent_paper %}
+                <tr>
+                  <td class="small-muted">{{ r.signal_ts }}</td>
+                  <td class="mono">{{ r.symbol }}</td>
+                  <td>{{ r.mode }}</td>
+                  <td>{{ r.side }}</td>
+                  <td class="mono">{{ r.entry }}</td>
+                  <td class="mono">{{ r.sl }}</td>
+                  <td class="mono">{{ r.tp }}</td>
+                </tr>
+              {% endfor %}
+              {% if not recent_paper %}
+                <tr><td colspan="7" class="small-muted">ما فيه شارات حالياً.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
