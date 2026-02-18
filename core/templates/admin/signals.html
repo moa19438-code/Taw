@@ -1,0 +1,50 @@
+{% extends "admin/base.html" %}
+{% set title = "Signals" %}
+{% block content %}
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <div>
+      <h3 class="mb-0">Signals للتعلّم</h3>
+      <div class="small-muted">آخر {{ limit }} إشارة (هذه لا تُحذف بالتنظيف).</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-body table-responsive">
+      <table class="table table-hover table-sm">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>وقت</th>
+            <th>السهم</th>
+            <th>Mode</th>
+            <th>Side</th>
+            <th>Strength</th>
+            <th>Score</th>
+            <th>Entry</th>
+            <th>SL</th>
+            <th>TP</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr>
+              <td class="mono">{{ r.id }}</td>
+              <td class="small-muted">{{ r.ts }}</td>
+              <td class="mono">{{ r.symbol }}</td>
+              <td>{{ r.mode }}</td>
+              <td>{{ r.side }}</td>
+              <td class="mono">{{ r.strength }}</td>
+              <td class="mono">{{ "%.2f"|format(r.score or 0) }}</td>
+              <td class="mono">{{ r.entry }}</td>
+              <td class="mono">{{ r.sl }}</td>
+              <td class="mono">{{ r.tp }}</td>
+            </tr>
+          {% endfor %}
+          {% if not rows %}
+            <tr><td colspan="10" class="small-muted">لا توجد بيانات.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}

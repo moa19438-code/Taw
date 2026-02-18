@@ -1,0 +1,52 @@
+{% extends "admin/base.html" %}
+{% set title = "WL" %}
+{% block content %}
+  <div class="row g-3">
+    <div class="col-12 col-lg-4">
+      <div class="card">
+        <div class="card-header">إضافة سهم إلى WL</div>
+        <div class="card-body">
+          <form method="post" action="{{ url_for('admin.wl_add') }}" class="d-flex gap-2">
+            <input class="form-control mono" name="symbol" placeholder="مثال: AAPL" required>
+            <button class="btn btn-success" type="submit">إضافة</button>
+          </form>
+          <div class="small-muted mt-2">WL = Watchlist (قائمة مراقبة)</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-8">
+      <div class="card">
+        <div class="card-header">WL الحالية</div>
+        <div class="card-body table-responsive">
+          <table class="table table-hover table-sm">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Added</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in rows %}
+                <tr>
+                  <td class="mono">{{ r.symbol }}</td>
+                  <td class="small-muted">{{ r.added_ts }}</td>
+                  <td class="text-end">
+                    <form method="post" action="{{ url_for('admin.wl_delete') }}" onsubmit="return confirm('حذف السهم من WL؟');">
+                      <input type="hidden" name="symbol" value="{{ r.symbol }}">
+                      <button class="btn btn-sm btn-outline-danger" type="submit">حذف</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
+              {% if not rows %}
+                <tr><td colspan="3" class="small-muted">WL فاضية.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
