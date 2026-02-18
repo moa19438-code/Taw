@@ -1180,6 +1180,23 @@ def delete_paper_trade_for_chat(chat_id: str, paper_id: int) -> None:
         con.commit()
 
 
+
+
+def clear_paper_trades_for_chat(chat_id: str) -> int:
+    """Delete ALL saved paper trades for a given chat (keeps signals for learning). Returns deleted count."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("DELETE FROM paper_trades WHERE chat_id=%s", (str(chat_id),))
+                deleted = cur.rowcount or 0
+            con.commit()
+        return int(deleted)
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("DELETE FROM paper_trades WHERE chat_id=?", (str(chat_id),))
+        deleted = cur.rowcount or 0
+        con.commit()
+    return int(deleted)
+
 def cleanup_old_paper_trades(retention_days: int = 7) -> int:
     """Auto-clean paper_trades older than retention_days (signals stay for learning). Returns deleted count."""
     cutoff = (datetime.utcnow() - timedelta(days=int(retention_days))).isoformat()

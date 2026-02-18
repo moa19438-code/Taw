@@ -216,7 +216,7 @@ def _build_menu(settings: Dict[str, str]) -> Dict[str, Any]:
         [("🔥 أفضل فرص الآن (D1)", "pick_d1"), ("⚡ سكالبينغ (M5)", "pick_m5")],
         [("🧠 1- أفضل EV", "ai_top_ev"), ("🧠 2- أعلى احتمال", "ai_top_prob")],
         [("🧠 3- سكالبينغ M5", "ai_top_m5"), ("🔎 AI سهم معين", "ai_symbol_start")],
-        [("📈 مراجعة إشاراتي", "review_signals"), ("📅 تقرير أسبوعي", "weekly_report")],
+        [("📊 إشاراتي", "my_sig_menu"), ("📅 تقرير أسبوعي", "weekly_report")],
         [("🔁 تحديث القائمة", "menu")],
     ])
 
@@ -230,11 +230,11 @@ def _build_pick_kb() -> Dict[str, Any]:
 
 
 
-def _build_my_signals_kb(has_items: bool = True) -> Dict[str, Any]:
+def _build_my_signals_kb(has_items: bool = True, back_action: str = "menu") -> Dict[str, Any]:
     rows = []
     if has_items:
         rows.append([("🗑 حذف إشارة", "my_sig_delete")])
-    rows.append([("🔄 تحديث", "my_sig_refresh"), ("⬅️ رجوع", "menu")])
+    rows.append([("🔄 تحديث", "my_sig_refresh"), ("⬅️ رجوع", back_action)])
     return _ikb(rows)
 
 
@@ -249,6 +249,16 @@ def _build_my_signals_delete_kb(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         rows.append([(label, f"del_sig:{pid}")])
     rows.append([("⬅️ رجوع", "review_signals")])
     return _ikb(rows)
+
+
+
+def _build_my_signals_root_kb() -> Dict[str, Any]:
+    """Entry point for user's signals management."""
+    return _ikb([
+        [("📈 مراجعة الأداء", "my_sig_review"), ("📌 شاراتي المحفوظة", "my_sig_list")],
+        [("🗑 حذف الكل", "my_sig_delall")],
+        [("⬅️ رجوع", "menu")],
+    ])
 
 def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
     ai_on = "ON" if _get_bool(s, "AI_PREDICT_ENABLED", False) else "OFF"
@@ -1848,17 +1858,54 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
-            if action in ("review_signals", "my_sig_refresh"):
-                msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
-                _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=bool(items)))
+            # 📊 إشاراتي (submenu)
+            if action == "my_sig_menu":
+                _tg_send(str(chat_id), "📊 إشاراتي:", reply_markup=_build_my_signals_root_kb())
                 return jsonify({"ok": True})
 
+            # Backward compatibility
+            if action == "review_signals":
+                _tg_send(str(chat_id), "📊 إشاراتي:", reply_markup=_build_my_signals_root_kb())
+                return jsonify({"ok": True})
+
+            # 📈 مراجعة الأداء (مرتبطة بالشارات المحفوظة فقط)
+            if action == "my_sig_review":
+                msg = _review_my_saved_performance(str(chat_id), lookback_days=2, limit=80)
+                _tg_send(str(chat_id), msg, reply_markup=_ikb([[("⬅️ رجوع", "my_sig_menu")]]))
+                return jsonify({"ok": True})
+
+            # 📌 شاراتي المحفوظة
+            if action in ("my_sig_list", "my_sig_refresh"):
+                msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
+                _tg_send(
+                    str(chat_id),
+                    msg,
+                    reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"),
+                )
+                return jsonify({"ok": True})
+
+            # 🗑 حذف صفقة واحدة
             if action == "my_sig_delete":
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
                 if not items:
-                    _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=False))
+                    _tg_send(
+                        str(chat_id),
+                        msg,
+                        reply_markup=_build_my_signals_kb(has_items=False, back_action="my_sig_menu"),
+                    )
                     return jsonify({"ok": True})
                 _tg_send(str(chat_id), "اختر الإشارة التي تريد حذفها:", reply_markup=_build_my_signals_delete_kb(items))
+                return jsonify({"ok": True})
+
+            # 🧹 حذف الكل
+            if action == "my_sig_delall":
+                try:
+                    from core.storage import clear_paper_trades_for_chat
+                    clear_paper_trades_for_chat(str(chat_id))
+                    _tg_send(str(chat_id), "✅ تم حذف جميع الشارات من قائمتك.")
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ تعذر حذف الكل:\n{e}")
+                _tg_send(str(chat_id), "📊 إشاراتي:", reply_markup=_build_my_signals_root_kb())
                 return jsonify({"ok": True})
 
             if action.startswith("del_sig:"):
@@ -1870,11 +1917,14 @@ def telegram_webhook():
                     _tg_send(str(chat_id), f"❌ تعذر الحذف:\n{e}")
                 # show updated list
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
-                _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=bool(items)))
+                _tg_send(
+                    str(chat_id),
+                    msg,
+                    reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"),
+                )
                 return jsonify({"ok": True})
 
-            
-            if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
+if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
                 s = _settings()
                 # 3) M5 uses intraday cache (fast)
                 if action == "ai_top_m5":
@@ -2721,6 +2771,107 @@ def _my_saved_signals_message(chat_id: str, lookback_days: int = 7, limit: int =
     lines.append("🧹 ملاحظة: يتم تنظيف القائمة تلقائياً بعد 7 أيام (لكن تبقى محفوظة داخلياً للتعلم).")
     return "\n".join(lines), items
 
+
+
+
+def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: int = 50) -> str:
+    """Review ONLY the user's saved paper trades using latest daily close (exploration).
+
+    Important: this review is tied to the same list the user can delete from (paper_trades),
+    so deleting a saved trade removes it from this review.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        from core.storage import list_paper_trades_for_chat
+        rows = list_paper_trades_for_chat(chat_id, limit=max(20, int(limit)))
+    except Exception:
+        rows = []
+    if not rows:
+        return "لا توجد شارات محفوظة لمراجعتها الآن."
+
+    reviewed = 0
+    winners = 0
+    losers = 0
+    lines: List[str] = []
+    seen = set()
+
+    for r in rows:
+        try:
+            ts = r.get("ts") or r.get("created_ts") or ""
+            if ts:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if (now - dt).days > int(lookback_days):
+                    continue
+            else:
+                dt = now
+            symbol = (r.get("symbol") or "").upper().strip()
+            mode = (r.get("mode") or "D1").upper().strip()
+            side = (r.get("side") or "buy").lower().strip()
+            entry = float(r.get("entry") or 0.0)
+            if not symbol or entry <= 0:
+                continue
+            k = (symbol, mode, side, round(entry, 4))
+            if k in seen:
+                continue
+            seen.add(k)
+
+            data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
+            blist = (data.get("bars", {}).get(symbol) or [])
+            if not blist:
+                continue
+            last_close = float(blist[-1].get("c") or entry)
+            highs = [float(b.get("h") or b.get("c") or entry) for b in blist]
+            lows = [float(b.get("l") or b.get("c") or entry) for b in blist]
+            max_high = max(highs) if highs else entry
+            min_low = min(lows) if lows else entry
+            if side == "sell":
+                ret = (entry - last_close) / entry * 100.0
+                mfe = (entry - min_low) / entry * 100.0
+                mae = (entry - max_high) / entry * 100.0
+            else:
+                ret = (last_close - entry) / entry * 100.0
+                mfe = (max_high - entry) / entry * 100.0
+                mae = (min_low - entry) / entry * 100.0
+
+            label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
+            if ret > 0:
+                winners += 1
+            elif ret < 0:
+                losers += 1
+            reviewed += 1
+
+            score = r.get("score")
+            lines.append(
+                f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
+                if score is not None
+                else f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+            )
+        except Exception:
+            continue
+
+    if reviewed == 0:
+        return "لا توجد شارات حديثة ضمن فترة المراجعة."
+    header = (
+        f"📈 مراجعة الإشارات (آخر {lookback_days} يوم):\n"
+        f"— تمت مراجعة: {reviewed}\n"
+        f"— رابحة: {winners} | خاسرة: {losers}\n"
+        f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
+    )
+    body = "\n".join(lines[:25])
+    return header + "\n" + body
+
+def _review_and_saved_message(chat_id: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Combine exploratory performance review (last 2 days) + user's saved paper trades list.
+
+    - Review section uses latest available close (D1 bars) and may include signals beyond paper list.
+    - Paper list is what the user can delete from Telegram UI (auto-cleaned after 7 days).
+    """
+    review = _review_recent_signals(lookback_days=2, limit=60)
+    saved_msg, items = _my_saved_signals_message(chat_id, lookback_days=7, limit=80)
+    # Combine with a clear separator so the user gets both behaviors.
+    combo = review.rstrip() + "\n\n" + "—" * 18 + "\n" + saved_msg
+    return combo, items
+
 def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
     """Build a Telegram message that reviews recent signals using latest available daily close.
     This does NOT place trades. It simply measures how signals performed so far (exploration mode)."
@@ -2734,6 +2885,8 @@ def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
     winners = 0
     losers = 0
     lines = []
+    # Avoid showing duplicates for the same symbol/mode within the same review window.
+    seen = set()
     for r in rows:
         try:
             ts = r.get("ts") or ""
@@ -2747,6 +2900,12 @@ def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
             entry = float(r.get("entry") or 0.0)
             if entry <= 0:
                 continue
+            mode = (r.get("mode") or "").strip() or "D1"
+            # key: symbol+mode+side+rounded entry (stable enough to remove spam duplicates)
+            k = (symbol, mode.upper(), side, round(entry, 4))
+            if k in seen:
+                continue
+            seen.add(k)
             # get daily bars from signal date to now (few days only)
             data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
             blist = (data.get("bars", {}).get(symbol) or [])
@@ -2784,9 +2943,12 @@ def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
                 )
             except Exception:
                 pass
-            mode = r.get("mode") or ""
             score = r.get("score")
-            lines.append(f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}" if score is not None else f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}")
+            lines.append(
+                f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
+                if score is not None
+                else f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+            )
         except Exception:
             continue
 
