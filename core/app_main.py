@@ -61,6 +61,9 @@ from core.storage import (
     add_paper_trade,
     due_paper_trades,
     mark_paper_trade_notified,
+    list_paper_trades_for_chat,
+    delete_paper_trade_for_chat,
+    cleanup_old_paper_trades,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -223,6 +226,27 @@ def _build_pick_kb() -> Dict[str, Any]:
         [("⬅️ رجوع", "menu")],
     ])
 
+
+
+def _build_my_signals_kb(has_items: bool = True) -> Dict[str, Any]:
+    rows = []
+    if has_items:
+        rows.append([("🗑 حذف إشارة", "my_sig_delete")])
+    rows.append([("🔄 تحديث", "my_sig_refresh"), ("⬅️ رجوع", "menu")])
+    return _ikb(rows)
+
+
+def _build_my_signals_delete_kb(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+    # show up to 12 items as buttons (Telegram UI friendly)
+    for r in (items or [])[:12]:
+        sym = (r.get("symbol") or "").upper()
+        mode = (r.get("mode") or "").upper() or "D1"
+        pid = int(r.get("paper_id") or 0)
+        label = f"❌ {sym} ({mode})"
+        rows.append([(label, f"del_sig:{pid}")])
+    rows.append([("⬅️ رجوع", "review_signals")])
+    return _ikb(rows)
 
 def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
     ai_on = "ON" if _get_bool(s, "AI_PREDICT_ENABLED", False) else "OFF"
@@ -1822,15 +1846,29 @@ def telegram_webhook():
                 _tg_send(str(chat_id), "📌 اختر:", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
 
-            if action == "review_signals":
-                _tg_send(str(chat_id), "⏳ جاري مراجعة الإشارات...")
-                def _job():
-                    try:
-                        msg = _review_recent_signals(lookback_days=int(_get_int(_settings(), "REVIEW_LOOKBACK_DAYS", 2)), limit=80)
-                        _tg_send(str(chat_id), msg)
-                    except Exception as e:
-                        _tg_send(str(chat_id), f"❌ خطأ أثناء المراجعة:\n{e}")
-                _run_async(_job)
+            if action in ("review_signals", "my_sig_refresh"):
+                msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
+                _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=bool(items)))
+                return jsonify({"ok": True})
+
+            if action == "my_sig_delete":
+                msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
+                if not items:
+                    _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=False))
+                    return jsonify({"ok": True})
+                _tg_send(str(chat_id), "اختر الإشارة التي تريد حذفها:", reply_markup=_build_my_signals_delete_kb(items))
+                return jsonify({"ok": True})
+
+            if action.startswith("del_sig:"):
+                try:
+                    pid = int(action.split(":", 1)[1])
+                    delete_paper_trade_for_chat(str(chat_id), pid)
+                    _tg_send(str(chat_id), "✅ تم حذف الإشارة من قائمتك.")
+                except Exception as e:
+                    _tg_send(str(chat_id), f"❌ تعذر الحذف:\n{e}")
+                # show updated list
+                msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
+                _tg_send(str(chat_id), msg, reply_markup=_build_my_signals_kb(has_items=bool(items)))
                 return jsonify({"ok": True})
 
             
@@ -2649,6 +2687,37 @@ def _run_scan_and_notify(force_summary: bool=True) -> None:
             send_telegram(b)
     elif force_summary:
         send_telegram(_fmt_scan_summary_ar(s, universe_size, picks))
+
+
+def _my_saved_signals_message(chat_id: str, lookback_days: int = 7, limit: int = 80) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return (message, items) for saved paper trades in the last N days."""
+    items = []
+    try:
+        items = list_paper_trades_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=int(limit))
+    except Exception:
+        items = []
+    if not items:
+        msg = "📌 إشاراتك المحفوظة\nلا توجد إشارات محفوظة خلال آخر 7 أيام."
+        return msg, items
+
+    lines = ["📌 إشاراتك المحفوظة (آخر 7 أيام)", ""]
+    # show concise list
+    for i, r in enumerate(items[:20], 1):
+        sym = (r.get("symbol") or "").upper()
+        mode = (r.get("mode") or "").upper() or "D1"
+        entry = r.get("entry")
+        ts = (r.get("signal_ts") or r.get("ts") or "").replace("T", " ").replace("Z", "")
+        try:
+            entry_f = float(entry) if entry is not None else 0.0
+            entry_s = f"{entry_f:.4g}$" if entry_f > 0 else "-"
+        except Exception:
+            entry_s = "-"
+        lines.append(f"{i}) {sym} ({mode}) | دخول: {entry_s} | وقت: {ts[:16]}")
+    if len(items) > 20:
+        lines.append(f"… وباقي {len(items)-20} إشارات.")
+    lines.append("")
+    lines.append("🧹 ملاحظة: يتم تنظيف القائمة تلقائياً بعد 7 أيام (لكن تبقى محفوظة داخلياً للتعلم).")
+    return "\n".join(lines), items
 
 def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
     """Build a Telegram message that reviews recent signals using latest available daily close.

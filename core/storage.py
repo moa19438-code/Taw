@@ -1092,3 +1092,106 @@ def mark_paper_trade_notified(paper_id: int) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute("UPDATE paper_trades SET notified=1 WHERE id=?", (int(paper_id),))
         con.commit()
+
+
+def list_paper_trades_for_chat(chat_id: str, lookback_days: int = 7, limit: int = 80) -> List[Dict[str, Any]]:
+    """List saved paper trades for a chat, joined with the originating signal.
+
+    Note: We keep the underlying signal rows (for learning/history) and only manage visibility via paper_trades.
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=int(lookback_days))).isoformat()
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        pt.id AS paper_id,
+                        pt.chat_id,
+                        pt.signal_id,
+                        pt.due_ts,
+                        pt.notified,
+                        s.ts AS signal_ts,
+                        s.symbol,
+                        s.mode,
+                        s.side,
+                        s.strength,
+                        s.score,
+                        s.entry,
+                        s.sl,
+                        s.tp
+                    FROM paper_trades pt
+                    JOIN signals s ON s.id = pt.signal_id
+                    WHERE pt.chat_id = %s
+                      AND s.ts >= %s
+                    ORDER BY s.ts DESC
+                    LIMIT %s
+                    """,
+                    (str(chat_id), cutoff, int(limit)),
+                )
+                return list(cur.fetchall() or [])
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+                pt.id AS paper_id,
+                pt.chat_id,
+                pt.signal_id,
+                pt.due_ts,
+                pt.notified,
+                s.ts AS signal_ts,
+                s.symbol,
+                s.mode,
+                s.side,
+                s.strength,
+                s.score,
+                s.entry,
+                s.sl,
+                s.tp
+            FROM paper_trades pt
+            JOIN signals s ON s.id = pt.signal_id
+            WHERE pt.chat_id = ?
+              AND s.ts >= ?
+            ORDER BY s.ts DESC
+            LIMIT ?
+            """,
+            (str(chat_id), cutoff, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in (rows or [])]
+
+
+def delete_paper_trade_for_chat(chat_id: str, paper_id: int) -> None:
+    """Delete a single saved paper-trade link for a chat (keeps the signal row intact)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM paper_trades WHERE id=%s AND chat_id=%s",
+                    (int(paper_id), str(chat_id)),
+                )
+            con.commit()
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "DELETE FROM paper_trades WHERE id=? AND chat_id=?",
+            (int(paper_id), str(chat_id)),
+        )
+        con.commit()
+
+
+def cleanup_old_paper_trades(retention_days: int = 7) -> int:
+    """Auto-clean paper_trades older than retention_days (signals stay for learning). Returns deleted count."""
+    cutoff = (datetime.utcnow() - timedelta(days=int(retention_days))).isoformat()
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("DELETE FROM paper_trades WHERE due_ts < %s", (cutoff,))
+                deleted = cur.rowcount or 0
+            con.commit()
+        return int(deleted)
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("DELETE FROM paper_trades WHERE due_ts < ?", (cutoff,))
+        deleted = cur.rowcount or 0
+        con.commit()
+    return int(deleted)
