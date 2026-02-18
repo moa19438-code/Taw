@@ -237,7 +237,6 @@ def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
         [("⏱️ فترة الفحص", "show_interval"), ("⚖️ المخاطرة", "show_risk")],
         [(f"🔔 التنبيهات: {notify_on}", "toggle_notify"), (f"🔕 صامت: {silent_on}", "toggle_silent")],
         [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), (f"📨 الوجهة: {route}", "show_notify_route")],
-        [("📅 تقرير أسبوعي", "weekly_report"), ("📈 مراجعة إشاراتي", "review_signals")],
         [("🧪 فحص ذاتي", "self_check"), ("⬅️ رجوع", "menu")],
     ])
 
