@@ -237,6 +237,7 @@ def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
         [("⏱️ فترة الفحص", "show_interval"), ("⚖️ المخاطرة", "show_risk")],
         [(f"🔔 التنبيهات: {notify_on}", "toggle_notify"), (f"🔕 صامت: {silent_on}", "toggle_silent")],
         [(f"🤖 AI تنبؤ: {ai_on}", "toggle_ai_predict"), (f"📨 الوجهة: {route}", "show_notify_route")],
+        [("📅 تقرير أسبوعي", "weekly_report"), ("📈 مراجعة إشاراتي", "review_signals")],
         [("🧪 فحص ذاتي", "self_check"), ("⬅️ رجوع", "menu")],
     ])
 
@@ -2748,6 +2749,21 @@ def _weekly_report(days: int = 7) -> str:
     tp_hits = sum(1 for r in rows if (r.get("tp_hit") or 0) in (1, True))
     sl_hits = sum(1 for r in rows if (r.get("sl_hit") or 0) in (1, True))
 
+    # Mode comparison (D1 vs M5 etc.)
+    mode_map = {}
+    for r in rows:
+        mode = (r.get("mode") or "").strip() or "?"
+        mode_map.setdefault(mode, []).append(float(r.get("return_pct") or 0))
+    def _mode_summary(mode: str, vals: list) -> str:
+        if not vals:
+            return ""
+        wins_m = sum(1 for v in vals if v > 0)
+        losses_m = sum(1 for v in vals if v < 0)
+        winrate_m = (wins_m / max(1, wins_m + losses_m)) * 100.0
+        avg_m = sum(vals) / len(vals)
+        net_m = sum(vals)
+        return f"• {mode}: n={len(vals)} | Winrate {winrate_m:.1f}% | Avg {avg_m:+.2f}% | Net {net_m:+.2f}%"
+
     # Top/Bottom by return_pct
     rows_sorted = sorted(rows, key=lambda x: float(x.get("return_pct") or 0), reverse=True)
     top5 = rows_sorted[:5]
@@ -2768,7 +2784,18 @@ def _weekly_report(days: int = 7) -> str:
         f"— Avg Ret: {avg_ret:+.2f}% | Avg MFE: {avg_mfe:+.2f}% | Avg MAE: {avg_mae:+.2f}%\n"
         f"— TP Hits: {tp_hits} | SL Hits: {sl_hits}\n"
     )
-    body = "🏆 أفضل 5\n" + "\n".join(fmt_row(r) for r in top5) + "\n\n" + "🧊 أسوأ 5\n" + "\n".join(fmt_row(r) for r in bot5)
+    compare_lines = []
+    # Prefer D1 and M5 first if present
+    for k in ["D1", "M5"]:
+        if k in mode_map:
+            compare_lines.append(_mode_summary(k, mode_map.get(k) or []))
+    for k in sorted(mode_map.keys()):
+        if k in ("D1","M5"):
+            continue
+        compare_lines.append(_mode_summary(k, mode_map.get(k) or []))
+    compare_block = "📊 مقارنة الأنماط (D1 vs M5)\n" + ("\n".join(compare_lines) if compare_lines else "لا توجد بيانات كافية للمقارنة.")
+
+    body = compare_block + "\n\n" + "🏆 أفضل 5\n" + "\n".join(fmt_row(r) for r in top5) + "\n\n" + "🧊 أسوأ 5\n" + "\n".join(fmt_row(r) for r in bot5)
     footer = "\n\nملاحظة: التقرير يعتمد على آخر مراجعة محفوظة لكل إشارة ضمن الفترة (استكشاف/تعليم)."
     return header + "\n" + body + footer
 

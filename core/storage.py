@@ -95,6 +95,15 @@ def init_db() -> None:
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_mode ON signals(symbol, mode);")
+                # --- MIGRATION: ensure signals has extended columns used by insert_signal() ---
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS source TEXT;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS side TEXT;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS features_json TEXT;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS reasons_json TEXT;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS horizon_days INTEGER;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS evaluated INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS model_prob DOUBLE PRECISION;")
+
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS signal_outcomes (
@@ -213,6 +222,22 @@ def init_db() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_mode ON signals(symbol, mode)")
+        # --- MIGRATION: ensure signals has extended columns used by insert_signal() ---
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(signals)")}
+            def _add(col: str, ddl: str):
+                if col not in cols:
+                    con.execute(f"ALTER TABLE signals ADD COLUMN {ddl}")
+            _add("source", "source TEXT")
+            _add("side", "side TEXT")
+            _add("features_json", "features_json TEXT")
+            _add("reasons_json", "reasons_json TEXT")
+            _add("horizon_days", "horizon_days INTEGER")
+            _add("evaluated", "evaluated INTEGER DEFAULT 0")
+            _add("model_prob", "model_prob REAL")
+        except Exception:
+            pass
+
 
         con.execute(
             """CREATE TABLE IF NOT EXISTS signal_outcomes (
