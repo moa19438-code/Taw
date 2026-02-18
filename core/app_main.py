@@ -14,6 +14,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
+from core.admin_dashboard import bp as admin_bp
 from core.ai_analyzer import gemini_analyze, gemini_predict_direction
 from core.ai_filter import should_alert, decide_signal, score_signal
 from core.ml_model import parse_weights, dumps_weights, featurize, predict_prob, update_online
@@ -67,6 +68,7 @@ from core.storage import (
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
+app.register_blueprint(admin_bp)
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "taw-bot"})
