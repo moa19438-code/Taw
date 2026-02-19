@@ -68,6 +68,7 @@ from core.storage import (
     list_paper_trades_for_chat,
     delete_paper_trade_for_chat,
     cleanup_old_paper_trades,
+    list_final_paper_reviews_for_chat,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -284,8 +285,9 @@ def _build_pick_kb() -> Dict[str, Any]:
     """Actions for a single pick (manual simulation)."""
     return _ikb([
         [("📝 سجّل كأني دخلت", "paper_log")],
-        [("⬅️ رجوع", "menu")],
+        [("➡️ التالي", "pick_next"), ("⬅️ رجوع", "menu")],
     ])
+
 
 
 
@@ -315,8 +317,21 @@ def _build_my_signals_root_kb() -> Dict[str, Any]:
     """Entry point for user's signals management."""
     return _ikb([
         [("📈 مراجعة الأداء", "my_sig_review"), ("📌 شاراتي المحفوظة", "my_sig_list")],
+        [("📊 مراجعات 24 ساعة", "my_sig_24h")],
         [("🗑 حذف الكل", "my_sig_delall")],
         [("⬅️ رجوع", "menu")],
+    ])
+
+
+def _build_my_sig_24h_kb(back_action: str = "my_sig_menu") -> Dict[str, Any]:
+    return _ikb([
+        [("🔄 تحديث", "my_sig_24h_refresh"), ("⬅️ رجوع", back_action)],
+    ])
+
+
+def _build_my_sig_review_kb(back_action: str = "my_sig_menu") -> Dict[str, Any]:
+    return _ikb([
+        [("🔄 تحديث", "my_sig_review_refresh"), ("⬅️ رجوع", back_action)],
     ])
 
 def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
@@ -497,7 +512,7 @@ def _self_check(fix: bool = True) -> Dict[str, Any]:
         "show_sl", "show_tp", "show_send", "show_window", "show_interval", "show_risk",
         "show_notify_route", "show_horizon",
         # actions
-        "do_analyze", "do_top", "pick_d1", "pick_m5",
+        "do_analyze", "do_top", "pick_d1", "pick_m5", "pick_next",
         "ai_top_ev", "ai_top_prob", "ai_top_m5", "ai_symbol_start", "ai_cancel",
 	        "review_signals", "weekly_report",
 	        # my signals menu
@@ -1807,6 +1822,28 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
                 f"{src_line}\n{ts_line}"
             )
             _tg_send(chat, msg, silent=True)
+            # Freeze this 24h review as a snapshot so it does NOT change later.
+            try:
+                signal_id = int(r.get("signal_id") or 0)
+                if signal_id > 0:
+                    note = json.dumps({
+                        "kind": "paper_24h_final",
+                        "price_src": price_src,
+                        "live_ts": live_ts or "",
+                        "review_ts": datetime.now(timezone.utc).isoformat(),
+                    }, ensure_ascii=False)
+                    log_signal_review(
+                        ts=datetime.now(timezone.utc).isoformat(),
+                        signal_id=signal_id,
+                        close=float(exit_price),
+                        return_pct=float(ret_pct),
+                        mfe_pct=0.0,
+                        mae_pct=0.0,
+                        note=note,
+                    )
+            except Exception:
+                pass
+
         except Exception:
             pass
         finally:
@@ -1955,12 +1992,20 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
             # 📈 مراجعة الأداء (مرتبطة بالشارات المحفوظة فقط)
-            if action == "my_sig_review":
+            if action in ("my_sig_review", "my_sig_review_refresh"):
                 msg = _review_my_saved_performance(str(chat_id), lookback_days=2, limit=80)
-                _tg_ui(str(chat_id), message_id, msg, reply_markup=_ikb([[("⬅️ رجوع", "my_sig_menu")]]))
+                _tg_ui(str(chat_id), message_id, msg, reply_markup=_build_my_sig_review_kb(back_action="my_sig_menu"))
                 return jsonify({"ok": True})
 
-            # 📌 شاراتي المحفوظة
+
+            
+            # 📊 مراجعات 24 ساعة (مقفلة)
+            if action in ("my_sig_24h", "my_sig_24h_refresh"):
+                msg = _my_saved_24h_reviews_message(str(chat_id), lookback_days=30, limit=50)
+                _ui(msg, reply_markup=_build_my_sig_24h_kb(back_action="my_sig_menu"))
+                return jsonify({"ok": True})
+
+# 📌 شاراتي المحفوظة
             if action in ("my_sig_list", "my_sig_refresh"):
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
                 _ui(msg, reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"))
@@ -2299,6 +2344,58 @@ def telegram_webhook():
                 s = _settings()
                 _tg_ui(str(chat_id), message_id, f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
+
+            if action == "pick_next":
+                # Show next cached pick for the last mode (D1/M5) without going back to the main menu
+                chat = str(chat_id)
+                tf = "d1"
+                try:
+                    from core.storage import get_user_state
+                    raw = get_user_state(chat, "last_pick") or ""
+                    info = json.loads(raw) if raw else {}
+                    tf = "m5" if str(info.get("mode") or "").lower() == "m5" else "d1"
+                except Exception:
+                    tf = "d1"
+
+                # Market-hours filter for scalping signals
+                if tf == "m5":
+                    ms = _market_status_cached()
+                    if not ms.get("is_open", True):
+                        _tg_ui(chat, message_id, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                        return jsonify({"ok": True})
+
+                pick = _get_next_pick(tf, chat)
+                if not pick:
+                    _tg_ui(chat, message_id, "⚠️ لا توجد نتائج جاهزة الآن. جرّب تحديث الفحص ثم أعد المحاولة.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                    return jsonify({"ok": True})
+
+                if tf == "m5":
+                    try:
+                        from core.storage import set_user_state
+                        entry_p = float(pick.get("last") or 0.0)
+                        info2 = {"symbol": str(pick.get("symbol") or "").upper(), "mode": "m5", "side": "buy", "entry": entry_p, "score": float(pick.get("score") or 0.0), "strength": "B"}
+                        set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
+                    except Exception:
+                        pass
+                    _tg_ui(chat, message_id, _format_pick_m5(pick), reply_markup=_build_pick_kb())
+                else:
+                    c = pick.get("candidate")
+                    if isinstance(c, Candidate):
+                        try:
+                            from core.storage import set_user_state
+                            s0 = _settings()
+                            live_p0, _ = _get_live_trade_price(c.symbol)
+                            entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
+                            plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
+                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                            set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
+                        except Exception:
+                            pass
+                        _tg_ui(chat, message_id, _format_pick_d1(c, _settings()), reply_markup=_build_pick_kb())
+                    else:
+                        _tg_ui(chat, message_id, "⚠️ تم العثور على نتيجة لكن غير صالحة.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                return jsonify({"ok": True})
+
             if action in ("pick_m5", "pick_d1"):
                 tf = "m5" if action == "pick_m5" else "d1"
                 chat = str(chat_id)
@@ -2851,90 +2948,178 @@ def _my_saved_signals_message(chat_id: str, lookback_days: int = 7, limit: int =
 
 
 def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: int = 50) -> str:
-    """Review ONLY the user's saved paper trades using latest daily close (exploration).
+    """Review ONLY the user's saved paper trades.
 
-    Important: this review is tied to the same list the user can delete from (paper_trades),
-    so deleting a saved trade removes it from this review.
+    - Uses the signal timestamp (signal_ts) from the originating signal (not the paper-trade row).
+    - Splits results into: completed (>= due_ts) vs pending (< due_ts).
+    - Win/Loss counts are calculated ONLY for completed rows.
+    - When market is closed, we may show/use a more recent LIVE last-trade price if available.
     """
     now = datetime.now(timezone.utc)
     try:
         from core.storage import list_paper_trades_for_chat
-        rows = list_paper_trades_for_chat(chat_id, limit=max(20, int(limit)))
+        rows = list_paper_trades_for_chat(chat_id, lookback_days=max(1, int(lookback_days)), limit=max(20, int(limit)))
     except Exception:
         rows = []
     if not rows:
         return "لا توجد شارات محفوظة لمراجعتها الآن."
 
     reviewed = 0
+    completed = 0
+    pending = 0
     winners = 0
     losers = 0
     lines: List[str] = []
-    seen = set()
+    seen: set[tuple] = set()
 
     for r in rows:
         try:
-            ts = r.get("ts") or r.get("created_ts") or ""
+            ts = r.get("signal_ts") or r.get("ts") or r.get("created_ts") or ""
             if ts:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if (now - dt).days > int(lookback_days):
+                sig_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if (now - sig_dt).days > int(lookback_days):
                     continue
             else:
-                dt = now
+                sig_dt = now
+
+            due_ts = r.get("due_ts") or ""
+            try:
+                due_dt = datetime.fromisoformat(str(due_ts).replace("Z", "+00:00")) if due_ts else (sig_dt + timedelta(hours=24))
+            except Exception:
+                due_dt = sig_dt + timedelta(hours=24)
+
             symbol = (r.get("symbol") or "").upper().strip()
             mode = (r.get("mode") or "D1").upper().strip()
             side = (r.get("side") or "buy").lower().strip()
             entry = float(r.get("entry") or 0.0)
             if not symbol or entry <= 0:
                 continue
-            k = (symbol, mode, side, round(entry, 4))
+
+            k = (symbol, mode, side, round(entry, 4), str(ts)[:16])
             if k in seen:
                 continue
             seen.add(k)
 
-            data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
+            # Pull daily bars around the signal window (enough for MFE/MAE + last close)
+            data = bars([symbol], start=sig_dt - timedelta(days=6), end=now + timedelta(days=1), timeframe="1Day", limit=200)
             blist = (data.get("bars", {}).get(symbol) or [])
             if not blist:
                 continue
-            last_close = float(blist[-1].get("c") or entry)
+
+            # last daily close reference
+            last_bar = blist[-1]
+            last_close = float(last_bar.get("c") or entry)
+
+            # optional live last-trade price (after-hours / pre-market)
+            live_p, live_ts = _get_live_trade_price(symbol)
+            use_live = False
+            live_dt = None
+            if live_p is not None and live_ts:
+                try:
+                    live_dt = datetime.fromisoformat(str(live_ts).replace("Z", "+00:00"))
+                    # Use live only if it's reasonably fresh (after-hours / pre-market)
+                    use_live = (now - live_dt) <= timedelta(hours=36)
+                except Exception:
+                    use_live = False
+
+            price = float(live_p) if (use_live and live_p is not None) else last_close
+            price_label = "Last" if (use_live and live_p is not None) else "Close"
+
             highs = [float(b.get("h") or b.get("c") or entry) for b in blist]
             lows = [float(b.get("l") or b.get("c") or entry) for b in blist]
             max_high = max(highs) if highs else entry
             min_low = min(lows) if lows else entry
+
             if side == "sell":
-                ret = (entry - last_close) / entry * 100.0
+                ret = (entry - price) / entry * 100.0
                 mfe = (entry - min_low) / entry * 100.0
                 mae = (entry - max_high) / entry * 100.0
             else:
-                ret = (last_close - entry) / entry * 100.0
+                ret = (price - entry) / entry * 100.0
                 mfe = (max_high - entry) / entry * 100.0
                 mae = (min_low - entry) / entry * 100.0
 
-            label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
-            if ret > 0:
-                winners += 1
-            elif ret < 0:
-                losers += 1
+            is_completed = now >= due_dt
+            side_label = "شراء" if side != "sell" else "بيع"
+
+            if is_completed:
+                completed += 1
+                label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
+                if ret > 0:
+                    winners += 1
+                elif ret < 0:
+                    losers += 1
+            else:
+                pending += 1
+                label = "⏳"
+
             reviewed += 1
 
             score = r.get("score")
+            score_str = f"{float(score):.1f}" if score is not None else "-"
+            t_short = str(ts)[:16]
             lines.append(
-                f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
-                if score is not None
-                else f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+                f"{label} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret:.2f}% | {price_label}: {price:.2f} | Entry: {entry:.2f} | t: {t_short} | Score: {score_str} | MFE: {mfe:.2f}% | MAE: {mae:.2f}%"
             )
         except Exception:
             continue
 
     if reviewed == 0:
         return "لا توجد شارات حديثة ضمن فترة المراجعة."
+
     header = (
         f"📈 مراجعة الإشارات (آخر {lookback_days} يوم):\n"
         f"— تمت مراجعة: {reviewed}\n"
-        f"— رابحة: {winners} | خاسرة: {losers}\n"
-        f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
+        f"— مكتملة: {completed} (رابحة: {winners} | خاسرة: {losers})\n"
+        f"— غير مكتملة: {pending} (قياس لحظي فقط)\n"
+        f"ملاحظة: إذا كان السوق مقفل، قد نعرض Last (بعد الإغلاق/قبل الافتتاح) بدل Close.\n"
     )
     body = "\n".join(lines[:25])
-    return header + "\n" + body
+    return header + "\n" + body + ("\n\n... (+ المزيد)" if len(lines) > 25 else "")
+
+
+def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: int = 30) -> str:
+    """Return frozen 24h review snapshots for this chat."""
+    try:
+        rows = list_final_paper_reviews_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=int(limit))
+    except Exception:
+        rows = []
+    if not rows:
+        return "📊 مراجعات 24 ساعة\n\nلا توجد مراجعات مكتملة محفوظة حتى الآن."
+    lines: List[str] = []
+    for r in rows[:int(limit)]:
+        try:
+            symbol = (r.get("symbol") or "").upper().strip()
+            mode = (r.get("mode") or "D1").upper().strip()
+            side = (r.get("side") or "buy").lower().strip()
+            entry = float(r.get("entry") or 0.0)
+            exit_price = float(r.get("exit_price") or 0.0)
+            ret_pct = float(r.get("return_pct") or 0.0)
+            score = r.get("score")
+            note_raw = r.get("note") or ""
+            price_src = ""
+            live_ts = ""
+            review_ts = r.get("review_ts") or ""
+            try:
+                j = json.loads(note_raw) if note_raw.strip().startswith("{") else {}
+                price_src = (j.get("price_src") or "")
+                live_ts = (j.get("live_ts") or "")
+                review_ts = j.get("review_ts") or review_ts
+            except Exception:
+                pass
+            side_label = "شراء" if side != "sell" else "بيع"
+            res = "✅" if ret_pct > 0 else ("❌" if ret_pct < 0 else "➖")
+            src_line = f" | Src: {price_src}" if price_src else ""
+            ts_line = f" | {review_ts[:16].replace('T',' ')}" if review_ts else ""
+            sc_line = f" | Score: {float(score):.1f}" if score is not None else ""
+            lines.append(
+                f"{res} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret_pct:+.2f}% | Entry: {entry:.2f} | Exit: {exit_price:.2f}{sc_line}{src_line}{ts_line}"
+            )
+        except Exception:
+            continue
+    header = f"📊 مراجعات 24 ساعة (مقفلة)\n— العدد: {len(rows)}\n"
+    return header + "\n".join(lines[:25])
+
 
 def _review_and_saved_message(chat_id: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Combine exploratory performance review (last 2 days) + user's saved paper trades list.
