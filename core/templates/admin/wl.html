@@ -1,14 +1,21 @@
 {% extends "admin/base.html" %}
 {% set title = "WL" %}
 {% block content %}
+  <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+    <div>
+      <h3 class="mb-0 fw-bold"><i class="bi bi-bookmark-star me-2"></i>Watchlist</h3>
+      <div class="small-muted">إضافة / حذف رموز القائمة بسرعة.</div>
+    </div>
+  </div>
+
   <div class="row g-3">
     <div class="col-12 col-lg-4">
       <div class="card">
-        <div class="card-header">إضافة سهم إلى WL</div>
+        <div class="card-header d-flex align-items-center gap-2"><i class="bi bi-plus-circle"></i><span>إضافة سهم إلى Watchlist</span></div>
         <div class="card-body">
           <form method="post" action="{{ url_for('admin.wl_add') }}" class="d-flex gap-2">
             <input class="form-control mono" name="symbol" placeholder="مثال: AAPL" required>
-            <button class="btn btn-success" type="submit">إضافة</button>
+            <button class="btn btn-success" type="submit"><i class="bi bi-plus-lg me-1"></i>إضافة</button>
           </form>
           <div class="small-muted mt-2">WL = Watchlist (قائمة مراقبة)</div>
         </div>
@@ -35,7 +42,7 @@
                   <td class="text-end">
                     <form method="post" action="{{ url_for('admin.wl_delete') }}" onsubmit="return confirm('حذف السهم من WL؟');">
                       <input type="hidden" name="symbol" value="{{ r.symbol }}">
-                      <button class="btn btn-sm btn-outline-danger" type="submit">حذف</button>
+                      <button class="btn btn-sm btn-outline-danger" type="submit"><i class="bi bi-trash3 me-1"></i>حذف</button>
                     </form>
                   </td>
                 </tr>

@@ -3,12 +3,16 @@
 {% block content %}
   <div class="d-flex align-items-center justify-content-between mb-3">
     <div>
-      <h3 class="mb-0">Signals للتعلّم</h3>
+      <h3 class="mb-0 fw-bold"><i class="bi bi-lightning-charge me-2"></i>Signals للتعلّم</h3>
       <div class="small-muted">آخر {{ limit }} إشارة (هذه لا تُحذف بالتنظيف).</div>
     </div>
   </div>
 
   <div class="card">
+    <div class="card-header d-flex align-items-center justify-content-between">
+      <span>سجل الإشارات</span>
+      <span class="small-muted">Limit: {{ limit }}</span>
+    </div>
     <div class="card-body table-responsive">
       <table class="table table-hover table-sm">
         <thead>
