@@ -14,6 +14,9 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
+
+# Network timeouts (avoid NameError + keep webhook responsive)
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "20"))
 from core.admin_dashboard import bp as admin_bp
 from core.ai_analyzer import gemini_analyze, gemini_predict_direction
 from core.ai_filter import should_alert, decide_signal, score_signal
