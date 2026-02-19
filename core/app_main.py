@@ -178,7 +178,6 @@ def _tg_ui(chat_id: str, message_id: Optional[int], text: str, reply_markup: Opt
     _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
 
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
-(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
     """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
     if not (TELEGRAM_BOT_TOKEN and callback_id):
         return
@@ -190,6 +189,7 @@ def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, 
         requests.post(url, json=payload, timeout=10)
     except Exception:
         pass
+
 def _seen_and_mark(d: Dict[str, float], key: str, ttl_sec: float) -> bool:
     """Return True if key was seen recently; otherwise mark and return False."""
     now = time.time()
