@@ -161,25 +161,41 @@ def _tg_edit_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict[s
 def _tg_ui(chat_id: str, message_id: Optional[int], text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
     """BotFather-like UI behavior:
     - For button clicks (we have message_id): prefer editing the same message.
-    - If Telegram says "message is not modified", just update keyboard (or do nothing) instead of spamming new messages.
-    - If edit is impossible (can't be edited / too old), fall back to sendMessage.
+    - If Telegram says "message is not modified", update only the keyboard.
+    - If the edited text is too long or editing is impossible, send a follow-up message *without buttons*,
+      and keep the original message as the UI container (menu/back).
     """
     if message_id:
         ok, desc = _tg_edit_text(chat_id, int(message_id), text, reply_markup=reply_markup)
         if ok:
             return
+
+        low = (desc or "").lower()
+
         # If content didn't change, try updating just the keyboard, or just keep as-is.
-        if "message is not modified" in (desc or "").lower():
-            # Try reply markup only; if that fails too, do nothing (but callback already acknowledged).
+        if "message is not modified" in low:
             _tg_edit_markup(chat_id, int(message_id), reply_markup=reply_markup)
             return
-        # If can't edit, fall back to sending a new message.
-        if ("message can't be edited" in (desc or "").lower()) or ("to edit" in (desc or "").lower()):
-            _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+
+        # If the content is too long to edit, keep UI in the same message and send details separately (no buttons).
+        if ("message is too long" in low) or ("message_too_long" in low) or ("too long" in low):
+            try:
+                _tg_edit_text(chat_id, int(message_id), "✅ تم تنفيذ الطلب. (التفاصيل في رسالة مستقلة بدون أزرار)", reply_markup=reply_markup)
+            except Exception:
+                pass
+            _tg_send(chat_id, text, reply_markup=None, silent=silent)
             return
-        # Unknown edit failure: fall back to send to avoid dead UI.
-        _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+
+        # If can't edit (too old / not allowed), send a follow-up without buttons (avoid UI spam).
+        if ("message can't be edited" in low) or ("can't be edited" in low) or ("to edit" in low):
+            _tg_send(chat_id, text, reply_markup=None, silent=silent)
+            return
+
+        # Unknown edit failure: send without buttons to avoid spawning duplicate menus.
+        _tg_send(chat_id, text, reply_markup=None, silent=silent)
         return
+
+    # No message_id (normal command/message): send a fresh message, keep buttons if provided.
     _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
     """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
@@ -470,7 +486,7 @@ def _extract_callbacks(markup: Optional[Dict[str, Any]]) -> List[str]:
             for b in (r or []):
                 d = (b or {}).get("callback_data")
                 if d:
-                    out.append(str(d))
+                    out.append(str(d).strip())
     except Exception:
         pass
     return out
