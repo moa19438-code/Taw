@@ -159,29 +159,26 @@ def _tg_edit_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict[s
     return ok, desc
 
 def _tg_ui(chat_id: str, message_id: Optional[int], text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
-    """BotFather-like UI behavior:
-    - For button clicks (we have message_id): prefer editing the same message.
-    - If Telegram says "message is not modified", just update keyboard (or do nothing) instead of spamming new messages.
-    - If edit is impossible (can't be edited / too old), fall back to sendMessage.
+    """Inline-button UI behavior (BotFather-style):
+    - On button clicks (message_id exists): UPDATE THE SAME MESSAGE ONLY (no new messages).
+    - If Telegram says "message is not modified", try updating just the keyboard.
+    - If edit is impossible / fails: do NOTHING (so we never create a new message from a button click).
+    - When message_id is missing (e.g., /start): send a normal message.
     """
     if message_id:
         ok, desc = _tg_edit_text(chat_id, int(message_id), text, reply_markup=reply_markup)
         if ok:
             return
-        # If content didn't change, try updating just the keyboard, or just keep as-is.
+        # If content didn't change, try updating just the keyboard.
         if "message is not modified" in (desc or "").lower():
-            # Try reply markup only; if that fails too, do nothing (but callback already acknowledged).
             _tg_edit_markup(chat_id, int(message_id), reply_markup=reply_markup)
             return
-        # If can't edit, fall back to sending a new message.
-        if ("message can't be edited" in (desc or "").lower()) or ("to edit" in (desc or "").lower()):
-            _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
-            return
-        # Unknown edit failure: fall back to send to avoid dead UI.
-        _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+        # Never send a new message for inline-button clicks.
         return
     _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
+(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
     """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
     if not (TELEGRAM_BOT_TOKEN and callback_id):
         return
