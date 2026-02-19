@@ -14,9 +14,6 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask, request, jsonify
-
-# Network timeouts (avoid NameError + keep webhook responsive)
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "20"))
 from core.admin_dashboard import bp as admin_bp
 from core.ai_analyzer import gemini_analyze, gemini_predict_direction
 from core.ai_filter import should_alert, decide_signal, score_signal
@@ -1957,8 +1954,31 @@ def telegram_webhook():
             # 📈 مراجعة الأداء (مرتبطة بالشارات المحفوظة فقط)
             if action == "my_sig_review":
                 msg = _review_my_saved_performance(str(chat_id), lookback_days=2, limit=80)
-                _tg_ui(str(chat_id), message_id, msg, reply_markup=_ikb([[("⬅️ رجوع", "my_sig_menu")]]))
+                _tg_ui(
+                    str(chat_id),
+                    message_id,
+                    msg,
+                    reply_markup=_ikb([
+                        [("🔄 تحديث", "my_sig_review_refresh")],
+                        [("⬅️ رجوع", "my_sig_menu")],
+                    ]),
+                )
                 return jsonify({"ok": True})
+
+            # 🔄 تحديث مراجعة الإشارات
+            if action == "my_sig_review_refresh":
+                msg = _review_my_saved_performance(str(chat_id), lookback_days=2, limit=80)
+                _tg_ui(
+                    str(chat_id),
+                    message_id,
+                    msg,
+                    reply_markup=_ikb([
+                        [("🔄 تحديث", "my_sig_review_refresh")],
+                        [("⬅️ رجوع", "my_sig_menu")],
+                    ]),
+                )
+                return jsonify({"ok": True})
+
 
             # 📌 شاراتي المحفوظة
             if action in ("my_sig_list", "my_sig_refresh"):
@@ -2917,10 +2937,11 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
             reviewed += 1
 
             score = r.get("score")
+            side_ar = "بيع" if side == "sell" else "شراء"
             lines.append(
-                f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
+                f"{label} {symbol} ({mode.lower()}) | {side_ar} | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
                 if score is not None
-                else f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+                else f"{label} {symbol} ({mode.lower()}) | {side_ar} | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
             )
         except Exception:
             continue
