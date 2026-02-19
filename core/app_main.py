@@ -2906,8 +2906,10 @@ def _my_saved_signals_message(chat_id: str, lookback_days: int = 7, limit: int =
 def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: int = 50) -> str:
     """Review ONLY the user's saved paper trades using latest daily close (exploration).
 
-    Important: this review is tied to the same list the user can delete from (paper_trades),
-    so deleting a saved trade removes it from this review.
+    Notes:
+    - This review is tied to the same list the user can delete from (paper_trades).
+    - We separate *completed* vs *incomplete* signals using due_ts (or +24h fallback),
+      and only count Win/Loss for completed signals to avoid misleading stats.
     """
     now = datetime.now(timezone.utc)
     try:
@@ -2919,6 +2921,8 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
         return "لا توجد شارات محفوظة لمراجعتها الآن."
 
     reviewed = 0
+    completed = 0
+    incomplete = 0
     winners = 0
     losers = 0
     lines: List[str] = []
@@ -2926,65 +2930,97 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
 
     for r in rows:
         try:
-            ts = r.get("ts") or r.get("created_ts") or ""
+            # Prefer signal_ts from storage join; fall back to legacy keys if present
+            ts = r.get("signal_ts") or r.get("ts") or r.get("created_ts") or ""
             if ts:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if (now - dt).days > int(lookback_days):
-                    continue
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
             else:
                 dt = now
+
+            # Lookback filter based on signal timestamp
+            if (now - dt).days > int(lookback_days):
+                continue
+
             symbol = (r.get("symbol") or "").upper().strip()
             mode = (r.get("mode") or "D1").upper().strip()
             side = (r.get("side") or "buy").lower().strip()
             entry = float(r.get("entry") or 0.0)
             if not symbol or entry <= 0:
                 continue
+
             k = (symbol, mode, side, round(entry, 4))
             if k in seen:
                 continue
             seen.add(k)
 
-            data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
+            # Determine completion using due_ts (preferred). Fallback: +24h from signal timestamp.
+            due_ts = r.get("due_ts") or ""
+            due_dt = None
+            if due_ts:
+                try:
+                    due_dt = datetime.fromisoformat(str(due_ts).replace("Z", "+00:00"))
+                    if due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    due_dt = None
+            if due_dt is None:
+                due_dt = dt + timedelta(days=1)
+
+            is_completed = now >= due_dt
+
+            # Fetch daily bars around the signal time
+            data = bars([symbol], start=dt - timedelta(days=3), end=now + timedelta(days=1), timeframe="1Day", limit=60)
             blist = (data.get("bars", {}).get(symbol) or [])
             if not blist:
                 continue
+
             last_close = float(blist[-1].get("c") or entry)
-            highs = [float(b.get("h") or b.get("c") or entry) for b in blist]
-            lows = [float(b.get("l") or b.get("c") or entry) for b in blist]
-            max_high = max(highs) if highs else entry
-            min_low = min(lows) if lows else entry
             if side == "sell":
                 ret = (entry - last_close) / entry * 100.0
-                mfe = (entry - min_low) / entry * 100.0
-                mae = (entry - max_high) / entry * 100.0
             else:
                 ret = (last_close - entry) / entry * 100.0
-                mfe = (max_high - entry) / entry * 100.0
-                mae = (min_low - entry) / entry * 100.0
 
-            label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
-            if ret > 0:
-                winners += 1
-            elif ret < 0:
-                losers += 1
             reviewed += 1
+            if is_completed:
+                completed += 1
+                label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
+                if ret > 0:
+                    winners += 1
+                elif ret < 0:
+                    losers += 1
+            else:
+                incomplete += 1
+                label = "⏳"
 
             score = r.get("score")
-            lines.append(
-                f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
-                if score is not None
-                else f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
-            )
+            side_label = "🎯 شراء" if side != "sell" else "🎯 بيع"
+
+            if score is not None:
+                try:
+                    score_s = f"{float(score):.1f}"
+                except Exception:
+                    score_s = str(score)
+                lines.append(
+                    f"{label} {symbol} ({mode.lower()}) | {side_label} | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {score_s}"
+                )
+            else:
+                lines.append(
+                    f"{label} {symbol} ({mode.lower()}) | {side_label} | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+                )
         except Exception:
             continue
 
     if reviewed == 0:
         return "لا توجد شارات حديثة ضمن فترة المراجعة."
+
     header = (
         f"📈 مراجعة الإشارات (آخر {lookback_days} يوم):\n"
         f"— تمت مراجعة: {reviewed}\n"
-        f"— رابحة: {winners} | خاسرة: {losers}\n"
-        f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
+        f"— مكتملة: {completed} (رابحة: {winners} | خاسرة: {losers})\n"
+        f"— غير مكتملة: {incomplete} (قياس لحظي فقط)\n"
+        f"ملاحظة: الإشارات غير المكتملة تُعرض كمؤشر لحظي فقط ولا تدخل في نسبة الربح/الخسارة.\n"
     )
     body = "\n".join(lines[:25])
     return header + "\n" + body
