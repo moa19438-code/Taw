@@ -159,28 +159,24 @@ def _tg_edit_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict[s
     return ok, desc
 
 def _tg_ui(chat_id: str, message_id: Optional[int], text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
-    """BotFather-like UI behavior:
-    - For button clicks (we have message_id): prefer editing the same message.
-    - If Telegram says "message is not modified", just update keyboard (or do nothing) instead of spamming new messages.
-    - If edit is impossible (can't be edited / too old), fall back to sendMessage.
+    """BotFather-like UI behavior (Option 1):
+    - On button clicks (message_id is present): ALWAYS edit the same message (no new messages).
+    - If Telegram says "message is not modified", try updating just the keyboard.
+    - If edit is impossible/forbidden, do nothing (so we never spam sendMessage).
     """
     if message_id:
         ok, desc = _tg_edit_text(chat_id, int(message_id), text, reply_markup=reply_markup)
         if ok:
             return
-        # If content didn't change, try updating just the keyboard, or just keep as-is.
         if "message is not modified" in (desc or "").lower():
-            # Try reply markup only; if that fails too, do nothing (but callback already acknowledged).
             _tg_edit_markup(chat_id, int(message_id), reply_markup=reply_markup)
             return
-        # If can't edit, fall back to sending a new message.
-        if ("message can't be edited" in (desc or "").lower()) or ("to edit" in (desc or "").lower()):
-            _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
-            return
-        # Unknown edit failure: fall back to send to avoid dead UI.
-        _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+        # No fallback to sendMessage on callbacks.
         return
+
+    # No message to edit (e.g., /start): send a new message.
     _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
     """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
     if not (TELEGRAM_BOT_TOKEN and callback_id):
@@ -500,7 +496,10 @@ def _self_check(fix: bool = True) -> Dict[str, Any]:
         # actions
         "do_analyze", "do_top", "pick_d1", "pick_m5",
         "ai_top_ev", "ai_top_prob", "ai_top_m5", "ai_symbol_start", "ai_cancel",
-        "review_signals", "weekly_report",
+	        "review_signals", "weekly_report",
+	        # my signals menu
+	        "my_sig_menu", "my_sig_review", "my_sig_list", "my_sig_refresh",
+	        "my_sig_delete", "my_sig_delall",
         # toggles / misc
         "toggle_notify", "toggle_silent", "toggle_ai_predict", "toggle_resend",
         "set_capital_custom",
@@ -516,6 +515,8 @@ def _self_check(fix: bool = True) -> Dict[str, Any]:
         "set_window:",
         "set_risk_aplus:", "set_risk_a:", "set_risk_b:",
         "set_interval:",
+	        # my signals delete item
+	        "del_sig:",
     ]
 
     markups = [
@@ -1860,7 +1861,7 @@ def telegram_webhook():
             # IMPORTANT: acknowledge callback fast to avoid spinner/retries
             _tg_answer_callback(callback_id)
             if not _is_admin(user_id):
-                _send("⛔ هذا البوت للأدمن فقط.")
+                _ui("⛔ هذا البوت للأدمن فقط.", reply_markup=_build_menu(_settings()))
                 return jsonify({"ok": True})
             settings = _settings()
             _run_due_paper_reviews()
@@ -2192,7 +2193,7 @@ def telegram_webhook():
             if action == "set_capital_custom":
                 from core.storage import set_user_state
                 set_user_state(str(chat_id), "pending", "capital")
-                _send("✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
+                _ui("✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
                 return jsonify({"ok": True})
             if action.startswith("set_capital:"):
                 val = action.split(":", 1)[1]
@@ -2303,7 +2304,7 @@ def telegram_webhook():
                 if tf == "m5":
                     ms = _market_status_cached()
                     if not ms.get("is_open", True):
-                        _tg_send(chat, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1.", silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        _tg_ui(chat, message_id, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                         return jsonify({"ok": True})
 
                 # 1) Try immediate response from cache
@@ -2317,7 +2318,7 @@ def telegram_webhook():
                             set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                         except Exception:
                             pass
-                        _tg_send(chat, _format_pick_m5(pick), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                        _tg_ui(chat, message_id, _format_pick_m5(pick), reply_markup=_build_pick_kb())
                     else:
                         c = pick.get("candidate")
                         if isinstance(c, Candidate):
@@ -2331,9 +2332,9 @@ def telegram_webhook():
                                 set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                             except Exception:
                                 pass
-                            _tg_send(chat, _format_pick_d1(c, _settings()), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                            _tg_ui(chat, message_id, _format_pick_d1(c, _settings()), reply_markup=_build_pick_kb())
                         else:
-                            _tg_send(chat, "⚠️ لا توجد نتيجة D1 جاهزة الآن، جاري التحديث...")
+                            _tg_ui(chat, message_id, "⚠️ لا توجد نتيجة D1 جاهزة الآن، جاري التحديث...", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                     return jsonify({"ok": True})
 
                 # 2) If cache empty/stale: start refresh in background and AUTO-SEND when ready
@@ -2342,11 +2343,11 @@ def telegram_webhook():
                 started = _PICK_IN_PROGRESS.get(key)
                 if started and (now - float(started)) < 180:
                     # already running
-                    _tg_send(chat, "⏳ لا يزال جاري تجهيز النتائج... سيتم إرسالها تلقائياً عند الجاهزية.", silent=True)
+                    _tg_ui(chat, message_id, "⏳ لا يزال جاري تجهيز النتائج... سيتم تحديث نفس الرسالة عند الجاهزية.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                     return jsonify({"ok": True})
 
                 _PICK_IN_PROGRESS[key] = now
-                _tg_send(chat, "⏳ جاري تجهيز النتائج... سيتم إرسالها تلقائياً عند الجاهزية.", silent=True)
+                _tg_ui(chat, message_id, "⏳ جاري تجهيز النتائج... سيتم تحديث نفس الرسالة عند الجاهزية.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
 
                 def _refresh_and_send():
                     try:
@@ -2358,7 +2359,7 @@ def telegram_webhook():
                         # After refresh, pull a pick and send it
                         pick2 = _get_next_pick(tf, chat)
                         if not pick2:
-                            _tg_send(chat, "❌ ما قدرت أجهز فرص حالياً (قد يكون السوق مغلق/بيانات غير كافية). جرّب لاحقاً.", silent=True)
+                            _tg_ui(chat, message_id, "❌ ما قدرت أجهز فرص حالياً (قد يكون السوق مغلق/بيانات غير كافية). جرّب لاحقاً.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                             return
 
                         if tf == "m5":
@@ -2369,7 +2370,7 @@ def telegram_webhook():
                                 set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                             except Exception:
                                 pass
-                            _tg_send(chat, _format_pick_m5(pick2), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                            _tg_ui(chat, message_id, _format_pick_m5(pick2), reply_markup=_build_pick_kb())
                         else:
                             c2 = pick2.get("candidate")
                             if isinstance(c2, Candidate):
@@ -2383,12 +2384,12 @@ def telegram_webhook():
                                     set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                                 except Exception:
                                     pass
-                                _tg_send(chat, _format_pick_d1(c2, _settings()), reply_markup=_build_pick_kb(), silent=_get_bool(_settings(), "NOTIFY_SILENT", True))
+                                _tg_ui(chat, message_id, _format_pick_d1(c2, _settings()), reply_markup=_build_pick_kb())
                             else:
-                                _tg_send(chat, "⚠️ تم تحديث D1 لكن النتيجة غير صالحة.", silent=True)
+                                _tg_ui(chat, message_id, "⚠️ تم تحديث D1 لكن النتيجة غير صالحة.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                     except Exception as e:
                         # IMPORTANT: show error to admin instead of swallowing it
-                        _tg_send(chat, f"❌ خطأ أثناء تجهيز فرص {tf.upper()}:\n{e}", silent=True)
+                        _tg_ui(chat, message_id, f"❌ خطأ أثناء تجهيز فرص {tf.upper()}:\n{e}", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
                     finally:
                         _PICK_IN_PROGRESS.pop(key, None)
 
@@ -2396,13 +2397,15 @@ def telegram_webhook():
                 return jsonify({"ok": True})
             if action in ("do_analyze", "do_top"):
                 settings = _settings()
-                _tg_ui(str(chat_id), message_id, "⏳ جاري التحليل...")
+                # BotFather-like: keep everything in the same message
+                _tg_ui(str(chat_id), message_id, "⏳ جاري التحليل...", reply_markup=_ikb([[('⬅️ رجوع', 'menu')]]))
                 def _job():
                     try:
                         msg, _ = _run_scan_and_build_message(settings)
-                        send_telegram(msg)
+                        # Update the same message with results (no extra spam)
+                        _tg_ui(str(chat_id), message_id, msg, reply_markup=_ikb([[('⬅️ رجوع', 'menu')], [('🔁 فحص جديد', action)]]))
                     except Exception as e:
-                        _tg_ui(str(chat_id), message_id, f"❌ خطأ أثناء الفحص:\n{e}")
+                        _tg_ui(str(chat_id), message_id, f"❌ خطأ أثناء الفحص:\n{e}", reply_markup=_ikb([[('⬅️ رجوع', 'menu')]]))
                 _run_async(_job)
                 return jsonify({"ok": True})
             # Unknown action
@@ -2477,13 +2480,13 @@ def telegram_webhook():
             _tg_ui(str(chat_id), message_id, "استخدم: /wl أو /wl add TSLA أو /wl del TSLA")
             return jsonify({"ok": True})
         if text.startswith("/analyze"):
-            _tg_ui(str(chat_id), message_id, "⏳ جاري التحليل...")
+            _tg_ui(str(chat_id), message_id, "⏳ جاري التحليل...", reply_markup=_ikb([[('⬅️ رجوع', 'menu')]]))
             def _job():
                 try:
                     msg, _ = _run_scan_and_build_message(settings)
-                    send_telegram(msg)
+                    _tg_ui(str(chat_id), message_id, msg, reply_markup=_ikb([[('⬅️ رجوع', 'menu')], [('🔁 فحص جديد', 'do_analyze')]]))
                 except Exception as e:
-                    _tg_ui(str(chat_id), message_id, f"❌ خطأ أثناء الفحص:\n{e}")
+                    _tg_ui(str(chat_id), message_id, f"❌ خطأ أثناء الفحص:\n{e}", reply_markup=_ikb([[('⬅️ رجوع', 'menu')]]))
             _run_async(_job)
             return jsonify({"ok": True})
         if text.startswith("/ai"):
