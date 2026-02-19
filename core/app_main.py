@@ -1924,7 +1924,7 @@ def telegram_webhook():
                 )
                 return jsonify({"ok": True})
 
-if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
+            if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
                 s = _settings()
                 # 3) M5 uses intraday cache (fast)
                 if action == "ai_top_m5":
