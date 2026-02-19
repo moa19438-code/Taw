@@ -1812,7 +1812,16 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
             if chat_id is not None and action:
-                if _seen_and_mark(_ACTION_SEEN, f"{chat_id}:{action}", float(_ACTION_DEBOUNCE_SEC)):
+                # Don't debounce lightweight UI/navigation actions; otherwise the UI feels "dead"
+                _ui_no_debounce = (
+                    action == "menu"
+                    or action.startswith("show_")
+                    or action.startswith("set_")
+                    or action.startswith("my_sig_")
+                    or action.startswith("wl_")
+                    or action in ("show_settings",)
+                )
+                if (not _ui_no_debounce) and _seen_and_mark(_ACTION_SEEN, f"{chat_id}:{action}", float(_ACTION_DEBOUNCE_SEC)):
                     _tg_answer_callback(callback_id, text="⏳ انتظر لحظة...", show_alert=False)
                     return jsonify({"ok": True})
 
