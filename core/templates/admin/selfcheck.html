@@ -1,0 +1,138 @@
+{% extends "admin/base.html" %}
+{% set title = "Self-Check" %}
+
+{% block content %}
+<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+  <div>
+    <h4 class="m-0">🧪 فحص الأزرار (Self‑Check)</h4>
+    <div class="small-muted">يعرض تغطية callback_data للأزرار داخل البوت، ويكشف الأزرار غير المعالجة أو مشاكل الرجوع.</div>
+  </div>
+  <div class="d-flex gap-2">
+    <a class="btn btn-outline-light btn-sm" href="{{ url_for('admin.selfcheck', fix=0) }}">🔎 فحص فقط</a>
+    <a class="btn btn-primary btn-sm" href="{{ url_for('admin.selfcheck', fix=1) }}">🛠️ فحص + إصلاح بسيط</a>
+  </div>
+</div>
+
+{% set c = report.counts or {} %}
+
+<div class="row g-3 mb-3">
+  <div class="col-12 col-md-3">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="small-muted">الحالة</div>
+        {% if report.ok %}
+          <div class="h4 m-0">✅ سليم</div>
+        {% else %}
+          <div class="h4 m-0">⚠️ يوجد مشاكل</div>
+        {% endif %}
+        <div class="small-muted mt-1">fix={{ 1 if fix else 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="small-muted">إجمالي الأزرار</div>
+        <div class="h4 m-0">{{ c.callbacks_total or 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="small-muted">بدون Handler</div>
+        <div class="h4 m-0">{{ c.missing_handlers or 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="small-muted">مشاكل الرجوع / التسميات</div>
+        <div class="h4 m-0">{{ (c.back_issues or 0) + (c.label_issues or 0) }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-12 col-lg-7">
+    <div class="card border-0 shadow-sm">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <div class="fw-semibold">🔻 أزرار بدون handler</div>
+        <span class="badge text-bg-secondary">{{ report.missing_handlers|length }}</span>
+      </div>
+      <div class="card-body">
+        {% if report.missing_handlers and report.missing_handlers|length > 0 %}
+          <div class="table-responsive">
+            <table class="table table-sm table-striped table-hover m-0">
+              <thead>
+                <tr>
+                  <th style="width: 30%">المكان</th>
+                  <th>callback_data</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for it in report.missing_handlers %}
+                <tr>
+                  <td><span class="badge text-bg-dark">{{ it.where }}</span></td>
+                  <td class="mono">{{ it.callback }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="alert alert-success m-0">✅ لا توجد أزرار مفقودة. كل الأزرار لها handler.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-5">
+    <div class="card border-0 shadow-sm mb-3">
+      <div class="card-header fw-semibold">🧩 مشاكل التسميات</div>
+      <div class="card-body">
+        {% if report.label_issues and report.label_issues|length > 0 %}
+          <ul class="m-0">
+            {% for it in report.label_issues %}
+              <li class="mono">{{ it }}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="alert alert-success m-0">✅ لا توجد مشاكل تسميات.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card border-0 shadow-sm">
+      <div class="card-header fw-semibold">↩️ مشاكل أزرار الرجوع</div>
+      <div class="card-body">
+        {% if report.back_issues and report.back_issues|length > 0 %}
+          <ul class="m-0">
+            {% for it in report.back_issues %}
+              <li class="mono">{{ it }}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="alert alert-success m-0">✅ لا توجد مشاكل رجوع.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if report.notes %}
+<div class="card border-0 shadow-sm mt-3">
+  <div class="card-header fw-semibold">ℹ️ ملاحظات</div>
+  <div class="card-body">
+    <ul class="m-0">
+      {% for n in report.notes %}
+        <li>{{ n }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -4,94 +4,38 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>{{ title or "Taw Dashboard" }}</title>
-
-    <!-- Fonts + Icons -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
-
-    <!-- Theme (Bootswatch) -->
-    <link id="bsTheme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.3/dist/darkly/bootstrap.min.css">
-
-    <!-- Custom dashboard styles -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='admin/dashboard.css') }}">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.3/dist/darkly/bootstrap.min.css">
+    <style>
+      body { padding-top: 70px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .small-muted { font-size: .9rem; opacity: .85; }
+      .table td, .table th { vertical-align: middle; }
+    </style>
   </head>
-
   <body>
-    <!-- Topbar -->
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary fixed-top shadow-sm">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary fixed-top">
       <div class="container-fluid">
-        <a class="navbar-brand d-flex align-items-center gap-2" href="{{ url_for('admin.index') }}">
-          <i class="bi bi-speedometer2"></i>
-          <span>Taw Dashboard</span>
-          <span class="badge rounded-pill text-bg-dark ms-2 d-none d-md-inline">Admin</span>
-        </a>
-
-        <div class="d-flex align-items-center gap-2">
-          <button class="btn btn-sm btn-outline-light d-none d-md-inline" type="button" id="themeToggle" title="تبديل الثيم">
-            <i class="bi bi-moon-stars"></i>
-            <span class="ms-1">ثيم</span>
-          </button>
-
-          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav" aria-label="Toggle navigation">
-            <span class="navbar-toggler-icon"></span>
-          </button>
-        </div>
-
+        <a class="navbar-brand" href="{{ url_for('admin.index') }}">Taw Dashboard</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav">
+          <span class="navbar-toggler-icon"></span>
+        </button>
         <div class="collapse navbar-collapse" id="nav">
-          <div class="ms-auto d-flex align-items-center gap-3 mt-3 mt-lg-0">
-            <span class="navbar-text small-muted">
-              <i class="bi bi-shield-lock me-1"></i> حماية Basic Auth
-            </span>
-          </div>
+          <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin.index') }}">الرئيسية</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin.paper') }}">شاراتي (7 أيام)</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin.signals') }}">التعلّم (Signals)</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin.wl') }}">WL</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin.selfcheck') }}">Self‑Check</a></li>
+          </ul>
+          <span class="navbar-text small-muted">حماية Basic Auth</span>
         </div>
       </div>
     </nav>
 
-    <!-- Layout -->
-    <div class="dash-wrap">
-      <aside class="dash-sidebar">
-        <div class="dash-sidebar-inner">
-          <div class="dash-section-title">التنقل</div>
-
-          <a class="dash-link {% if request.path == url_for('admin.index') %}active{% endif %}" href="{{ url_for('admin.index') }}">
-            <i class="bi bi-grid-1x2-fill"></i><span>الرئيسية</span>
-          </a>
-
-          <a class="dash-link {% if request.path.startswith(url_for('admin.paper')) %}active{% endif %}" href="{{ url_for('admin.paper') }}">
-            <i class="bi bi-receipt"></i><span>شاراتي (Paper)</span>
-          </a>
-
-          <a class="dash-link {% if request.path.startswith(url_for('admin.signals')) %}active{% endif %}" href="{{ url_for('admin.signals') }}">
-            <i class="bi bi-lightning-charge"></i><span>Signals</span>
-          </a>
-
-          <a class="dash-link {% if request.path.startswith(url_for('admin.wl')) %}active{% endif %}" href="{{ url_for('admin.wl') }}">
-            <i class="bi bi-bookmark-star"></i><span>Watchlist</span>
-          </a>
-
-          <div class="dash-divider"></div>
-          <div class="dash-section-title">اختصارات</div>
-
-          <a class="dash-link" href="{{ url_for('admin.index') }}#maintenance">
-            <i class="bi bi-wrench-adjustable"></i><span>صيانة</span>
-          </a>
-
-          <div class="dash-sidebar-footer">
-            <div class="small-muted">آخر تحديث للواجهة: <span class="mono">v2</span></div>
-          </div>
-        </div>
-      </aside>
-
-      <main class="dash-main">
-        <div class="container-fluid py-3">
-          {% block content %}{% endblock %}
-        </div>
-      </main>
-    </div>
+    <main class="container-fluid">
+      {% block content %}{% endblock %}
+    </main>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="{{ url_for('static', filename='admin/dashboard.js') }}"></script>
   </body>
 </html>
