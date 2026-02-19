@@ -284,8 +284,9 @@ def _build_pick_kb() -> Dict[str, Any]:
     """Actions for a single pick (manual simulation)."""
     return _ikb([
         [("📝 سجّل كأني دخلت", "paper_log")],
-        [("⬅️ رجوع", "menu")],
+        [("➡️ التالي", "pick_next"), ("⬅️ رجوع", "menu")],
     ])
+
 
 
 
@@ -497,7 +498,7 @@ def _self_check(fix: bool = True) -> Dict[str, Any]:
         "show_sl", "show_tp", "show_send", "show_window", "show_interval", "show_risk",
         "show_notify_route", "show_horizon",
         # actions
-        "do_analyze", "do_top", "pick_d1", "pick_m5",
+        "do_analyze", "do_top", "pick_d1", "pick_m5", "pick_next",
         "ai_top_ev", "ai_top_prob", "ai_top_m5", "ai_symbol_start", "ai_cancel",
 	        "review_signals", "weekly_report",
 	        # my signals menu
@@ -2299,6 +2300,58 @@ def telegram_webhook():
                 s = _settings()
                 _tg_ui(str(chat_id), message_id, f"✅ تم ضبط فترة الفحص: {val} دقيقة", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
+
+            if action == "pick_next":
+                # Show next cached pick for the last mode (D1/M5) without going back to the main menu
+                chat = str(chat_id)
+                tf = "d1"
+                try:
+                    from core.storage import get_user_state
+                    raw = get_user_state(chat, "last_pick") or ""
+                    info = json.loads(raw) if raw else {}
+                    tf = "m5" if str(info.get("mode") or "").lower() == "m5" else "d1"
+                except Exception:
+                    tf = "d1"
+
+                # Market-hours filter for scalping signals
+                if tf == "m5":
+                    ms = _market_status_cached()
+                    if not ms.get("is_open", True):
+                        _tg_ui(chat, message_id, _format_market_status_line(ms) + "\n\n⛔ إشارات M5 تُرسل فقط وقت فتح السوق (لتفادي سيولة ضعيفة).\nجرّب زر D1.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                        return jsonify({"ok": True})
+
+                pick = _get_next_pick(tf, chat)
+                if not pick:
+                    _tg_ui(chat, message_id, "⚠️ لا توجد نتائج جاهزة الآن. جرّب تحديث الفحص ثم أعد المحاولة.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                    return jsonify({"ok": True})
+
+                if tf == "m5":
+                    try:
+                        from core.storage import set_user_state
+                        entry_p = float(pick.get("last") or 0.0)
+                        info2 = {"symbol": str(pick.get("symbol") or "").upper(), "mode": "m5", "side": "buy", "entry": entry_p, "score": float(pick.get("score") or 0.0), "strength": "B"}
+                        set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
+                    except Exception:
+                        pass
+                    _tg_ui(chat, message_id, _format_pick_m5(pick), reply_markup=_build_pick_kb())
+                else:
+                    c = pick.get("candidate")
+                    if isinstance(c, Candidate):
+                        try:
+                            from core.storage import set_user_state
+                            s0 = _settings()
+                            live_p0, _ = _get_live_trade_price(c.symbol)
+                            entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
+                            plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
+                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                            set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
+                        except Exception:
+                            pass
+                        _tg_ui(chat, message_id, _format_pick_d1(c, _settings()), reply_markup=_build_pick_kb())
+                    else:
+                        _tg_ui(chat, message_id, "⚠️ تم العثور على نتيجة لكن غير صالحة.", reply_markup=_ikb([[("⬅️ رجوع", "menu")]]))
+                return jsonify({"ok": True})
+
             if action in ("pick_m5", "pick_d1"):
                 tf = "m5" if action == "pick_m5" else "d1"
                 chat = str(chat_id)
