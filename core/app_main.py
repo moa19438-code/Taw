@@ -1827,6 +1827,17 @@ def telegram_webhook():
             action = (cb.get("data") or "").strip()
             callback_id = cb.get("id")
 
+            # Convenience aliases for BotFather-like UX (edit same message on button clicks)
+            _chat = str(chat_id) if chat_id is not None else ""
+            _mid: Optional[int] = int(message_id) if message_id is not None else None
+
+            def _ui(text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
+                _tg_ui(_chat, _mid, text, reply_markup=reply_markup, silent=silent)
+
+            def _send(text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
+                """Force a new message (use sparingly)."""
+                _tg_send(_chat, text, reply_markup=reply_markup, silent=silent)
+
             # Dedupe / Debounce BEFORE ack text so user gets immediate feedback
             if callback_id and _seen_and_mark(_CB_SEEN, str(callback_id), float(_CB_TTL_SEC)):
                 _tg_answer_callback(callback_id, text="⏳ تم تنفيذ هذا الزر للتو", show_alert=False)
@@ -1849,16 +1860,16 @@ def telegram_webhook():
             # IMPORTANT: acknowledge callback fast to avoid spinner/retries
             _tg_answer_callback(callback_id)
             if not _is_admin(user_id):
-                _tg_send(str(chat_id), "⛔ هذا البوت للأدمن فقط.")
+                _send("⛔ هذا البوت للأدمن فقط.")
                 return jsonify({"ok": True})
             settings = _settings()
             _run_due_paper_reviews()
             if action == "self_check":
                 try:
                     rep = _self_check(fix=False)
-                    _tg_send(str(chat_id), _self_check_text(rep), reply_markup=_build_menu(_settings()))
+                    _ui(_self_check_text(rep), reply_markup=_build_menu(_settings()))
                 except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ في الفحص الذاتي:\n{e}", reply_markup=_build_menu(_settings()))
+                    _ui(f"❌ خطأ في الفحص الذاتي:\n{e}", reply_markup=_build_menu(_settings()))
                 return jsonify({"ok": True})
 
             if action == "paper_log":
@@ -1866,7 +1877,7 @@ def telegram_webhook():
                     from core.storage import get_user_state, set_user_state
                     raw = get_user_state(str(chat_id), "last_pick") or ""
                     if not raw:
-                        _tg_send(str(chat_id), "⚠️ لا يوجد آخر سهم محفوظ. اضغط D1 أو M5 أولاً.")
+                        _ui("⚠️ لا يوجد آخر سهم محفوظ. اضغط D1 أو M5 أولاً.", reply_markup=_build_menu(_settings()))
                         return jsonify({"ok": True})
                     info = json.loads(raw)
                     symbol = (info.get("symbol") or "").upper().strip()
@@ -1878,7 +1889,7 @@ def telegram_webhook():
                     score = float(info.get("score") or 0.0)
                     strength = (info.get("strength") or "B")
                     if not symbol or entry <= 0:
-                        _tg_send(str(chat_id), "⚠️ بيانات الإشارة غير مكتملة.")
+                        _ui("⚠️ بيانات الإشارة غير مكتملة.", reply_markup=_build_menu(_settings()))
                         return jsonify({"ok": True})
 
                     ts = datetime.now(timezone.utc).isoformat()
@@ -1899,28 +1910,28 @@ def telegram_webhook():
                         model_prob=None,
                     )
                     if sig_id is None:
-                        _tg_send(str(chat_id), f"📝 تم تسجيل صفقة وهمية لـ {symbol}. سأراجعها بعد 24 ساعة.")
+                        _ui(f"📝 تم تسجيل صفقة وهمية لـ {symbol}. سأراجعها بعد 24 ساعة.", reply_markup=_build_menu(_settings()))
                         return jsonify({"ok": True})
 
                     due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
                     add_paper_trade(str(chat_id), int(sig_id), due)
                     set_user_state(str(chat_id), "last_pick_logged", ts)
-                    _tg_send(str(chat_id), f"📝 تم تسجيل صفقة وهمية لـ {symbol} بسعر {entry:.4g}$\nسأراجعها بعد 24 ساعة تلقائياً ✅", silent=True)
+                    _ui(f"📝 تم تسجيل صفقة وهمية لـ {symbol} بسعر {entry:.4g}$\nسأراجعها بعد 24 ساعة تلقائياً ✅", reply_markup=_build_menu(_settings()), silent=True)
                 except Exception as e:
-                    _tg_send(str(chat_id), f"❌ خطأ أثناء تسجيل الصفقة الوهمية:\n{e}")
+                    _ui(f"❌ خطأ أثناء تسجيل الصفقة الوهمية:\n{e}", reply_markup=_build_menu(_settings()))
                 return jsonify({"ok": True})
 
 
             # ================= التقرير الأسبوعي =================
             if action == "weekly_report":
-                _tg_send(str(chat_id), "⏳ جاري إعداد التقرير الأسبوعي...")
+                _ui("⏳ جاري إعداد التقرير الأسبوعي...")
                 def _job():
                     try:
                         days = int(_get_int(_settings(), "WEEKLY_REPORT_DAYS", 7))
                         msg = _weekly_report(days=days)
-                        _tg_send(str(chat_id), msg, reply_markup=_build_menu(_settings()))
+                        _tg_ui(_chat, _mid, msg, reply_markup=_build_menu(_settings()))
                     except Exception as e:
-                        _tg_send(str(chat_id), f"❌ خطأ أثناء إنشاء التقرير الأسبوعي:\n{e}", reply_markup=_build_menu(_settings()))
+                        _tg_ui(_chat, _mid, f"❌ خطأ أثناء إنشاء التقرير الأسبوعي:\n{e}", reply_markup=_build_menu(_settings()))
                 _run_async(_job)
                 return jsonify({"ok": True})
 
@@ -1948,22 +1959,14 @@ def telegram_webhook():
             # 📌 شاراتي المحفوظة
             if action in ("my_sig_list", "my_sig_refresh"):
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
-                _tg_send(
-                    str(chat_id),
-                    msg,
-                    reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"),
-                )
+                _ui(msg, reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"))
                 return jsonify({"ok": True})
 
             # 🗑 حذف صفقة واحدة
             if action == "my_sig_delete":
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
                 if not items:
-                    _tg_send(
-                        str(chat_id),
-                        msg,
-                        reply_markup=_build_my_signals_kb(has_items=False, back_action="my_sig_menu"),
-                    )
+                    _ui(msg, reply_markup=_build_my_signals_kb(has_items=False, back_action="my_sig_menu"))
                     return jsonify({"ok": True})
                 _tg_ui(str(chat_id), message_id, "اختر الإشارة التي تريد حذفها:", reply_markup=_build_my_signals_delete_kb(items))
                 return jsonify({"ok": True})
@@ -1988,11 +1991,7 @@ def telegram_webhook():
                     _tg_ui(str(chat_id), message_id, f"❌ تعذر الحذف:\n{e}")
                 # show updated list
                 msg, items = _my_saved_signals_message(str(chat_id), lookback_days=7, limit=80)
-                _tg_send(
-                    str(chat_id),
-                    msg,
-                    reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"),
-                )
+                _ui(msg, reply_markup=_build_my_signals_kb(has_items=bool(items), back_action="my_sig_menu"))
                 return jsonify({"ok": True})
 
             if action in ("ai_top_ev", "ai_top_prob", "ai_top_m5"):
@@ -2099,12 +2098,12 @@ def telegram_webhook():
             if action == "ai_symbol_start":
                 from core.storage import set_user_state
                 set_user_state(str(chat_id), "pending", "ai_symbol")
-                _tg_send(str(chat_id), "🧠 اكتب رمز السهم الآن (مثال: TSLA)\nأو اكتب /ai TSLA", reply_markup=_build_ai_start_kb())
+                _ui("🧠 اكتب رمز السهم الآن (مثال: TSLA)\nأو اكتب /ai TSLA", reply_markup=_build_ai_start_kb())
                 return jsonify({"ok": True})
             if action == "ai_cancel":
                 from core.storage import clear_user_state
                 clear_user_state(str(chat_id), "pending")
-                _tg_send(str(chat_id), "✅ تم الإلغاء.", reply_markup=_build_menu(_settings()))
+                _ui("✅ تم الإلغاء.", reply_markup=_build_menu(_settings()))
                 return jsonify({"ok": True})
             if action == "show_modes":
                 _tg_ui(str(chat_id), message_id, "📆 اختر الخطة الزمنية:", reply_markup=_build_modes_kb())
@@ -2128,13 +2127,13 @@ def telegram_webhook():
                 cur = _get_bool(settings, "AUTO_NOTIFY", True)
                 set_setting("AUTO_NOTIFY", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
+                _ui("✅ تم تحديث التنبيهات.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "toggle_ai_predict":
                 cur = _get_bool(settings, "AI_PREDICT_ENABLED", False)
                 set_setting("AI_PREDICT_ENABLED", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث تنبؤ AI.", reply_markup=_build_settings_kb(settings))
+                _ui("✅ تم تحديث تنبؤ AI.", reply_markup=_build_settings_kb(settings))
                 return jsonify({"ok": True})
             if action == "show_horizon":
                 _tg_ui(str(chat_id), message_id, "🤖 اختر إطار التنبؤ (يؤثر على تحليل AI فقط):", reply_markup=_build_horizon_kb(settings))
@@ -2164,7 +2163,7 @@ def telegram_webhook():
                 cur = _get_bool(settings, "NOTIFY_SILENT", True)
                 set_setting("NOTIFY_SILENT", "0" if cur else "1")
                 settings = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
+                _ui("✅ تم تحديث وضع الصامت.", reply_markup=_build_menu(settings))
                 return jsonify({"ok": True})
             if action == "show_settings":
                 s = _settings()
@@ -2193,13 +2192,13 @@ def telegram_webhook():
             if action == "set_capital_custom":
                 from core.storage import set_user_state
                 set_user_state(str(chat_id), "pending", "capital")
-                _tg_send(str(chat_id), "✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
+                _send("✍️ أرسل رقم رأس المال بالدولار (مثال: 5000)")
                 return jsonify({"ok": True})
             if action.startswith("set_capital:"):
                 val = action.split(":", 1)[1]
                 set_setting("CAPITAL_USD", val)
                 s = _settings()
-                _tg_send(str(chat_id), f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
+                _ui(f"✅ تم ضبط رأس المال: {val}$", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
             if action == "show_position":
                 _tg_ui(str(chat_id), message_id, "📦 اختر نسبة حجم الصفقة من رأس المال:", reply_markup=_build_position_kb())
@@ -2243,7 +2242,7 @@ def telegram_webhook():
                 cur = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
                 set_setting("ALLOW_RESEND_IF_STRONGER", "0" if cur else "1")
                 s = _settings()
-                _tg_send(str(chat_id), "✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
+                _ui("✅ تم تحديث خيار إعادة الإرسال.", reply_markup=_build_settings_kb(s))
                 return jsonify({"ok": True})
             if action == "show_window":
                 _tg_ui(str(chat_id), message_id, "🕒 اختر نافذة السوق (بتوقيت الرياض):", reply_markup=_build_window_kb())
