@@ -1197,6 +1197,78 @@ def clear_paper_trades_for_chat(chat_id: str) -> int:
         con.commit()
     return int(deleted)
 
+
+def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """List frozen 24h paper-review snapshots for a chat (does NOT change over time).
+
+    These rows are written by the 24h paper review runner (kind=paper_24h_final) into signal_reviews.note as JSON.
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=int(lookback_days))).isoformat()
+    like_pat = '%"kind":"paper_24h_final"%'
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        pt.id AS paper_id,
+                        pt.chat_id,
+                        pt.signal_id,
+                        pt.due_ts,
+                        r.ts AS review_ts,
+                        r.close AS exit_price,
+                        r.return_pct,
+                        r.note,
+                        s.signal_ts,
+                        s.symbol,
+                        s.mode,
+                        s.side,
+                        s.score,
+                        s.entry
+                    FROM paper_trades pt
+                    JOIN signals s ON s.id = pt.signal_id
+                    JOIN signal_reviews r ON r.signal_id = pt.signal_id
+                    WHERE pt.chat_id = %s
+                      AND r.ts >= %s
+                      AND r.note LIKE %s
+                    ORDER BY r.ts DESC
+                    LIMIT %s
+                    """,
+                    (str(chat_id), cutoff, like_pat, int(limit)),
+                )
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+                pt.id AS paper_id,
+                pt.chat_id,
+                pt.signal_id,
+                pt.due_ts,
+                r.ts AS review_ts,
+                r.close AS exit_price,
+                r.return_pct,
+                r.note,
+                s.ts AS signal_ts,
+                s.symbol,
+                s.mode,
+                s.side,
+                s.score,
+                s.entry
+            FROM paper_trades pt
+            JOIN signals s ON s.id = pt.signal_id
+            JOIN signal_reviews r ON r.signal_id = pt.signal_id
+            WHERE pt.chat_id = ?
+              AND r.ts >= ?
+              AND r.note LIKE ?
+            ORDER BY r.ts DESC
+            LIMIT ?
+            """,
+            (str(chat_id), cutoff, like_pat, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 def cleanup_old_paper_trades(retention_days: int = 7) -> int:
     """Auto-clean paper_trades older than retention_days (signals stay for learning). Returns deleted count."""
     cutoff = (datetime.utcnow() - timedelta(days=int(retention_days))).isoformat()
