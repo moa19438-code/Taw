@@ -122,26 +122,44 @@ _LAST_PAPER_REVIEW_RUN = 0.0
 _CB_TTL_SEC = int(os.getenv('TG_CB_TTL_SEC', '600'))  # 10 minutes default
 _ACTION_DEBOUNCE_SEC = float(os.getenv('TG_ACTION_DEBOUNCE_SEC', '2.5'))
 
-def _tg_edit(chat_id: str, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
-    """Edit an existing bot message (used for inline keyboard navigation to avoid sending new messages)."""
+def _tg_edit(chat_id: str, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
+    """Edit an existing bot message. Returns True if Telegram accepted the edit.
+
+    Telegram edits can fail for non-exception reasons (e.g., message not modified, message can't be edited),
+    so we check the HTTP/JSON response and let the caller decide whether to fall back to sendMessage.
+    """
     if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
-        return
+        return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": int(message_id), "text": text}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=float(HTTP_TIMEOUT_SEC))
+        r = requests.post(url, json=payload, timeout=float(HTTP_TIMEOUT_SEC))
+        if r.status_code != 200:
+            return False
+        try:
+            j = r.json()
+        except Exception:
+            return False
+        return bool(j.get("ok"))
     except Exception:
-        pass
+        return False
+
+
 
 
 def _tg_ui(chat_id: str, message_id: Optional[int], text: str, reply_markup: Optional[Dict[str, Any]] = None, silent: bool = False) -> None:
-    """Prefer editing the current message (if we have message_id), otherwise send a new message."""
+    """UI helper:
+    - If we have a message_id (from an inline button click), prefer editing the same message.
+    - If edit fails (Telegram rejects it), fall back to sending a new message so the user always sees a response.
+    """
     if message_id:
-        _tg_edit(chat_id, int(message_id), text, reply_markup=reply_markup)
-    else:
-        _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+        ok = _tg_edit(chat_id, int(message_id), text, reply_markup=reply_markup)
+        if ok:
+            return
+    _tg_send(chat_id, text, reply_markup=reply_markup, silent=silent)
+
 def _tg_answer_callback(callback_id: Optional[str], text: Optional[str] = None, show_alert: bool = False) -> None:
     """Acknowledge Telegram inline button click quickly to avoid retries/spinner."""
     if not (TELEGRAM_BOT_TOKEN and callback_id):
