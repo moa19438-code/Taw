@@ -328,6 +328,12 @@ def _build_my_sig_24h_kb(back_action: str = "my_sig_menu") -> Dict[str, Any]:
         [("🔄 تحديث", "my_sig_24h_refresh"), ("⬅️ رجوع", back_action)],
     ])
 
+
+def _build_my_sig_review_kb(back_action: str = "my_sig_menu") -> Dict[str, Any]:
+    return _ikb([
+        [("🔄 تحديث", "my_sig_review_refresh"), ("⬅️ رجوع", back_action)],
+    ])
+
 def _build_settings_kb(s: Dict[str, str]) -> Dict[str, Any]:
     ai_on = "ON" if _get_bool(s, "AI_PREDICT_ENABLED", False) else "OFF"
     notify_on = "ON" if _get_bool(s, "AUTO_NOTIFY", True) else "OFF"
@@ -1986,10 +1992,11 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
             # 📈 مراجعة الأداء (مرتبطة بالشارات المحفوظة فقط)
-            if action == "my_sig_review":
+            if action in ("my_sig_review", "my_sig_review_refresh"):
                 msg = _review_my_saved_performance(str(chat_id), lookback_days=2, limit=80)
-                _tg_ui(str(chat_id), message_id, msg, reply_markup=_ikb([[("⬅️ رجوع", "my_sig_menu")]]))
+                _tg_ui(str(chat_id), message_id, msg, reply_markup=_build_my_sig_review_kb(back_action="my_sig_menu"))
                 return jsonify({"ok": True})
+
 
             
             # 📊 مراجعات 24 ساعة (مقفلة)
@@ -2941,90 +2948,134 @@ def _my_saved_signals_message(chat_id: str, lookback_days: int = 7, limit: int =
 
 
 def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: int = 50) -> str:
-    """Review ONLY the user's saved paper trades using latest daily close (exploration).
+    """Review ONLY the user's saved paper trades.
 
-    Important: this review is tied to the same list the user can delete from (paper_trades),
-    so deleting a saved trade removes it from this review.
+    - Uses the signal timestamp (signal_ts) from the originating signal (not the paper-trade row).
+    - Splits results into: completed (>= due_ts) vs pending (< due_ts).
+    - Win/Loss counts are calculated ONLY for completed rows.
+    - When market is closed, we may show/use a more recent LIVE last-trade price if available.
     """
     now = datetime.now(timezone.utc)
     try:
         from core.storage import list_paper_trades_for_chat
-        rows = list_paper_trades_for_chat(chat_id, limit=max(20, int(limit)))
+        rows = list_paper_trades_for_chat(chat_id, lookback_days=max(1, int(lookback_days)), limit=max(20, int(limit)))
     except Exception:
         rows = []
     if not rows:
         return "لا توجد شارات محفوظة لمراجعتها الآن."
 
     reviewed = 0
+    completed = 0
+    pending = 0
     winners = 0
     losers = 0
     lines: List[str] = []
-    seen = set()
+    seen: set[tuple] = set()
 
     for r in rows:
         try:
-            ts = r.get("ts") or r.get("created_ts") or ""
+            ts = r.get("signal_ts") or r.get("ts") or r.get("created_ts") or ""
             if ts:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if (now - dt).days > int(lookback_days):
+                sig_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if (now - sig_dt).days > int(lookback_days):
                     continue
             else:
-                dt = now
+                sig_dt = now
+
+            due_ts = r.get("due_ts") or ""
+            try:
+                due_dt = datetime.fromisoformat(str(due_ts).replace("Z", "+00:00")) if due_ts else (sig_dt + timedelta(hours=24))
+            except Exception:
+                due_dt = sig_dt + timedelta(hours=24)
+
             symbol = (r.get("symbol") or "").upper().strip()
             mode = (r.get("mode") or "D1").upper().strip()
             side = (r.get("side") or "buy").lower().strip()
             entry = float(r.get("entry") or 0.0)
             if not symbol or entry <= 0:
                 continue
-            k = (symbol, mode, side, round(entry, 4))
+
+            k = (symbol, mode, side, round(entry, 4), str(ts)[:16])
             if k in seen:
                 continue
             seen.add(k)
 
-            data = bars([symbol], start=dt - timedelta(days=2), end=now + timedelta(days=1), timeframe="1Day", limit=50)
+            # Pull daily bars around the signal window (enough for MFE/MAE + last close)
+            data = bars([symbol], start=sig_dt - timedelta(days=6), end=now + timedelta(days=1), timeframe="1Day", limit=200)
             blist = (data.get("bars", {}).get(symbol) or [])
             if not blist:
                 continue
-            last_close = float(blist[-1].get("c") or entry)
+
+            # last daily close reference
+            last_bar = blist[-1]
+            last_close = float(last_bar.get("c") or entry)
+
+            # optional live last-trade price (after-hours / pre-market)
+            live_p, live_ts = _get_live_trade_price(symbol)
+            use_live = False
+            live_dt = None
+            if live_p is not None and live_ts:
+                try:
+                    live_dt = datetime.fromisoformat(str(live_ts).replace("Z", "+00:00"))
+                    # Use live only if it's reasonably fresh (after-hours / pre-market)
+                    use_live = (now - live_dt) <= timedelta(hours=36)
+                except Exception:
+                    use_live = False
+
+            price = float(live_p) if (use_live and live_p is not None) else last_close
+            price_label = "Last" if (use_live and live_p is not None) else "Close"
+
             highs = [float(b.get("h") or b.get("c") or entry) for b in blist]
             lows = [float(b.get("l") or b.get("c") or entry) for b in blist]
             max_high = max(highs) if highs else entry
             min_low = min(lows) if lows else entry
+
             if side == "sell":
-                ret = (entry - last_close) / entry * 100.0
+                ret = (entry - price) / entry * 100.0
                 mfe = (entry - min_low) / entry * 100.0
                 mae = (entry - max_high) / entry * 100.0
             else:
-                ret = (last_close - entry) / entry * 100.0
+                ret = (price - entry) / entry * 100.0
                 mfe = (max_high - entry) / entry * 100.0
                 mae = (min_low - entry) / entry * 100.0
 
-            label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
-            if ret > 0:
-                winners += 1
-            elif ret < 0:
-                losers += 1
+            is_completed = now >= due_dt
+            side_label = "شراء" if side != "sell" else "بيع"
+
+            if is_completed:
+                completed += 1
+                label = "✅" if ret > 0 else ("❌" if ret < 0 else "➖")
+                if ret > 0:
+                    winners += 1
+                elif ret < 0:
+                    losers += 1
+            else:
+                pending += 1
+                label = "⏳"
+
             reviewed += 1
 
             score = r.get("score")
+            score_str = f"{float(score):.1f}" if score is not None else "-"
+            t_short = str(ts)[:16]
             lines.append(
-                f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f} | Score: {float(score):.1f}"
-                if score is not None
-                else f"{label} {symbol} ({mode.lower()}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
+                f"{label} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret:.2f}% | {price_label}: {price:.2f} | Entry: {entry:.2f} | t: {t_short} | Score: {score_str} | MFE: {mfe:.2f}% | MAE: {mae:.2f}%"
             )
         except Exception:
             continue
 
     if reviewed == 0:
         return "لا توجد شارات حديثة ضمن فترة المراجعة."
+
     header = (
         f"📈 مراجعة الإشارات (آخر {lookback_days} يوم):\n"
         f"— تمت مراجعة: {reviewed}\n"
-        f"— رابحة: {winners} | خاسرة: {losers}\n"
-        f"ملاحظة: هذا قياس استكشافي حسب آخر إغلاق/آخر شمعة، وليس تنفيذًا فعليًا.\n"
+        f"— مكتملة: {completed} (رابحة: {winners} | خاسرة: {losers})\n"
+        f"— غير مكتملة: {pending} (قياس لحظي فقط)\n"
+        f"ملاحظة: إذا كان السوق مقفل، قد نعرض Last (بعد الإغلاق/قبل الافتتاح) بدل Close.\n"
     )
     body = "\n".join(lines[:25])
-    return header + "\n" + body
+    return header + "\n" + body + ("\n\n... (+ المزيد)" if len(lines) > 25 else "")
 
 
 def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: int = 30) -> str:
