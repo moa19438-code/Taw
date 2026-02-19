@@ -160,3 +160,18 @@ def cleanup():
     days = int(request.form.get("days") or 7)
     n = cleanup_old_paper_trades(retention_days=days)
     return redirect(url_for("admin.index"))
+
+
+@bp.get("/selfcheck")
+def selfcheck():
+    """Pretty self-check report (same logic as /self_check command in bot)."""
+    need = _require_auth()
+    if need:
+        return need
+
+    fix = (request.args.get("fix") or "0").strip() == "1"
+    # Lazy import to avoid circular import at app start
+    from core.app_main import _self_check
+
+    report = _self_check(fix=fix)
+    return render_template("admin/selfcheck.html", report=report, fix=fix)
