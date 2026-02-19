@@ -1,0 +1,149 @@
+
+:root{
+  --dash-radius: 16px;
+  --dash-shadow: 0 10px 30px rgba(0,0,0,.25);
+}
+html, body{
+  font-family: "Cairo", system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+body{
+  padding-top: 66px;
+  background:
+    radial-gradient(1200px 600px at 20% 10%, rgba(13,110,253,.25), transparent 60%),
+    radial-gradient(900px 500px at 90% 20%, rgba(25,135,84,.18), transparent 55%),
+    radial-gradient(900px 500px at 50% 100%, rgba(255,193,7,.10), transparent 55%);
+}
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.small-muted { font-size: .9rem; opacity: .85; }
+.table td, .table th { vertical-align: middle; }
+
+/* Layout */
+.dash-wrap{
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  min-height: calc(100vh - 66px);
+}
+@media (max-width: 992px){
+  .dash-wrap{ grid-template-columns: 1fr; }
+  .dash-sidebar{ display:none; }
+}
+
+.dash-sidebar{
+  position: sticky;
+  top: 66px;
+  height: calc(100vh - 66px);
+  border-left: 1px solid rgba(255,255,255,.08);
+  background: rgba(0,0,0,.22);
+  backdrop-filter: blur(10px);
+}
+.dash-sidebar-inner{
+  padding: 18px 14px;
+  height: 100%;
+  overflow: auto;
+}
+.dash-section-title{
+  font-weight: 800;
+  font-size: .85rem;
+  opacity: .8;
+  margin: 10px 10px 8px;
+}
+.dash-link{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding: 10px 12px;
+  margin: 6px 6px;
+  border-radius: 14px;
+  text-decoration:none;
+  color: rgba(255,255,255,.82);
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(255,255,255,.03);
+  transition: transform .15s ease, background .15s ease, border-color .15s ease;
+}
+.dash-link:hover{
+  transform: translateY(-1px);
+  background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.14);
+  color: #fff;
+}
+.dash-link.active{
+  background: rgba(13,110,253,.18);
+  border-color: rgba(13,110,253,.35);
+  box-shadow: 0 6px 20px rgba(13,110,253,.18);
+}
+.dash-divider{
+  margin: 14px 8px;
+  height:1px;
+  background: rgba(255,255,255,.10);
+}
+.dash-sidebar-footer{
+  margin-top: 18px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px dashed rgba(255,255,255,.14);
+  background: rgba(0,0,0,.15);
+}
+
+/* Cards */
+.card{
+  border-radius: var(--dash-radius);
+  box-shadow: var(--dash-shadow);
+  border: 1px solid rgba(255,255,255,.08);
+  overflow:hidden;
+}
+.card-header{
+  font-weight: 800;
+}
+.kpi-card{
+  position: relative;
+  overflow:hidden;
+}
+.kpi-card::after{
+  content:"";
+  position:absolute;
+  inset:-60px -80px auto auto;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: rgba(255,255,255,.06);
+  filter: blur(0px);
+}
+.kpi-title{
+  font-weight:800;
+  opacity:.9;
+}
+.kpi-value{
+  font-weight: 800;
+  letter-spacing:.3px;
+}
+.btn{
+  border-radius: 14px;
+}
+.table{
+  --bs-table-bg: transparent;
+}
+.badge{
+  border-radius: 999px;
+}
+
+/* Light theme tweaks (when we swap theme to a light bootswatch) */
+body[data-theme="light"]{
+  background:
+    radial-gradient(1200px 600px at 20% 10%, rgba(13,110,253,.15), transparent 60%),
+    radial-gradient(900px 500px at 90% 20%, rgba(25,135,84,.10), transparent 55%),
+    radial-gradient(900px 500px at 50% 100%, rgba(255,193,7,.08), transparent 55%);
+}
+body[data-theme="light"] .dash-sidebar{
+  background: rgba(255,255,255,.65);
+  border-left: 1px solid rgba(0,0,0,.08);
+}
+body[data-theme="light"] .dash-link{
+  color: rgba(0,0,0,.75);
+  border-color: rgba(0,0,0,.08);
+  background: rgba(255,255,255,.55);
+}
+body[data-theme="light"] .dash-link:hover{ color:#000; }
+body[data-theme="light"] .dash-link.active{
+  background: rgba(13,110,253,.10);
+  border-color: rgba(13,110,253,.25);
+}
