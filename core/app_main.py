@@ -1778,6 +1778,7 @@ def telegram_webhook():
         if not TELEGRAM_BOT_TOKEN:
             return jsonify({"ok": True})
         data = request.get_json(silent=True) or {}
+        message_id: Optional[int] = None  # for UI edits; only set for callback_query messages
         # Handle button clicks
         cb = data.get("callback_query")
         if cb:
