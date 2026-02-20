@@ -69,7 +69,6 @@ from core.storage import (
     delete_paper_trade_for_chat,
     cleanup_old_paper_trades,
     list_final_paper_reviews_for_chat,
-    final_paper_review_exists,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -2002,10 +2001,6 @@ def telegram_webhook():
             
             # 📊 مراجعات 24 ساعة (مقفلة)
             if action in ("my_sig_24h", "my_sig_24h_refresh"):
-                try:
-                    _backfill_my_due_24h_reviews(str(chat_id), lookback_days=30, limit=200)
-                except Exception:
-                    pass
                 msg = _my_saved_24h_reviews_message(str(chat_id), lookback_days=30, limit=50)
                 _ui(msg, reply_markup=_build_my_sig_24h_kb(back_action="my_sig_menu"))
                 return jsonify({"ok": True})
@@ -3081,114 +3076,6 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
     )
     body = "\n".join(lines[:25])
     return header + "\n" + body + ("\n\n... (+ المزيد)" if len(lines) > 25 else "")
-
-
-
-def _backfill_my_due_24h_reviews(chat_id: str, lookback_days: int = 30, limit: int = 200) -> int:
-    """Freeze missing 24h paper-review snapshots for this chat (no notifications).
-
-    This fixes cases where the scheduled runner couldn't persist reviews (e.g., DB schema mismatch earlier).
-    It uses the current best available price (LIVE if possible, else last close) and stores kind=paper_24h_final.
-    Returns number of newly created snapshots.
-    """
-    created = 0
-    now_dt = datetime.now(timezone.utc)
-    cutoff = (now_dt - timedelta(days=int(lookback_days))).isoformat()
-    try:
-        rows = list_paper_trades_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=max(50, int(limit)))
-    except Exception:
-        rows = []
-    if not rows:
-        return 0
-
-    for r in rows[: int(limit)]:
-        try:
-            due_ts = r.get("due_ts") or ""
-            if not due_ts or due_ts < cutoff:
-                continue
-            # only backfill when due has passed
-            try:
-                due_dt = datetime.fromisoformat(due_ts.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if now_dt < due_dt:
-                continue
-
-            signal_id = int(r.get("signal_id") or 0)
-            paper_id = int(r.get("paper_id") or 0)  # from list_paper_trades_for_chat alias
-            symbol = (r.get("symbol") or "").upper().strip()
-            side = (r.get("side") or "buy").lower().strip()
-            entry = float(r.get("entry") or 0.0)
-            if signal_id <= 0 or not symbol or entry <= 0:
-                continue
-
-            # Skip if snapshot already exists
-            try:
-                if final_paper_review_exists(signal_id):
-                    # Mark notified to avoid reprocessing by runner if still pending
-                    if paper_id:
-                        try:
-                            mark_paper_trade_notified(paper_id)
-                        except Exception:
-                            pass
-                    continue
-            except Exception:
-                pass
-
-            live_p, live_ts = _get_live_trade_price(symbol)
-            exit_price = float(live_p) if live_p is not None else None
-            price_src = "LIVE" if exit_price is not None else "LAST_CLOSE"
-
-            if exit_price is None:
-                try:
-                    dt = now_dt
-                    data = bars([symbol], start=dt - timedelta(days=3), end=dt, timeframe="1Day", limit=5)
-                    bl = (data.get("bars", {}).get(symbol) or [])
-                    if bl:
-                        exit_price = float(bl[-1].get("c") or entry)
-                except Exception:
-                    exit_price = entry
-
-            if exit_price is None:
-                exit_price = entry
-
-            if side == "sell":
-                ret_pct = (entry - exit_price) / entry * 100.0
-            else:
-                ret_pct = (exit_price - entry) / entry * 100.0
-
-            note = json.dumps(
-                {
-                    "kind": "paper_24h_final",
-                    "price_src": price_src,
-                    "live_ts": live_ts or "",
-                    "review_ts": now_dt.isoformat(),
-                    "backfill": True,
-                },
-                ensure_ascii=False,
-            )
-            log_signal_review(
-                ts=now_dt.isoformat(),
-                signal_id=signal_id,
-                close=float(exit_price),
-                return_pct=float(ret_pct),
-                mfe_pct=0.0,
-                mae_pct=0.0,
-                note=note,
-            )
-            created += 1
-
-            # Mark notified so the scheduler doesn't keep trying old items
-            if paper_id:
-                try:
-                    mark_paper_trade_notified(paper_id)
-                except Exception:
-                    pass
-
-        except Exception:
-            continue
-    return int(created)
-
 
 
 def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: int = 30) -> str:
