@@ -280,6 +280,13 @@ def init_db() -> None:
 
         con.commit()
 
+    # Ensure signal_reviews has extended columns used by review snapshots
+    try:
+        ensure_signal_reviews_schema()
+    except Exception:
+        pass
+
+
 
 
 
@@ -922,6 +929,10 @@ def log_signal_review(
     tp_gap_class: str = "",
 ) -> None:
     """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
+    try:
+        ensure_signal_reviews_schema()
+    except Exception:
+        pass
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
@@ -935,8 +946,8 @@ def log_signal_review(
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
         )
         con.commit()
@@ -1196,6 +1207,78 @@ def clear_paper_trades_for_chat(chat_id: str) -> int:
         deleted = cur.rowcount or 0
         con.commit()
     return int(deleted)
+
+
+def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """List frozen 24h paper-review snapshots for a chat (does NOT change over time).
+
+    These rows are written by the 24h paper review runner (kind=paper_24h_final) into signal_reviews.note as JSON.
+    """
+    cutoff = (datetime.utcnow() - timedelta(days=int(lookback_days))).isoformat()
+    like_pat = '%paper_24h_final%'
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        pt.id AS paper_id,
+                        pt.chat_id,
+                        pt.signal_id,
+                        pt.due_ts,
+                        r.ts AS review_ts,
+                        r.close AS exit_price,
+                        r.return_pct,
+                        r.note,
+                        s.signal_ts,
+                        s.symbol,
+                        s.mode,
+                        s.side,
+                        s.score,
+                        s.entry
+                    FROM paper_trades pt
+                    JOIN signals s ON s.id = pt.signal_id
+                    JOIN signal_reviews r ON r.signal_id = pt.signal_id
+                    WHERE pt.chat_id = %s
+                      AND r.ts >= %s
+                      AND COALESCE(r.note,'') LIKE %s
+                    ORDER BY r.ts DESC
+                    LIMIT %s
+                    """,
+                    (str(chat_id), cutoff, like_pat, int(limit)),
+                )
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+                pt.id AS paper_id,
+                pt.chat_id,
+                pt.signal_id,
+                pt.due_ts,
+                r.ts AS review_ts,
+                r.close AS exit_price,
+                r.return_pct,
+                r.note,
+                s.ts AS signal_ts,
+                s.symbol,
+                s.mode,
+                s.side,
+                s.score,
+                s.entry
+            FROM paper_trades pt
+            JOIN signals s ON s.id = pt.signal_id
+            JOIN signal_reviews r ON r.signal_id = pt.signal_id
+            WHERE pt.chat_id = ?
+              AND r.ts >= ?
+              AND COALESCE(r.note,'') LIKE ?
+            ORDER BY r.ts DESC
+            LIMIT ?
+            """,
+            (str(chat_id), cutoff, like_pat, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 def cleanup_old_paper_trades(retention_days: int = 7) -> int:
     """Auto-clean paper_trades older than retention_days (signals stay for learning). Returns deleted count."""
