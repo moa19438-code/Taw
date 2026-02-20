@@ -1,1 +1,1 @@
-from bot.main import app
+from core.app_main import app
