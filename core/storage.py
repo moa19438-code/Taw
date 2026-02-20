@@ -280,13 +280,6 @@ def init_db() -> None:
 
         con.commit()
 
-    # Ensure signal_reviews has extended columns used by review snapshots
-    try:
-        ensure_signal_reviews_schema()
-    except Exception:
-        pass
-
-
 
 
 
@@ -929,15 +922,16 @@ def log_signal_review(
     tp_gap_class: str = "",
 ) -> None:
     """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
-    try:
-        ensure_signal_reviews_schema()
-    except Exception:
-        pass
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
+                    """
+    try:
+        ensure_signal_reviews_schema()
+    except Exception:
+        pass
+INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
                 )
@@ -945,12 +939,38 @@ def log_signal_review(
         return
 
     with sqlite3.connect(DB_PATH) as con:
+        # Ensure schema is up-to-date so extra columns exist before INSERT.
+        try:
+            ensure_signal_reviews_schema()
+        except Exception:
+            pass
         con.execute(
-            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
+            """INSERT INTO signal_reviews (
+                ts, signal_id, close, return_pct, mfe_pct, mae_pct, note,
+                high, low, tp_hit, sl_hit, hit, hit_ts,
+                tp_progress, tp_gap_pct, tp_gap_class
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                ts,
+                int(signal_id),
+                float(close),
+                float(return_pct),
+                float(mfe_pct),
+                float(mae_pct),
+                note or "",
+                float(high) if high is not None else None,
+                float(low) if low is not None else None,
+                int(bool(tp_hit)) if tp_hit is not None else None,
+                int(bool(sl_hit)) if sl_hit is not None else None,
+                hit or "",
+                hit_ts or "",
+                float(tp_progress) if tp_progress is not None else None,
+                float(tp_gap_pct) if tp_gap_pct is not None else None,
+                (tp_gap_class or ""),
+            ),
         )
         con.commit()
+
 
 
 def last_signal_reviews(limit: int = 50) -> List[Dict[str, Any]]:
@@ -1241,7 +1261,7 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                     JOIN signal_reviews r ON r.signal_id = pt.signal_id
                     WHERE pt.chat_id = %s
                       AND r.ts >= %s
-                      AND COALESCE(r.note,'') LIKE %s
+                      AND r.note LIKE %s
                     ORDER BY r.ts DESC
                     LIMIT %s
                     """,
@@ -1272,7 +1292,7 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
             JOIN signal_reviews r ON r.signal_id = pt.signal_id
             WHERE pt.chat_id = ?
               AND r.ts >= ?
-              AND COALESCE(r.note,'') LIKE ?
+              AND r.note LIKE ?
             ORDER BY r.ts DESC
             LIMIT ?
             """,

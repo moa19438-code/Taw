@@ -116,8 +116,8 @@ def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = N
         if reply_markup:
             payload["reply_markup"] = reply_markup
         requests.post(url, json=payload, timeout=20)
-    except Exception:
-        pass
+    except Exception as e:
+                print(f"[paper_24h_final] failed to persist review: {e}")
 # --- Telegram callback responsiveness / anti-duplicate ---
 _CB_SEEN: Dict[str, float] = {}  # callback_query.id -> ts
 _ACTION_SEEN: Dict[str, float] = {}  # f"{chat_id}:{action}" -> ts
