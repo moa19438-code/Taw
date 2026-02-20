@@ -280,6 +280,13 @@ def init_db() -> None:
 
         con.commit()
 
+    # Ensure signal_reviews has extended columns used by review snapshots
+    try:
+        ensure_signal_reviews_schema()
+    except Exception:
+        pass
+
+
 
 
 
@@ -292,6 +299,10 @@ _REVIEW_COLS = {
     "sl_hit": "INTEGER",
     "hit": "TEXT",
     "hit_ts": "TEXT",
+    "tp_hit_ts": "TEXT",
+    "sl_hit_ts": "TEXT",
+    "tp_hit_price": "REAL",
+    "sl_hit_price": "REAL",
     "tp_progress": "REAL",
     "tp_gap_pct": "REAL",
     "tp_gap_class": "TEXT",
@@ -917,39 +928,55 @@ def log_signal_review(
     sl_hit: bool | None = None,
     hit: str = "",
     hit_ts: str = "",
+    tp_hit_ts: str = "",
+    sl_hit_ts: str = "",
+    tp_hit_price: float | None = None,
+    sl_hit_price: float | None = None,
     tp_progress: float | None = None,
     tp_gap_pct: float | None = None,
     tp_gap_class: str = "",
 ) -> None:
     """Store a periodic review snapshot for a signal (e.g. daily close performance)."""
-    if IS_POSTGRES:
-        with _pg_connect() as con:
-            with con.cursor() as cur:
-                cur.execute(
-                    """
     try:
         ensure_signal_reviews_schema()
     except Exception:
         pass
-INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_hit_ts, sl_hit_ts, tp_hit_price, sl_hit_price, tp_progress, tp_gap_pct, tp_gap_class)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        ts,
+                        int(signal_id),
+                        float(close),
+                        float(return_pct),
+                        float(mfe_pct),
+                        float(mae_pct),
+                        note or "",
+                        float(high) if high is not None else None,
+                        float(low) if low is not None else None,
+                        int(bool(tp_hit)) if tp_hit is not None else None,
+                        int(bool(sl_hit)) if sl_hit is not None else None,
+                        hit or "",
+                        hit_ts or "",
+                        tp_hit_ts or "",
+                        sl_hit_ts or "",
+                        float(tp_hit_price) if tp_hit_price is not None else None,
+                        float(sl_hit_price) if sl_hit_price is not None else None,
+                        float(tp_progress) if tp_progress is not None else None,
+                        float(tp_gap_pct) if tp_gap_pct is not None else None,
+                        (tp_gap_class or ""),
+                    ),
                 )
             con.commit()
         return
 
     with sqlite3.connect(DB_PATH) as con:
-        # Ensure schema is up-to-date so extra columns exist before INSERT.
-        try:
-            ensure_signal_reviews_schema()
-        except Exception:
-            pass
         con.execute(
-            """INSERT INTO signal_reviews (
-                ts, signal_id, close, return_pct, mfe_pct, mae_pct, note,
-                high, low, tp_hit, sl_hit, hit, hit_ts,
-                tp_progress, tp_gap_pct, tp_gap_class
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts, tp_hit_ts, sl_hit_ts, tp_hit_price, sl_hit_price, tp_progress, tp_gap_pct, tp_gap_class)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 ts,
                 int(signal_id),
@@ -964,13 +991,16 @@ INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, 
                 int(bool(sl_hit)) if sl_hit is not None else None,
                 hit or "",
                 hit_ts or "",
+                tp_hit_ts or "",
+                sl_hit_ts or "",
+                float(tp_hit_price) if tp_hit_price is not None else None,
+                float(sl_hit_price) if sl_hit_price is not None else None,
                 float(tp_progress) if tp_progress is not None else None,
                 float(tp_gap_pct) if tp_gap_pct is not None else None,
                 (tp_gap_class or ""),
             ),
         )
         con.commit()
-
 
 
 def last_signal_reviews(limit: int = 50) -> List[Dict[str, Any]]:
@@ -1261,7 +1291,7 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                     JOIN signal_reviews r ON r.signal_id = pt.signal_id
                     WHERE pt.chat_id = %s
                       AND r.ts >= %s
-                      AND r.note LIKE %s
+                      AND COALESCE(r.note,'') LIKE %s
                     ORDER BY r.ts DESC
                     LIMIT %s
                     """,
@@ -1292,7 +1322,7 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
             JOIN signal_reviews r ON r.signal_id = pt.signal_id
             WHERE pt.chat_id = ?
               AND r.ts >= ?
-              AND r.note LIKE ?
+              AND COALESCE(r.note,'') LIKE ?
             ORDER BY r.ts DESC
             LIMIT ?
             """,
