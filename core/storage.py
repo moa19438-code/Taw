@@ -934,34 +934,10 @@ def log_signal_review(
         return
 
     with sqlite3.connect(DB_PATH) as con:
-        # NOTE: signal_reviews table is migrated via ensure_signal_reviews_schema() to include:
-        # high, low, tp_hit, sl_hit, hit, hit_ts, tp_progress, tp_gap_pct, tp_gap_class.
-        # Keep SQLite insert aligned with the Postgres insert (same columns + bindings).
         con.execute(
-            """INSERT INTO signal_reviews (
-                    ts, signal_id, close, return_pct, mfe_pct, mae_pct, note,
-                    high, low, tp_hit, sl_hit, hit, hit_ts,
-                    tp_progress, tp_gap_pct, tp_gap_class
-                )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                ts,
-                int(signal_id),
-                float(close),
-                float(return_pct),
-                float(mfe_pct),
-                float(mae_pct),
-                note or "",
-                float(high) if high is not None else None,
-                float(low) if low is not None else None,
-                int(bool(tp_hit)) if tp_hit is not None else None,
-                int(bool(sl_hit)) if sl_hit is not None else None,
-                hit or "",
-                hit_ts or "",
-                float(tp_progress) if tp_progress is not None else None,
-                float(tp_gap_pct) if tp_gap_pct is not None else None,
-                (tp_gap_class or ""),
-            ),
+            """INSERT INTO signal_reviews (ts, signal_id, close, return_pct, mfe_pct, mae_pct, note, high, low, tp_hit, sl_hit, hit, hit_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, int(signal_id), float(close), float(return_pct), float(mfe_pct), float(mae_pct), note or "", float(high) if high is not None else None, float(low) if low is not None else None, int(bool(tp_hit)) if tp_hit is not None else None, int(bool(sl_hit)) if sl_hit is not None else None, hit or "", hit_ts or "", float(tp_progress) if tp_progress is not None else None, float(tp_gap_pct) if tp_gap_pct is not None else None, (tp_gap_class or "")),
         )
         con.commit()
 
@@ -1228,7 +1204,8 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
     These rows are written by the 24h paper review runner (kind=paper_24h_final) into signal_reviews.note as JSON.
     """
     cutoff = (datetime.utcnow() - timedelta(days=int(lookback_days))).isoformat()
-    like_pat = '%"kind":"paper_24h_final"%'
+    # NOTE: note is JSON dumped with spaces (e.g. "kind": "paper_24h_final"), so match loosely.
+    like_pat = '%paper_24h_final%'
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
