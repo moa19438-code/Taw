@@ -352,14 +352,29 @@ _SIGNAL_COLS = {
 
 # extra columns for paper trades to support premium monitoring (manual execution + TP/SL hit tracking)
 _PAPER_TRADE_COLS = {
-    "status": "TEXT",          # open|tp|sl|final
-    "exec_price": "REAL",      # user executed price (optional)
-    "qty": "REAL",             # executed quantity (optional)
-    "tp_hit": "INTEGER",       # 1 if TP touched before finalize
-    "sl_hit": "INTEGER",       # 1 if SL touched before finalize
-    "hit_ts": "TEXT",          # when TP/SL hit (UTC ISO)
-    "hit_price": "REAL",       # the level hit (tp or sl)
-    "last_check_ts": "TEXT",   # last monitoring scan (UTC ISO)
+    # snapshot fields (freeze trade plan at save-time)
+    "symbol": "TEXT",
+    "mode": "TEXT",
+    "side": "TEXT",
+    "signal_ts": "TEXT",
+    "strength": "TEXT",
+    "score": "REAL",
+    "entry": "REAL",
+    "sl": "REAL",
+    "tp": "REAL",            # TP1
+    "tp2": "REAL",           # TP2 (runner)
+    "trail_sl": "REAL",      # dynamic trailing SL (e.g., move to BE after TP1)
+    "tp1_hit": "INTEGER",    # 1 if TP1 touched
+    "tp2_hit": "INTEGER",    # 1 if TP2 touched
+    # monitor fields
+    "status": "TEXT",        # open|tp1|tp2|sl|final
+    "exec_price": "REAL",    # user executed price (optional)
+    "qty": "REAL",           # executed quantity (optional)
+    "tp_hit": "INTEGER",     # legacy: 1 if any TP touched (kept for backwards compat)
+    "sl_hit": "INTEGER",     # 1 if SL touched
+    "hit_ts": "TEXT",        # when TP/SL hit (UTC ISO)
+    "hit_price": "REAL",     # the level hit (tp1/tp2/sl)
+    "last_check_ts": "TEXT", # last monitoring scan (UTC ISO)
 }
 
 def ensure_signal_schema() -> None:
@@ -1085,21 +1100,89 @@ def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
 
 # --- Paper trades (manual simulation tracking) ---
 def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
-    """Link a saved signal to a chat_id for 24h later review."""
+    """Link a saved signal to a chat_id for 24h later review.
+
+    Platinum behavior:
+      - Freeze the trade plan at save-time (symbol/mode/side/score/entry/sl/tp/tp2).
+      - Keep compatibility with older DBs by ensuring schema before insert.
+    """
+    try:
+        ensure_paper_trades_schema()
+    except Exception:
+        pass
+
+    # Fetch signal snapshot (best-effort)
+    sig: Dict[str, Any] = {}
+    try:
+        sig = get_signal_by_id(int(signal_id)) or {}
+    except Exception:
+        sig = {}
+
+    symbol = (sig.get("symbol") or "").upper().strip()
+    mode = (sig.get("mode") or "")
+    side = (sig.get("side") or "buy")
+    strength = (sig.get("strength") or "")
+    score = sig.get("score")
+    entry = sig.get("entry")
+    sl = sig.get("sl")
+    tp = sig.get("tp")
+    sig_ts = sig.get("ts") or sig.get("signal_ts") or ""
+
+    # Compute TP2 (runner) if possible
+    tp2 = None
+    try:
+        entry_f = float(entry or 0.0)
+        sl_f = float(sl or 0.0)
+        tp_f = float(tp or 0.0)
+        if entry_f > 0 and sl_f > 0:
+            risk_per_share = abs(entry_f - sl_f)
+            # default runner target ~4R if not specified in settings (kept inside note)
+            tp2_r = float(os.getenv("TP2_R_MULT", "4.0"))
+            if (side or "buy").lower().strip() == "sell":
+                tp2 = max(0.01, entry_f - (risk_per_share * tp2_r))
+            else:
+                tp2 = entry_f + (risk_per_share * tp2_r)
+        else:
+            tp2 = None
+    except Exception:
+        tp2 = None
+
+    # Insert
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (%s,%s,%s,0)",
-                    (str(chat_id), int(signal_id), due_ts),
+                    """INSERT INTO paper_trades
+                       (chat_id, signal_id, due_ts, notified,
+                        symbol, mode, side, signal_ts, strength, score, entry, sl, tp, tp2,
+                        status, tp1_hit, tp2_hit, tp_hit, sl_hit)
+                       VALUES (%s,%s,%s,0,
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               'open',0,0,0,0)
+                    """,
+                    (str(chat_id), int(signal_id), due_ts,
+                     symbol, mode, side, sig_ts, strength,
+                     float(score) if score is not None else None,
+                     float(entry) if entry is not None else None,
+                     float(sl) if sl is not None else None,
+                     float(tp) if tp is not None else None,
+                     float(tp2) if tp2 is not None else None),
                 )
             con.commit()
         return
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (?,?,?,0)",
-            (str(chat_id), int(signal_id), due_ts),
+            """INSERT INTO paper_trades
+               (chat_id, signal_id, due_ts, notified,
+                symbol, mode, side, signal_ts, strength, score, entry, sl, tp, tp2,
+                status, tp1_hit, tp2_hit, tp_hit, sl_hit)
+               VALUES (?,?,?,0,
+                       ?,?,?,?,?,?,?,?,?,?,
+                       'open',0,0,0,0)""",
+            (str(chat_id), int(signal_id), due_ts,
+             symbol, mode, side, sig_ts, strength,
+             score, entry, sl, tp, tp2),
         )
         con.commit()
 
@@ -1111,7 +1194,17 @@ def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+                    """SELECT p.*,
+                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
+                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
+                              COALESCE(NULLIF(p.side,''), s.side) AS side,
+                              COALESCE(p.entry, s.entry) AS entry,
+                              COALESCE(p.sl, s.sl) AS sl,
+                              COALESCE(p.tp, s.tp) AS tp,
+                              COALESCE(p.tp2, NULL) AS tp2,
+                              COALESCE(p.score, s.score) AS score,
+                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
                        FROM paper_trades p
                        JOIN signals s ON s.id = p.signal_id
                        WHERE COALESCE(p.notified,0)=0 AND (p.due_ts::timestamptz) <= now()
@@ -1124,7 +1217,17 @@ def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+            """SELECT p.*,
+                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
+                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
+                              COALESCE(NULLIF(p.side,''), s.side) AS side,
+                              COALESCE(p.entry, s.entry) AS entry,
+                              COALESCE(p.sl, s.sl) AS sl,
+                              COALESCE(p.tp, s.tp) AS tp,
+                              COALESCE(p.tp2, NULL) AS tp2,
+                              COALESCE(p.score, s.score) AS score,
+                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
                FROM paper_trades p
                JOIN signals s ON s.id = p.signal_id
                WHERE COALESCE(p.notified,0)=0 AND p.due_ts <= ?
@@ -1142,7 +1245,17 @@ def open_paper_trades_for_monitor(limit: int = 500) -> List[Dict[str, Any]]:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+                    """SELECT p.*,
+                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
+                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
+                              COALESCE(NULLIF(p.side,''), s.side) AS side,
+                              COALESCE(p.entry, s.entry) AS entry,
+                              COALESCE(p.sl, s.sl) AS sl,
+                              COALESCE(p.tp, s.tp) AS tp,
+                              COALESCE(p.tp2, NULL) AS tp2,
+                              COALESCE(p.score, s.score) AS score,
+                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
                        FROM paper_trades p
                        JOIN signals s ON s.id = p.signal_id
                        WHERE COALESCE(p.notified,0)=0
@@ -1156,7 +1269,17 @@ def open_paper_trades_for_monitor(limit: int = 500) -> List[Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
+            """SELECT p.*,
+                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
+                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
+                              COALESCE(NULLIF(p.side,''), s.side) AS side,
+                              COALESCE(p.entry, s.entry) AS entry,
+                              COALESCE(p.sl, s.sl) AS sl,
+                              COALESCE(p.tp, s.tp) AS tp,
+                              COALESCE(p.tp2, NULL) AS tp2,
+                              COALESCE(p.score, s.score) AS score,
+                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
                FROM paper_trades p
                JOIN signals s ON s.id = p.signal_id
                WHERE COALESCE(p.notified,0)=0
@@ -1173,6 +1296,9 @@ def update_paper_trade_monitor_state(
     *,
     status: Optional[str] = None,
     tp_hit: Optional[int] = None,
+    tp1_hit: Optional[int] = None,
+    tp2_hit: Optional[int] = None,
+    trail_sl: Optional[float] = None,
     sl_hit: Optional[int] = None,
     hit_ts: Optional[str] = None,
     hit_price: Optional[float] = None,
@@ -1184,6 +1310,12 @@ def update_paper_trade_monitor_state(
         fields["status"] = status
     if tp_hit is not None:
         fields["tp_hit"] = int(tp_hit)
+    if tp1_hit is not None:
+        fields["tp1_hit"] = int(tp1_hit)
+    if tp2_hit is not None:
+        fields["tp2_hit"] = int(tp2_hit)
+    if trail_sl is not None:
+        fields["trail_sl"] = float(trail_sl)
     if sl_hit is not None:
         fields["sl_hit"] = int(sl_hit)
     if hit_ts is not None:

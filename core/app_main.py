@@ -1331,6 +1331,18 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
         risk_per_share = max(entry - sl, 0.01)
         tp = entry + (risk_per_share * tp_r_mult)
 
+    # TP2 (Runner): allows catching big moves without changing TP1
+    tp2_r_mult = _get_float(settings, "TP2_R_MULT", float(os.getenv("TP2_R_MULT","4.0")))
+    tp2 = None
+    try:
+        if tp2_r_mult and float(tp2_r_mult) > float(tp_r_mult) and risk_per_share > 0:
+            if side == "sell":
+                tp2 = max(0.01, entry - (risk_per_share * float(tp2_r_mult)))
+            else:
+                tp2 = entry + (risk_per_share * float(tp2_r_mult))
+    except Exception:
+        tp2 = None
+
     # تصنيف (A+/A/B) حسب القوة
     st = _strength(float(c.score))
     if st == "قوي جداً":
@@ -1362,11 +1374,24 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
     # RR محسوب على أساس المخاطرة R
     rr = (abs(tp - entry)) / max(abs(entry - sl), 0.01)
 
+    # TP2 runner (optional): catch extended moves while keeping TP1 conservative
+    tp2 = None
+    try:
+        tp2_r_mult = _get_float(s, "TP2_R_MULT", float(os.getenv("TP2_R_MULT","4.0")))
+        if tp2_r_mult and float(tp2_r_mult) > float(tp_r_mult) and risk_per_share > 0:
+            if side == "sell":
+                tp2 = max(0.01, entry - (risk_per_share * float(tp2_r_mult)))
+            else:
+                tp2 = entry + (risk_per_share * float(tp2_r_mult))
+    except Exception:
+        tp2 = None
+
     return {
         "side": side,
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
+        "tp2": round(float(tp2), 2) if tp2 is not None else None,
         "qty": int(qty),
         "atr": round(atr_val, 2),
         "sl_atr_mult": sl_atr_mult,
@@ -1494,6 +1519,7 @@ def _build_trade_plan(symbol: str,
         "entry": round(entry, 2),
         "sl": round(float(sl), 2),
         "tp": round(float(tp), 2),
+        "tp2": round(float(tp2), 2) if tp2 is not None else None,
         "atr": round(float(atr or 0.0), 2),
         "sl_atr_mult": round(float(sl_atr_mult), 2),
         "tp_r_mult": round(float(tp_r_mult), 2),
@@ -1557,8 +1583,10 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
 
         f"{ai_line}"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
-        f"جني الربح: {plan['tp']}\n"
-        f"وقف الخسارة: {plan['sl']}\n"
+        f"جني الربح (TP1): {plan['tp']}\n"
+        + (f"جني الربح (TP2/Runner): {plan.get('tp2')}\n" if plan.get('tp2') is not None else "")
+        + (f"Trail SL بعد TP1: {plan['entry']}\n" if plan.get('tp2') is not None else "")
+        + f"وقف الخسارة: {plan['sl']}\n"
         f"الخطة: {mode_label}\n"
         f"ملاحظة: {c.notes}\n"
     )
@@ -1871,8 +1899,11 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
             symbol = (r.get("symbol") or "").upper().strip()
             side = (r.get("side") or "buy").lower().strip()
             entry = float(r.get("entry") or 0.0)
-            tp = float(r.get("tp") or 0.0)
+            tp = float(r.get("tp") or 0.0)   # TP1
+            tp2 = float(r.get("tp2") or 0.0) # TP2 (runner)
             sl = float(r.get("sl") or 0.0)
+            tp1_hit = int(r.get("tp1_hit") or 0)
+            trail_sl = float(r.get("trail_sl") or 0.0)
 
             if not paper_id or not chat or not symbol or entry <= 0:
                 continue
@@ -1893,7 +1924,20 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                 update_paper_trade_monitor_state(paper_id, last_check_ts=now_dt.isoformat().replace("+00:00","Z"))
                 continue
 
-            hit = _scan_hit_in_bars(symbol, side, tp, sl, start_dt, end_dt)
+            # Decide what to monitor:
+            # - Before TP1: monitor TP1 vs SL
+            # - After TP1: keep a runner toward TP2, with trailing SL moved to breakeven (or existing trail_sl)
+            mon_tp = tp
+            mon_sl = sl
+            if tp1_hit:
+                mon_tp = tp2 if tp2 > 0 else tp
+                if trail_sl > 0:
+                    mon_sl = trail_sl
+                else:
+                    # breakeven trail by default
+                    mon_sl = entry
+
+            hit = _scan_hit_in_bars(symbol, side, float(mon_tp or 0.0), float(mon_sl or 0.0), start_dt, end_dt)
             update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
 
             if not hit:
@@ -1903,10 +1947,33 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
             hit_ts = str(hit.get("ts") or now_dt.isoformat().replace("+00:00","Z"))
             hit_price = float(hit.get("price") or 0.0)
 
+            # Handle multi-stage TP:
             if kind == "tp":
-                update_paper_trade_monitor_state(paper_id, status="tp", tp_hit=1, hit_ts=hit_ts, hit_price=hit_price)
-                res_emoji = "✅"
-                res_title = "تحقق جني الربح (TP)"
+                if not tp1_hit:
+                    # TP1 hit -> activate runner + trail to breakeven
+                    update_paper_trade_monitor_state(
+                        paper_id,
+                        status="tp1",
+                        tp_hit=1,
+                        tp1_hit=1,
+                        trail_sl=float(entry),
+                        hit_ts=hit_ts,
+                        hit_price=hit_price,
+                    )
+                    res_emoji = "✅"
+                    res_title = "تحقق TP1 — تم تفعيل Runner"
+                else:
+                    # TP2 hit -> finalize win
+                    update_paper_trade_monitor_state(
+                        paper_id,
+                        status="tp2",
+                        tp_hit=1,
+                        tp2_hit=1,
+                        hit_ts=hit_ts,
+                        hit_price=hit_price,
+                    )
+                    res_emoji = "🏁✅"
+                    res_title = "تحقق TP2 (Runner) — هدف كبير"
             else:
                 update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_ts=hit_ts, hit_price=hit_price)
                 res_emoji = "❌"
@@ -1927,13 +1994,24 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                 pass
 
             extra = f" | R: {r_mult:+.2f}" if r_mult is not None else ""
+            tp1_line = f"TP1: {tp:.4g}$" if tp > 0 else "TP1: —"
+            tp2_line = f"TP2: {tp2:.4g}$" if tp2 > 0 else ""
+            trail_line = ""
+            try:
+                if (tp1_hit or (res_title and "TP1" in res_title)) and float(entry) > 0:
+                    trail_line = f"Trail SL (بعد TP1): {entry:.4g}$"
+            except Exception:
+                trail_line = ""
+
             msg = (
                 f"🔔 {res_emoji} {symbol} — {res_title}\n\n"
                 f"Entry: {entry:.4g}$\n"
-                f"TP: {tp:.4g}$ {'✅' if kind=='tp' else '❌'}\n"
-                f"SL: {sl:.4g}$ {'✅' if kind=='sl' else '❌'}\n"
-                f"hit@: {hit_ts}\n"
-                f"{extra}"
+                f"{tp1_line}\n"
+                + (f"{tp2_line}\n" if tp2_line else "")
+                + f"SL: {sl:.4g}$\n"
+                + (f"{trail_line}\n" if trail_line else "")
+                + f"hit@: {hit_ts}\n"
+                + f"{extra}"
             )
             _tg_send(chat, msg, silent=True)
 
@@ -1946,7 +2024,9 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                         "hit_kind": kind,
                         "hit_ts": hit_ts,
                         "hit_price": hit_price,
-                        "tp": tp,
+                        "tp1": tp,
+                        "tp2": tp2,
+                        "stage": "tp1" if (res_title and "TP1" in res_title) else ("tp2" if (res_title and "TP2" in res_title) else kind),
                         "sl": sl,
                         "entry": entry,
                     }, ensure_ascii=False)
@@ -1996,17 +2076,20 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
 
 
             tp = float(r.get("tp") or 0.0)
+            tp2 = float(r.get("tp2") or 0.0)
+            tp1_hit = int(r.get("tp1_hit") or 0)
+            trail_sl = float(r.get("trail_sl") or 0.0)
             sl = float(r.get("sl") or 0.0)
             p_status = (r.get("status") or "open").lower().strip()
             hit_price = float(r.get("hit_price") or 0.0)
             hit_ts = str(r.get("hit_ts") or "")
 
             # If TP/SL was already hit during monitoring, finalize based on that hit.
-            if p_status in ("tp", "sl") and hit_price > 0:
+            if p_status in ("tp","tp1","tp2","sl") and hit_price > 0:
                 exit_price = hit_price
                 live_p = None
                 live_ts = None
-                price_src = "TP_HIT" if p_status == "tp" else "SL_HIT"
+                price_src = "TP_HIT" if p_status in ("tp","tp1","tp2") else "SL_HIT"
             else:
                 exit_price = None
                 price_src = ""
@@ -2053,6 +2136,20 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
 
             if exit_price is None:
                 exit_price = entry
+
+            # If TP1 was hit and we are still not stopped/TP2, assume breakeven trail after TP1:
+            try:
+                if tp1_hit and p_status not in ("tp2","sl") and entry > 0 and exit_price is not None:
+                    if side == "sell":
+                        exit_price = min(float(exit_price), float(entry))
+                    else:
+                        exit_price = max(float(exit_price), float(entry))
+                    if price_src == "LIVE":
+                        price_src = "LIVE+TRAIL_BE"
+                    elif price_src:
+                        price_src = f"{price_src}+TRAIL_BE"
+            except Exception:
+                pass
 
             if side == "sell":
                 ret_pct = (entry - exit_price) / entry * 100.0
@@ -2653,7 +2750,7 @@ def telegram_webhook():
                             live_p0, _ = _get_live_trade_price(c.symbol)
                             entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                             plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
-                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
                             set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
                         except Exception:
                             pass
@@ -2694,7 +2791,7 @@ def telegram_webhook():
                                 live_p0, _ = _get_live_trade_price(c.symbol)
                                 entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                                 plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
-                                info = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                                info = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
                                 set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                             except Exception:
                                 pass
@@ -2746,7 +2843,7 @@ def telegram_webhook():
                                     live_p0, _ = _get_live_trade_price(c2.symbol)
                                     entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                                     plan0 = _compute_trade_plan(s0, c2, entry_override=entry_override0)
-                                    info = {"symbol": c2.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c2, "score", 0.0) or 0.0), "strength": str(getattr(c2,"grade","B") or "B")}
+                                    info = {"symbol": c2.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c2, "score", 0.0) or 0.0), "strength": str(getattr(c2,"grade","B") or "B")}
                                     set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                                 except Exception:
                                     pass

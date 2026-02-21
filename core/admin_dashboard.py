@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
@@ -51,6 +52,40 @@ def index():
     paper: List[Dict[str, Any]] = []
     if chat_id:
         paper = list_paper_trades_for_chat(chat_id, lookback_days=lookback_days, limit=200)
+
+    finals: List[Dict[str, Any]] = []
+    perf = {"count": 0, "win": 0, "loss": 0, "avg_ret": 0.0, "tp1": 0, "tp2": 0, "sl": 0}
+    if chat_id:
+        try:
+            finals = list_final_paper_reviews_for_chat(chat_id, lookback_days=lookback_days, limit=200)
+        except Exception:
+            finals = []
+    rets = []
+    for r in finals:
+        try:
+            ret = float(r.get("return_pct") or 0.0)
+            rets.append(ret)
+            note = r.get("note") or ""
+            j = {}
+            try:
+                j = json.loads(note) if isinstance(note, str) and note.strip().startswith("{") else {}
+            except Exception:
+                j = {}
+            st = str(j.get("paper_status") or "")
+            if st == "tp2":
+                perf["tp2"] += 1
+            elif st == "tp1":
+                perf["tp1"] += 1
+            elif st == "sl":
+                perf["sl"] += 1
+        except Exception:
+            pass
+    perf["count"] = len(rets)
+    if rets:
+        perf["win"] = sum(1 for x in rets if x > 0)
+        perf["loss"] = sum(1 for x in rets if x < 0)
+        perf["avg_ret"] = round(sum(rets) / len(rets), 3)
+    perf["winrate"] = round((perf["win"] / perf["count"]) * 100.0, 1) if perf["count"] else 0.0
 
     signals = last_signals(200)
 
@@ -105,6 +140,7 @@ def index():
         open_paper_count=len(open_paper),
         due_now_count=len(due_now),
         signals_count=len(signals_window),
+        perf=perf,
         finals_count=len(finals),
         winrate=winrate,
         top_symbols=top_symbols,
