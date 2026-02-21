@@ -36,6 +36,37 @@
     </div>
   </div>
 
+
+  <div class="row g-3 mt-2">
+    <div class="col-12 col-md-4">
+      <div class="card border-primary">
+        <div class="card-body">
+          <div class="h5">مفتوحة</div>
+          <div class="display-6">{{ open_paper_count }}</div>
+          <div class="small-muted">Paper trades قيد المتابعة</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-md-4">
+      <div class="card border-danger">
+        <div class="card-body">
+          <div class="h5">مستحقة الآن</div>
+          <div class="display-6">{{ due_now_count }}</div>
+          <div class="small-muted">اضغط تحديث داخل البوت أو انتظر الجدولة</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-md-4">
+      <div class="card border-secondary">
+        <div class="card-body">
+          <div class="h5">نتائج 24h</div>
+          <div class="display-6">{{ winrate|round(1) }}%</div>
+          <div class="small-muted">{{ finals_count }} لقطات ثابتة (آخر {{ lookback_days }} أيام)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="row g-3 mt-2">
     <div class="col-12 col-lg-5">
       <div class="card">
