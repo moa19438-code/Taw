@@ -352,29 +352,36 @@ _SIGNAL_COLS = {
 
 # extra columns for paper trades to support premium monitoring (manual execution + TP/SL hit tracking)
 _PAPER_TRADE_COLS = {
-    # snapshot fields (freeze trade plan at save-time)
+    # Snapshot fields (freeze signal at save time)
     "symbol": "TEXT",
     "mode": "TEXT",
-    "side": "TEXT",
-    "signal_ts": "TEXT",
-    "strength": "TEXT",
-    "score": "REAL",
+    "side": "TEXT",            # buy|sell
+    "signal_ts": "TEXT",       # UTC ISO
     "entry": "REAL",
     "sl": "REAL",
-    "tp": "REAL",            # TP1
-    "tp2": "REAL",           # TP2 (runner)
-    "trail_sl": "REAL",      # dynamic trailing SL (e.g., move to BE after TP1)
-    "tp1_hit": "INTEGER",    # 1 if TP1 touched
-    "tp2_hit": "INTEGER",    # 1 if TP2 touched
-    # monitor fields
-    "status": "TEXT",        # open|tp1|tp2|sl|final
-    "exec_price": "REAL",    # user executed price (optional)
-    "qty": "REAL",           # executed quantity (optional)
-    "tp_hit": "INTEGER",     # legacy: 1 if any TP touched (kept for backwards compat)
-    "sl_hit": "INTEGER",     # 1 if SL touched
-    "hit_ts": "TEXT",        # when TP/SL hit (UTC ISO)
-    "hit_price": "REAL",     # the level hit (tp1/tp2/sl)
-    "last_check_ts": "TEXT", # last monitoring scan (UTC ISO)
+    "tp": "REAL",              # TP1
+    "tp2": "REAL",             # TP2 (runner)
+    "tp3": "REAL",             # TP3 (runner)
+
+    # Trade management state
+    "status": "TEXT",          # open|runner|tp2|tp3|sl|final
+    "exec_price": "REAL",      # user executed price (optional)
+    "qty": "REAL",             # executed quantity (optional)
+
+    # Runner / trailing
+    "trail_sl": "REAL",        # active trailing stop level
+    "trail_mode": "TEXT",      # BE|TP1|ATR (for future)
+    "tp1_hit": "INTEGER",
+    "tp2_hit": "INTEGER",
+    "tp3_hit": "INTEGER",
+
+    # Monitoring / events
+    "tp_hit": "INTEGER",       # 1 if any TP touched before finalize
+    "sl_hit": "INTEGER",       # 1 if SL/tail stop touched before finalize
+    "hit_ts": "TEXT",          # when TP/SL hit (UTC ISO)
+    "hit_price": "REAL",       # the level hit (tp/sl/tp2/tp3/trail)
+    "hit_kind": "TEXT",        # tp|tp2|tp3|sl|trail
+    "last_check_ts": "TEXT",   # last monitoring scan (UTC ISO)
 }
 
 def ensure_signal_schema() -> None:
@@ -1100,73 +1107,91 @@ def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
 
 # --- Paper trades (manual simulation tracking) ---
 def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
-    """Link a saved signal to a chat_id for 24h later review.
+    """Save a signal to a chat for later monitoring/review (24h).
 
-    Platinum behavior:
-      - Freeze the trade plan at save-time (symbol/mode/side/score/entry/sl/tp/tp2).
-      - Keep compatibility with older DBs by ensuring schema before insert.
+    We freeze (snapshot) key signal fields into paper_trades so later reviews/monitoring
+    do not depend on signals table changing.
     """
+    ensure_paper_trades_schema()
+
+    # Load signal snapshot
+    sig = None
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength
+                       FROM signals WHERE id=%s""",
+                    (int(signal_id),),
+                )
+                sig = cur.fetchone()
+    else:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength FROM signals WHERE id=?",
+                (int(signal_id),),
+            ).fetchone()
+            sig = dict(row) if row else None
+
+    if not sig:
+        # Fallback: still insert minimal row (legacy behavior)
+        if IS_POSTGRES:
+            with _pg_connect() as con:
+                with con.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (%s,%s,%s,0)",
+                        (str(chat_id), int(signal_id), due_ts),
+                    )
+                con.commit()
+            return
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (?,?,?,0)",
+                (str(chat_id), int(signal_id), due_ts),
+            )
+            con.commit()
+        return
+
+    symbol = (sig.get("symbol") or "").upper().strip()
+    mode = (sig.get("mode") or "").upper().strip()
+    side = (sig.get("side") or "buy").lower().strip()
+    signal_ts = str(sig.get("ts") or "")
+    entry = float(sig.get("entry") or 0.0)
+    sl = float(sig.get("sl") or 0.0)
+    tp1 = float(sig.get("tp") or 0.0)
+
+    # Multi-stage TP: if SL exists, compute TP2/TP3 as 4R/8R runners.
+    tp2 = 0.0
+    tp3 = 0.0
     try:
-        ensure_paper_trades_schema()
+        risk = abs(entry - sl) if sl > 0 else 0.0
+        if risk > 0:
+            if side == "sell":
+                tp2 = entry - 4.0 * risk
+                tp3 = entry - 8.0 * risk
+            else:
+                tp2 = entry + 4.0 * risk
+                tp3 = entry + 8.0 * risk
     except Exception:
         pass
 
-    # Fetch signal snapshot (best-effort)
-    sig: Dict[str, Any] = {}
-    try:
-        sig = get_signal_by_id(int(signal_id)) or {}
-    except Exception:
-        sig = {}
-
-    symbol = (sig.get("symbol") or "").upper().strip()
-    mode = (sig.get("mode") or "")
-    side = (sig.get("side") or "buy")
-    strength = (sig.get("strength") or "")
-    score = sig.get("score")
-    entry = sig.get("entry")
-    sl = sig.get("sl")
-    tp = sig.get("tp")
-    sig_ts = sig.get("ts") or sig.get("signal_ts") or ""
-
-    # Compute TP2 (runner) if possible
-    tp2 = None
-    try:
-        entry_f = float(entry or 0.0)
-        sl_f = float(sl or 0.0)
-        tp_f = float(tp or 0.0)
-        if entry_f > 0 and sl_f > 0:
-            risk_per_share = abs(entry_f - sl_f)
-            # default runner target ~4R if not specified in settings (kept inside note)
-            tp2_r = float(os.getenv("TP2_R_MULT", "4.0"))
-            if (side or "buy").lower().strip() == "sell":
-                tp2 = max(0.01, entry_f - (risk_per_share * tp2_r))
-            else:
-                tp2 = entry_f + (risk_per_share * tp2_r)
-        else:
-            tp2 = None
-    except Exception:
-        tp2 = None
-
-    # Insert
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
                     """INSERT INTO paper_trades
-                       (chat_id, signal_id, due_ts, notified,
-                        symbol, mode, side, signal_ts, strength, score, entry, sl, tp, tp2,
-                        status, tp1_hit, tp2_hit, tp_hit, sl_hit)
-                       VALUES (%s,%s,%s,0,
-                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               'open',0,0,0,0)
-                    """,
+                    (chat_id, signal_id, due_ts, notified, symbol, mode, side, signal_ts, entry, sl, tp, tp2, tp3,
+                     status, trail_sl, trail_mode, tp1_hit, tp2_hit, tp3_hit, tp_hit, sl_hit)
+                    VALUES (%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,0,0,0,0)""",
                     (str(chat_id), int(signal_id), due_ts,
-                     symbol, mode, side, sig_ts, strength,
-                     float(score) if score is not None else None,
-                     float(entry) if entry is not None else None,
-                     float(sl) if sl is not None else None,
-                     float(tp) if tp is not None else None,
-                     float(tp2) if tp2 is not None else None),
+                     symbol, mode, side, signal_ts,
+                     float(entry), float(sl) if sl > 0 else None,
+                     float(tp1) if tp1 > 0 else None,
+                     float(tp2) if tp2 != 0 else None,
+                     float(tp3) if tp3 != 0 else None,
+                     "open",
+                     None, "BE"),
                 )
             con.commit()
         return
@@ -1174,40 +1199,92 @@ def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
             """INSERT INTO paper_trades
-               (chat_id, signal_id, due_ts, notified,
-                symbol, mode, side, signal_ts, strength, score, entry, sl, tp, tp2,
-                status, tp1_hit, tp2_hit, tp_hit, sl_hit)
-               VALUES (?,?,?,0,
-                       ?,?,?,?,?,?,?,?,?,?,
-                       'open',0,0,0,0)""",
-            (str(chat_id), int(signal_id), due_ts,
-             symbol, mode, side, sig_ts, strength,
-             score, entry, sl, tp, tp2),
+            (chat_id, signal_id, due_ts, notified, symbol, mode, side, signal_ts, entry, sl, tp, tp2, tp3,
+             status, trail_sl, trail_mode, tp1_hit, tp2_hit, tp3_hit, tp_hit, sl_hit)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,0)""",
+            (str(chat_id), int(signal_id), due_ts, 0,
+             symbol, mode, side, signal_ts, float(entry),
+             float(sl) if sl > 0 else None,
+             float(tp1) if tp1 > 0 else None,
+             float(tp2) if tp2 != 0 else None,
+             float(tp3) if tp3 != 0 else None,
+             "open", None, "BE"),
         )
         con.commit()
 
-
 def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
-    """Paper trades that are due for review and not yet notified."""
-    now_ts = datetime.utcnow().isoformat()
+    """Paper trades that are due for 24h finalize and not yet notified."""
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    """SELECT p.*,
-                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
-                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
-                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
-                              COALESCE(NULLIF(p.side,''), s.side) AS side,
-                              COALESCE(p.entry, s.entry) AS entry,
-                              COALESCE(p.sl, s.sl) AS sl,
-                              COALESCE(p.tp, s.tp) AS tp,
-                              COALESCE(p.tp2, NULL) AS tp2,
-                              COALESCE(p.score, s.score) AS score,
-                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
+                    """SELECT
+                          p.*,
+                          COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                          COALESCE(p.symbol, s.symbol) AS symbol,
+                          COALESCE(p.mode, s.mode) AS mode,
+                          COALESCE(p.side, s.side) AS side,
+                          COALESCE(p.entry, s.entry) AS entry,
+                          COALESCE(p.sl, s.sl) AS sl,
+                          COALESCE(p.tp, s.tp) AS tp,
+                          p.tp2, p.tp3, p.trail_sl, p.trail_mode, p.tp1_hit, p.tp2_hit, p.tp3_hit,
+                          s.score, s.strength
                        FROM paper_trades p
-                       JOIN signals s ON s.id = p.signal_id
-                       WHERE COALESCE(p.notified,0)=0 AND (p.due_ts::timestamptz) <= now()
+                       LEFT JOIN signals s ON s.id = p.signal_id
+                       WHERE COALESCE(p.notified,0)=0
+                         AND (p.due_ts::timestamptz) <= now()
+                       ORDER BY p.due_ts ASC
+                       LIMIT %s""",
+                    (int(limit),),
+                )
+                return cur.fetchall()
+
+    now_ts = datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT
+                  p.*,
+                  COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                  COALESCE(p.symbol, s.symbol) AS symbol,
+                  COALESCE(p.mode, s.mode) AS mode,
+                  COALESCE(p.side, s.side) AS side,
+                  COALESCE(p.entry, s.entry) AS entry,
+                  COALESCE(p.sl, s.sl) AS sl,
+                  COALESCE(p.tp, s.tp) AS tp,
+                  p.tp2, p.tp3, p.trail_sl, p.trail_mode, p.tp1_hit, p.tp2_hit, p.tp3_hit,
+                  s.score, s.strength
+               FROM paper_trades p
+               LEFT JOIN signals s ON s.id = p.signal_id
+               WHERE COALESCE(p.notified,0)=0
+                 AND p.due_ts <= ?
+               ORDER BY p.due_ts ASC
+               LIMIT ?""",
+            (now_ts, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def open_paper_trades_for_monitor(limit: int = 500) -> List[Dict[str, Any]]:
+    """Paper trades that are still active (open/runner) and need TP/SL monitoring."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT
+                          p.*,
+                          COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                          COALESCE(p.symbol, s.symbol) AS symbol,
+                          COALESCE(p.mode, s.mode) AS mode,
+                          COALESCE(p.side, s.side) AS side,
+                          COALESCE(p.entry, s.entry) AS entry,
+                          COALESCE(p.sl, s.sl) AS sl,
+                          COALESCE(p.tp, s.tp) AS tp,
+                          p.tp2, p.tp3, p.trail_sl, p.trail_mode, p.tp1_hit, p.tp2_hit, p.tp3_hit,
+                          s.score, s.strength
+                       FROM paper_trades p
+                       LEFT JOIN signals s ON s.id = p.signal_id
+                       WHERE COALESCE(p.notified,0)=0
+                         AND COALESCE(p.status,'open') IN ('open','runner','tp2')
                        ORDER BY p.due_ts ASC
                        LIMIT %s""",
                     (int(limit),),
@@ -1217,107 +1294,63 @@ def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            """SELECT p.*,
-                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
-                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
-                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
-                              COALESCE(NULLIF(p.side,''), s.side) AS side,
-                              COALESCE(p.entry, s.entry) AS entry,
-                              COALESCE(p.sl, s.sl) AS sl,
-                              COALESCE(p.tp, s.tp) AS tp,
-                              COALESCE(p.tp2, NULL) AS tp2,
-                              COALESCE(p.score, s.score) AS score,
-                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
+            """SELECT
+                  p.*,
+                  COALESCE(p.signal_ts, s.ts) AS signal_ts,
+                  COALESCE(p.symbol, s.symbol) AS symbol,
+                  COALESCE(p.mode, s.mode) AS mode,
+                  COALESCE(p.side, s.side) AS side,
+                  COALESCE(p.entry, s.entry) AS entry,
+                  COALESCE(p.sl, s.sl) AS sl,
+                  COALESCE(p.tp, s.tp) AS tp,
+                  p.tp2, p.tp3, p.trail_sl, p.trail_mode, p.tp1_hit, p.tp2_hit, p.tp3_hit,
+                  s.score, s.strength
                FROM paper_trades p
-               JOIN signals s ON s.id = p.signal_id
-               WHERE COALESCE(p.notified,0)=0 AND p.due_ts <= ?
+               LEFT JOIN signals s ON s.id = p.signal_id
+               WHERE COALESCE(p.notified,0)=0
+                 AND COALESCE(p.status,'open') IN ('open','runner','tp2')
                ORDER BY p.due_ts ASC
                LIMIT ?""",
             (int(limit),),
         ).fetchall()
         return [dict(r) for r in rows]
 
-
-
-def open_paper_trades_for_monitor(limit: int = 500) -> List[Dict[str, Any]]:
-    """Paper trades that are still open and need TP/SL monitoring."""
-    if IS_POSTGRES:
-        with _pg_connect() as con:
-            with con.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """SELECT p.*,
-                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
-                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
-                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
-                              COALESCE(NULLIF(p.side,''), s.side) AS side,
-                              COALESCE(p.entry, s.entry) AS entry,
-                              COALESCE(p.sl, s.sl) AS sl,
-                              COALESCE(p.tp, s.tp) AS tp,
-                              COALESCE(p.tp2, NULL) AS tp2,
-                              COALESCE(p.score, s.score) AS score,
-                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
-                       FROM paper_trades p
-                       JOIN signals s ON s.id = p.signal_id
-                       WHERE COALESCE(p.notified,0)=0
-                         AND COALESCE(p.status,'open')='open'
-                       ORDER BY p.due_ts ASC
-                       LIMIT %s""",
-                    (int(limit),),
-                )
-                return cur.fetchall()
-
-    with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """SELECT p.*,
-                              COALESCE(p.signal_ts, s.ts) AS signal_ts,
-                              COALESCE(NULLIF(p.symbol,''), s.symbol) AS symbol,
-                              COALESCE(NULLIF(p.mode,''), s.mode) AS mode,
-                              COALESCE(NULLIF(p.side,''), s.side) AS side,
-                              COALESCE(p.entry, s.entry) AS entry,
-                              COALESCE(p.sl, s.sl) AS sl,
-                              COALESCE(p.tp, s.tp) AS tp,
-                              COALESCE(p.tp2, NULL) AS tp2,
-                              COALESCE(p.score, s.score) AS score,
-                              COALESCE(NULLIF(p.strength,''), s.strength) AS strength
-               FROM paper_trades p
-               JOIN signals s ON s.id = p.signal_id
-               WHERE COALESCE(p.notified,0)=0
-                 AND COALESCE(p.status,'open')='open'
-               ORDER BY p.due_ts
-               LIMIT ?""",
-            (int(limit),),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
 def update_paper_trade_monitor_state(
     paper_id: int,
     *,
     status: Optional[str] = None,
     tp_hit: Optional[int] = None,
+    sl_hit: Optional[int] = None,
     tp1_hit: Optional[int] = None,
     tp2_hit: Optional[int] = None,
+    tp3_hit: Optional[int] = None,
     trail_sl: Optional[float] = None,
-    sl_hit: Optional[int] = None,
+    trail_mode: Optional[str] = None,
+    hit_kind: Optional[str] = None,
     hit_ts: Optional[str] = None,
     hit_price: Optional[float] = None,
     last_check_ts: Optional[str] = None,
 ) -> None:
-    """Update monitoring fields for a paper trade."""
+    """Update monitoring fields for a paper trade (idempotent)."""
     fields: Dict[str, Any] = {}
     if status is not None:
         fields["status"] = status
     if tp_hit is not None:
         fields["tp_hit"] = int(tp_hit)
+    if sl_hit is not None:
+        fields["sl_hit"] = int(sl_hit)
     if tp1_hit is not None:
         fields["tp1_hit"] = int(tp1_hit)
     if tp2_hit is not None:
         fields["tp2_hit"] = int(tp2_hit)
+    if tp3_hit is not None:
+        fields["tp3_hit"] = int(tp3_hit)
     if trail_sl is not None:
         fields["trail_sl"] = float(trail_sl)
-    if sl_hit is not None:
-        fields["sl_hit"] = int(sl_hit)
+    if trail_mode is not None:
+        fields["trail_mode"] = str(trail_mode)
+    if hit_kind is not None:
+        fields["hit_kind"] = str(hit_kind)
     if hit_ts is not None:
         fields["hit_ts"] = hit_ts
     if hit_price is not None:
@@ -1325,22 +1358,23 @@ def update_paper_trade_monitor_state(
     if last_check_ts is not None:
         fields["last_check_ts"] = last_check_ts
 
-    if not paper_id or not fields:
+    if not fields:
         return
 
     if IS_POSTGRES:
+        cols = ", ".join([f"{k}=%s" for k in fields.keys()])
+        vals = list(fields.values()) + [int(paper_id)]
         with _pg_connect() as con:
             with con.cursor() as cur:
-                sets = ", ".join([f"{k}=%s" for k in fields.keys()])
-                cur.execute(f"UPDATE paper_trades SET {sets} WHERE id=%s", tuple(fields.values()) + (int(paper_id),))
+                cur.execute(f"UPDATE paper_trades SET {cols} WHERE id=%s", vals)
             con.commit()
         return
 
     with sqlite3.connect(DB_PATH) as con:
-        sets = ", ".join([f"{k}=?" for k in fields.keys()])
-        con.execute(f"UPDATE paper_trades SET {sets} WHERE id=?", tuple(fields.values()) + (int(paper_id),))
+        cols = ", ".join([f"{k}=?" for k in fields.keys()])
+        vals = list(fields.values()) + [int(paper_id)]
+        con.execute(f"UPDATE paper_trades SET {cols} WHERE id=?", vals)
         con.commit()
-
 
 def mark_paper_trade_notified(paper_id: int) -> None:
     if IS_POSTGRES:

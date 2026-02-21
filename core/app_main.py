@@ -1331,18 +1331,6 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
         risk_per_share = max(entry - sl, 0.01)
         tp = entry + (risk_per_share * tp_r_mult)
 
-    # TP2 (Runner): allows catching big moves without changing TP1
-    tp2_r_mult = _get_float(settings, "TP2_R_MULT", float(os.getenv("TP2_R_MULT","4.0")))
-    tp2 = None
-    try:
-        if tp2_r_mult and float(tp2_r_mult) > float(tp_r_mult) and risk_per_share > 0:
-            if side == "sell":
-                tp2 = max(0.01, entry - (risk_per_share * float(tp2_r_mult)))
-            else:
-                tp2 = entry + (risk_per_share * float(tp2_r_mult))
-    except Exception:
-        tp2 = None
-
     # تصنيف (A+/A/B) حسب القوة
     st = _strength(float(c.score))
     if st == "قوي جداً":
@@ -1374,24 +1362,11 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
     # RR محسوب على أساس المخاطرة R
     rr = (abs(tp - entry)) / max(abs(entry - sl), 0.01)
 
-    # TP2 runner (optional): catch extended moves while keeping TP1 conservative
-    tp2 = None
-    try:
-        tp2_r_mult = _get_float(s, "TP2_R_MULT", float(os.getenv("TP2_R_MULT","4.0")))
-        if tp2_r_mult and float(tp2_r_mult) > float(tp_r_mult) and risk_per_share > 0:
-            if side == "sell":
-                tp2 = max(0.01, entry - (risk_per_share * float(tp2_r_mult)))
-            else:
-                tp2 = entry + (risk_per_share * float(tp2_r_mult))
-    except Exception:
-        tp2 = None
-
     return {
         "side": side,
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
-        "tp2": round(float(tp2), 2) if tp2 is not None else None,
         "qty": int(qty),
         "atr": round(atr_val, 2),
         "sl_atr_mult": sl_atr_mult,
@@ -1519,7 +1494,6 @@ def _build_trade_plan(symbol: str,
         "entry": round(entry, 2),
         "sl": round(float(sl), 2),
         "tp": round(float(tp), 2),
-        "tp2": round(float(tp2), 2) if tp2 is not None else None,
         "atr": round(float(atr or 0.0), 2),
         "sl_atr_mult": round(float(sl_atr_mult), 2),
         "tp_r_mult": round(float(tp_r_mult), 2),
@@ -1583,10 +1557,8 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
 
         f"{ai_line}"
         f"الأمر المرفق: جني الربح/وقف الخسارة\n"
-        f"جني الربح (TP1): {plan['tp']}\n"
-        + (f"جني الربح (TP2/Runner): {plan.get('tp2')}\n" if plan.get('tp2') is not None else "")
-        + (f"Trail SL بعد TP1: {plan['entry']}\n" if plan.get('tp2') is not None else "")
-        + f"وقف الخسارة: {plan['sl']}\n"
+        f"جني الربح: {plan['tp']}\n"
+        f"وقف الخسارة: {plan['sl']}\n"
         f"الخطة: {mode_label}\n"
         f"ملاحظة: {c.notes}\n"
     )
@@ -1873,10 +1845,103 @@ def _scan_hit_in_bars(symbol: str, side: str, tp: float, sl: float, start: datet
         if hit_sl:
             return {"kind": "sl", "ts": dt.isoformat().replace("+00:00","Z"), "price": sl}
     return None
+def _scan_runner_window(
+    symbol: str,
+    side: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    start: datetime,
+    end: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Scan bars chronologically with a runner state machine.
+
+    Returns dict: {kind, ts, price}
+      kind in: 'sl','tp','tp2','tp3','trail','tp1_be'
+    """
+    if entry <= 0:
+        return None
+    # fallback: if no SL/TP, nothing to do
+    if (tp1 <= 0 and tp2 <= 0 and tp3 <= 0) and sl <= 0:
+        return None
+
+    state = 0  # 0 before TP1, 1 runner to TP2, 2 runner to TP3
+    trail = 0.0
+
+    try:
+        data = bars([symbol], start=start, end=end, timeframe="5Min", limit=3000)
+        bl = (data.get("bars", {}).get(symbol) or [])
+        if not bl:
+            return None
+
+        for b in bl:
+            ts = b.get("t")
+            dt = _dt_from_iso(str(ts)) or None
+            if dt is None:
+                continue
+            h = float(b.get("h") or 0.0)
+            l = float(b.get("l") or 0.0)
+
+            if side == "sell":
+                # invert comparisons for short
+                # TP hits are lows <= target; SL/trail hits are highs >= stop
+                def hit_tp(target: float) -> bool:
+                    return target > 0 and l <= target
+                def hit_stop(stop: float) -> bool:
+                    return stop > 0 and h >= stop
+            else:
+                def hit_tp(target: float) -> bool:
+                    return target > 0 and h >= target
+                def hit_stop(stop: float) -> bool:
+                    return stop > 0 and l <= stop
+
+            if state == 0:
+                if hit_stop(sl):
+                    return {"kind": "sl", "ts": dt.isoformat().replace("+00:00","Z"), "price": sl}
+                if hit_tp(tp1):
+                    state = 1
+                    trail = entry  # breakeven
+                    continue
+            elif state == 1:
+                if hit_stop(trail):
+                    return {"kind": "trail", "ts": dt.isoformat().replace("+00:00","Z"), "price": trail}
+                if hit_tp(tp2):
+                    state = 2
+                    trail = tp1 if tp1 > 0 else entry
+                    # If TP3 already hit in this bar (gap), allow it
+                    if hit_tp(tp3):
+                        return {"kind": "tp3", "ts": dt.isoformat().replace("+00:00","Z"), "price": tp3}
+                    continue
+            else:
+                if hit_stop(trail):
+                    return {"kind": "trail", "ts": dt.isoformat().replace("+00:00","Z"), "price": trail}
+                if hit_tp(tp3):
+                    return {"kind": "tp3", "ts": dt.isoformat().replace("+00:00","Z"), "price": tp3}
+
+        # End of window: if TP1 happened but nothing else, return breakeven (protected)
+        if state >= 1:
+            return {"kind": "tp1_be", "ts": end.isoformat().replace("+00:00","Z"), "price": entry}
+    except Exception:
+        return None
+
+    return None
+
 
 
 def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
-    """Monitor OPEN paper trades for TP/SL hits and notify immediately."""
+    """Monitor active paper trades for TP1/TP2/TP3/Trail hits and notify immediately.
+
+    Multi-stage logic:
+      - status=open: monitor TP1 vs SL
+      - on TP1: arm runner (trail_sl = entry, status=runner)
+      - status=runner: monitor TP2 vs trail_sl (BE)
+      - on TP2: lock profits (trail_sl = TP1, status=tp2)
+      - status=tp2: monitor TP3 vs trail_sl (TP1)
+      - on TP3: mark tp3 hit (status=tp3)
+      - on trail hit: mark as sl with hit_kind=trail
+    """
     global _LAST_PAPER_MONITOR_RUN
     now = time.time()
     if (now - float(_LAST_PAPER_MONITOR_RUN or 0.0)) < float(ttl_sec):
@@ -1897,19 +1962,18 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
             paper_id = int(r.get("id") or 0)
             chat = str(r.get("chat_id") or "")
             symbol = (r.get("symbol") or "").upper().strip()
+            mode = (r.get("mode") or "").upper().strip()
             side = (r.get("side") or "buy").lower().strip()
+
             entry = float(r.get("entry") or 0.0)
-            tp = float(r.get("tp") or 0.0)   # TP1
-            tp2 = float(r.get("tp2") or 0.0) # TP2 (runner)
             sl = float(r.get("sl") or 0.0)
-            tp1_hit = int(r.get("tp1_hit") or 0)
+            tp1 = float(r.get("tp") or 0.0)
+            tp2 = float(r.get("tp2") or 0.0)
+            tp3 = float(r.get("tp3") or 0.0)
             trail_sl = float(r.get("trail_sl") or 0.0)
+            p_status = (r.get("status") or "open").lower().strip()
 
             if not paper_id or not chat or not symbol or entry <= 0:
-                continue
-            if tp <= 0 and sl <= 0:
-                # nothing to monitor
-                update_paper_trade_monitor_state(paper_id, last_check_ts=now_dt.isoformat().replace("+00:00","Z"))
                 continue
 
             sig_dt = _dt_from_iso(str(r.get("signal_ts") or "")) or (now_dt - timedelta(hours=26))
@@ -1917,101 +1981,138 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
             end_dt = min(now_dt, due_dt)
 
             last_check = _dt_from_iso(str(r.get("last_check_ts") or "")) or sig_dt
-            # avoid scanning too-far back repeatedly
             start_dt = max(last_check - timedelta(minutes=5), sig_dt)
 
             if end_dt <= start_dt:
-                update_paper_trade_monitor_state(paper_id, last_check_ts=now_dt.isoformat().replace("+00:00","Z"))
+                update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
                 continue
 
-            # Decide what to monitor:
-            # - Before TP1: monitor TP1 vs SL
-            # - After TP1: keep a runner toward TP2, with trailing SL moved to breakeven (or existing trail_sl)
-            mon_tp = tp
-            mon_sl = sl
-            if tp1_hit:
-                mon_tp = tp2 if tp2 > 0 else tp
-                if trail_sl > 0:
-                    mon_sl = trail_sl
-                else:
-                    # breakeven trail by default
-                    mon_sl = entry
+            # Decide which targets to monitor based on status
+            tp_target = 0.0
+            sl_target = 0.0
+            tp_kind = "tp"
+            sl_kind = "sl"
 
-            hit = _scan_hit_in_bars(symbol, side, float(mon_tp or 0.0), float(mon_sl or 0.0), start_dt, end_dt)
+            if p_status in ("open", ""):
+                tp_target = tp1
+                sl_target = sl
+                tp_kind = "tp"
+                sl_kind = "sl"
+            elif p_status == "runner":
+                tp_target = tp2 if tp2 > 0 else tp1
+                sl_target = trail_sl if trail_sl > 0 else entry
+                tp_kind = "tp2"
+                sl_kind = "trail"
+            elif p_status == "tp2":
+                tp_target = tp3 if tp3 > 0 else tp2
+                sl_target = trail_sl if trail_sl > 0 else tp1
+                tp_kind = "tp3"
+                sl_kind = "trail"
+            else:
+                # not monitorable
+                update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
+                continue
+
+            if tp_target <= 0 and sl_target <= 0:
+                update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
+                continue
+
+            hit = _scan_hit_in_bars(symbol, side, tp_target if tp_target > 0 else 0.0, sl_target if sl_target > 0 else 0.0, start_dt, end_dt)
             update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
 
             if not hit:
                 continue
 
-            kind = hit.get("kind")
+            kind = hit.get("kind")  # 'tp' or 'sl' from scanner
             hit_ts = str(hit.get("ts") or now_dt.isoformat().replace("+00:00","Z"))
             hit_price = float(hit.get("price") or 0.0)
 
-            # Handle multi-stage TP:
-            if kind == "tp":
-                if not tp1_hit:
-                    # TP1 hit -> activate runner + trail to breakeven
-                    update_paper_trade_monitor_state(
-                        paper_id,
-                        status="tp1",
-                        tp_hit=1,
-                        tp1_hit=1,
-                        trail_sl=float(entry),
-                        hit_ts=hit_ts,
-                        hit_price=hit_price,
-                    )
-                    res_emoji = "✅"
-                    res_title = "تحقق TP1 — تم تفعيل Runner"
-                else:
-                    # TP2 hit -> finalize win
-                    update_paper_trade_monitor_state(
-                        paper_id,
-                        status="tp2",
-                        tp_hit=1,
-                        tp2_hit=1,
-                        hit_ts=hit_ts,
-                        hit_price=hit_price,
-                    )
-                    res_emoji = "🏁✅"
-                    res_title = "تحقق TP2 (Runner) — هدف كبير"
-            else:
-                update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_ts=hit_ts, hit_price=hit_price)
-                res_emoji = "❌"
-                res_title = "تحقق وقف الخسارة (SL)"
+            # Map scanner kind to our stage kind
+            mapped_kind = tp_kind if kind == "tp" else sl_kind
 
-            # R-multiple estimate
+            # Stage transitions
+            if mapped_kind == "tp":
+                # TP1 hit → arm runner (trail to breakeven)
+                update_paper_trade_monitor_state(
+                    paper_id,
+                    status="runner",
+                    tp_hit=1,
+                    tp1_hit=1,
+                    trail_sl=entry,
+                    trail_mode="BE",
+                    hit_kind="tp",
+                    hit_ts=hit_ts,
+                    hit_price=hit_price,
+                )
+                title = "تحقق TP1 — تم تفعيل Runner (Trail إلى الدخول)"
+                res_emoji = "✅"
+            elif mapped_kind == "tp2":
+                # TP2 hit → lock profits (trail to TP1)
+                new_trail = tp1 if tp1 > 0 else entry
+                update_paper_trade_monitor_state(
+                    paper_id,
+                    status="tp2",
+                    tp_hit=1,
+                    tp2_hit=1,
+                    trail_sl=new_trail,
+                    trail_mode="TP1",
+                    hit_kind="tp2",
+                    hit_ts=hit_ts,
+                    hit_price=hit_price,
+                )
+                title = "تحقق TP2 — Runner مستمر (Trail إلى TP1)"
+                res_emoji = "🏁"
+            elif mapped_kind == "tp3":
+                # TP3 hit → mark big win
+                update_paper_trade_monitor_state(
+                    paper_id,
+                    status="tp3",
+                    tp_hit=1,
+                    tp3_hit=1,
+                    hit_kind="tp3",
+                    hit_ts=hit_ts,
+                    hit_price=hit_price,
+                )
+                title = "تحقق TP3 — صفقة ذهبية"
+                res_emoji = "🏆"
+            else:
+                # SL / Trail hit
+                update_paper_trade_monitor_state(
+                    paper_id,
+                    status="sl",
+                    sl_hit=1,
+                    hit_kind=mapped_kind,
+                    hit_ts=hit_ts,
+                    hit_price=hit_price,
+                )
+                title = "تحقق وقف الخسارة" if mapped_kind == "sl" else "تحقق Trail Stop"
+                res_emoji = "❌"
+
+            # R-multiple estimate (vs SL risk if available)
             r_mult = None
             try:
-                if side == "sell":
-                    risk = (sl - entry) if sl > 0 else None
-                    reward = (entry - hit_price)
-                else:
-                    risk = (entry - sl) if sl > 0 else None
-                    reward = (hit_price - entry)
-                if risk and abs(risk) > 1e-9:
+                risk = abs(entry - sl) if sl > 0 else None
+                if risk and risk > 1e-9:
+                    if side == "sell":
+                        reward = (entry - hit_price)
+                    else:
+                        reward = (hit_price - entry)
                     r_mult = reward / risk
             except Exception:
                 pass
 
-            extra = f" | R: {r_mult:+.2f}" if r_mult is not None else ""
-            tp1_line = f"TP1: {tp:.4g}$" if tp > 0 else "TP1: —"
-            tp2_line = f"TP2: {tp2:.4g}$" if tp2 > 0 else ""
-            trail_line = ""
-            try:
-                if (tp1_hit or (res_title and "TP1" in res_title)) and float(entry) > 0:
-                    trail_line = f"Trail SL (بعد TP1): {entry:.4g}$"
-            except Exception:
-                trail_line = ""
+            extra_r = f" | R: {r_mult:+.2f}" if r_mult is not None else ""
 
             msg = (
-                f"🔔 {res_emoji} {symbol} — {res_title}\n\n"
+                f"🔔 {res_emoji} {symbol} ({mode}) — {title}\n\n"
                 f"Entry: {entry:.4g}$\n"
-                f"{tp1_line}\n"
-                + (f"{tp2_line}\n" if tp2_line else "")
-                + f"SL: {sl:.4g}$\n"
-                + (f"{trail_line}\n" if trail_line else "")
-                + f"hit@: {hit_ts}\n"
-                + f"{extra}"
+                f"SL: {sl:.4g}$\n"
+                f"TP1: {tp1:.4g}$\n"
+                f"TP2: {tp2:.4g}$\n"
+                f"TP3: {tp3:.4g}$\n"
+                f"Trail: {trail_sl:.4g}$\n"
+                f"hit@: {hit_ts}\n"
+                f"{extra_r}"
             )
             _tg_send(chat, msg, silent=True)
 
@@ -2020,17 +2121,18 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                 signal_id = int(r.get("signal_id") or 0)
                 if signal_id > 0:
                     note = json.dumps({
-                        "kind": "paper_24h_hit",
-                        "hit_kind": kind,
+                        "kind": "paper_hit",
+                        "hit_kind": mapped_kind,
                         "hit_ts": hit_ts,
                         "hit_price": hit_price,
-                        "tp1": tp,
+                        "tp1": tp1,
                         "tp2": tp2,
-                        "stage": "tp1" if (res_title and "TP1" in res_title) else ("tp2" if (res_title and "TP2" in res_title) else kind),
+                        "tp3": tp3,
                         "sl": sl,
                         "entry": entry,
+                        "side": side,
+                        "status": (r.get("status") or ""),
                     }, ensure_ascii=False)
-                    # use close field to store hit_price for event logs
                     log_signal_review(
                         ts=datetime.now(timezone.utc).isoformat(),
                         signal_id=signal_id,
@@ -2045,7 +2147,6 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
 
         except Exception:
             continue
-
 
 def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
     """Check for due 24h paper trades and send results to their chats (throttled)."""
@@ -2076,20 +2177,17 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
 
 
             tp = float(r.get("tp") or 0.0)
-            tp2 = float(r.get("tp2") or 0.0)
-            tp1_hit = int(r.get("tp1_hit") or 0)
-            trail_sl = float(r.get("trail_sl") or 0.0)
             sl = float(r.get("sl") or 0.0)
             p_status = (r.get("status") or "open").lower().strip()
             hit_price = float(r.get("hit_price") or 0.0)
             hit_ts = str(r.get("hit_ts") or "")
 
             # If TP/SL was already hit during monitoring, finalize based on that hit.
-            if p_status in ("tp","tp1","tp2","sl") and hit_price > 0:
+            if p_status in ("tp", "tp2", "tp3", "sl") and hit_price > 0:
                 exit_price = hit_price
                 live_p = None
                 live_ts = None
-                price_src = "TP_HIT" if p_status in ("tp","tp1","tp2") else "SL_HIT"
+                price_src = "TP_HIT" if p_status == "tp" else ("TP2_HIT" if p_status=="tp2" else ("TP3_HIT" if p_status=="tp3" else "SL_HIT"))
             else:
                 exit_price = None
                 price_src = ""
@@ -2099,19 +2197,29 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
                 try:
                     sig_dt = _dt_from_iso(str(r.get("signal_ts") or "")) or datetime.now(timezone.utc) - timedelta(hours=26)
                     due_dt = _dt_from_iso(str(r.get("due_ts") or "")) or (sig_dt + timedelta(hours=24))
-                    hit2 = _scan_hit_in_bars(symbol, side, tp, sl, sig_dt, due_dt)
+                    hit2 = _scan_runner_window(symbol, side, entry, sl, tp, float(r.get('tp2') or 0.0), float(r.get('tp3') or 0.0), sig_dt, due_dt)
                     if hit2:
                         kind2 = hit2.get("kind")
                         hit_ts2 = str(hit2.get("ts") or "")
                         hit_price2 = float(hit2.get("price") or 0.0)
-                        if kind2 == "tp":
-                            p_status = "tp"
-                            update_paper_trade_monitor_state(paper_id, status="tp", tp_hit=1, hit_ts=hit_ts2, hit_price=hit_price2)
-                            price_src = "TP_HIT"
+                        if kind2 in ("tp", "tp2", "tp3"):
+                            p_status = kind2
+                            update_paper_trade_monitor_state(paper_id, status=kind2, tp_hit=1,
+                                                           tp1_hit=1 if kind2=="tp" else None,
+                                                           tp2_hit=1 if kind2=="tp2" else None,
+                                                           tp3_hit=1 if kind2=="tp3" else None,
+                                                           hit_kind=kind2, hit_ts=hit_ts2, hit_price=hit_price2)
+                            price_src = "TP_HIT" if kind2=="tp" else ("TP2_HIT" if kind2=="tp2" else "TP3_HIT")
+                        elif kind2 == "tp1_be":
+                            p_status = "final"
+                            update_paper_trade_monitor_state(paper_id, status="final", tp_hit=1, tp1_hit=1, hit_kind="tp1_be",
+                                                           hit_ts=hit_ts2, hit_price=hit_price2)
+                            price_src = "TP1_BE"
                         else:
                             p_status = "sl"
-                            update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_ts=hit_ts2, hit_price=hit_price2)
-                            price_src = "SL_HIT"
+                            hk = "trail" if kind2 == "trail" else "sl"
+                            update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_kind=hk, hit_ts=hit_ts2, hit_price=hit_price2)
+                            price_src = "TRAIL_HIT" if hk=="trail" else "SL_HIT"
                         hit_ts = hit_ts2
                         hit_price = hit_price2
                         exit_price = hit_price2
@@ -2136,20 +2244,6 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
 
             if exit_price is None:
                 exit_price = entry
-
-            # If TP1 was hit and we are still not stopped/TP2, assume breakeven trail after TP1:
-            try:
-                if tp1_hit and p_status not in ("tp2","sl") and entry > 0 and exit_price is not None:
-                    if side == "sell":
-                        exit_price = min(float(exit_price), float(entry))
-                    else:
-                        exit_price = max(float(exit_price), float(entry))
-                    if price_src == "LIVE":
-                        price_src = "LIVE+TRAIL_BE"
-                    elif price_src:
-                        price_src = f"{price_src}+TRAIL_BE"
-            except Exception:
-                pass
 
             if side == "sell":
                 ret_pct = (entry - exit_price) / entry * 100.0
@@ -2177,7 +2271,12 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
                         "live_ts": live_ts or "",
                         "review_ts": datetime.now(timezone.utc).isoformat(),
                         "tp": tp,
+                        "tp2": float(r.get("tp2") or 0.0),
+                        "tp3": float(r.get("tp3") or 0.0),
                         "sl": sl,
+                        "entry": entry,
+                        "side": side,
+                        "hit_kind": str(r.get("hit_kind") or ""),
                         "paper_status": p_status,
                         "hit_ts": hit_ts,
                         "hit_price": hit_price,
@@ -2750,7 +2849,7 @@ def telegram_webhook():
                             live_p0, _ = _get_live_trade_price(c.symbol)
                             entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                             plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
-                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                            info2 = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
                             set_user_state(chat, "last_pick", json.dumps(info2, ensure_ascii=False))
                         except Exception:
                             pass
@@ -2791,7 +2890,7 @@ def telegram_webhook():
                                 live_p0, _ = _get_live_trade_price(c.symbol)
                                 entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                                 plan0 = _compute_trade_plan(s0, c, entry_override=entry_override0)
-                                info = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
+                                info = {"symbol": c.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c, "score", 0.0) or 0.0), "strength": str(getattr(c,"grade","B") or "B")}
                                 set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                             except Exception:
                                 pass
@@ -2843,7 +2942,7 @@ def telegram_webhook():
                                     live_p0, _ = _get_live_trade_price(c2.symbol)
                                     entry_override0 = live_p0 if (live_p0 is not None and _is_us_market_open()) else None
                                     plan0 = _compute_trade_plan(s0, c2, entry_override=entry_override0)
-                                    info = {"symbol": c2.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "tp2": plan0.get("tp2"), "score": float(getattr(c2, "score", 0.0) or 0.0), "strength": str(getattr(c2,"grade","B") or "B")}
+                                    info = {"symbol": c2.symbol, "mode": "d1", "side": plan0.get("side","buy"), "entry": float(plan0.get("entry") or 0.0), "sl": plan0.get("sl"), "tp": plan0.get("tp"), "score": float(getattr(c2, "score", 0.0) or 0.0), "strength": str(getattr(c2,"grade","B") or "B")}
                                     set_user_state(chat, "last_pick", json.dumps(info, ensure_ascii=False))
                                 except Exception:
                                     pass
