@@ -67,6 +67,84 @@
     </div>
   </div>
 
+
+<div class="row g-3 mt-2">
+  <div class="col-12 col-md-3">
+    <div class="card border-dark">
+      <div class="card-body">
+        <div class="h6">Avg R</div>
+        <div class="display-6">{{ avg_r|round(2) }}</div>
+        <div class="small-muted">Expectancy (آخر {{ lookback_days }} أيام)</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-dark">
+      <div class="card-body">
+        <div class="h6">Profit Factor</div>
+        <div class="display-6">
+          {{ profit_factor_display }}
+        </div>
+        <div class="small-muted">مجموع الأرباح / مجموع الخسائر (R)</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-dark">
+      <div class="card-body">
+        <div class="h6">Max DD</div>
+        <div class="display-6">{{ (max_dd*100)|round(1) }}%</div>
+        <div class="small-muted">على منحنى رأس المال الافتراضي</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-3">
+    <div class="card border-dark">
+      <div class="card-body">
+        <div class="h6">Equity (Virtual)</div>
+        <div class="display-6">{{ equity_last|round(2) }}</div>
+        <div class="small-muted">Start {{ start_capital }} | Risk {{ risk_pct }}%</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mt-2">
+  <div class="col-12 col-lg-8">
+    <div class="card">
+      <div class="card-header">منحنى رأس المال (افتراضي)</div>
+      <div class="card-body">
+        {% if equity_svg %}
+          <div class="text-primary">{{ equity_svg|safe }}</div>
+        {% else %}
+          <div class="small-muted">لا توجد بيانات كافية.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-lg-4">
+    <div class="card">
+      <div class="card-header">نتائج الضربات</div>
+      <div class="card-body">
+        <ul class="list-group list-group-flush">
+          <li class="list-group-item d-flex justify-content-between"><span>TP1</span><span class="badge bg-success">{{ tp1_hits }}</span></li>
+          <li class="list-group-item d-flex justify-content-between"><span>TP2</span><span class="badge bg-success">{{ tp2_hits }}</span></li>
+          <li class="list-group-item d-flex justify-content-between"><span>TP3</span><span class="badge bg-success">{{ tp3_hits }}</span></li>
+          <li class="list-group-item d-flex justify-content-between"><span>Trail</span><span class="badge bg-warning text-dark">{{ trail_hits }}</span></li>
+          <li class="list-group-item d-flex justify-content-between"><span>SL</span><span class="badge bg-danger">{{ sl_hits }}</span></li>
+        </ul>
+        <hr/>
+        <div class="small fw-bold mb-2">توزيع R</div>
+        <ul class="list-group list-group-flush">
+          {% for b, c in r_hist %}
+            <li class="list-group-item d-flex justify-content-between"><span class="mono">{{ b }}</span><span class="badge bg-secondary">{{ c }}</span></li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
   <div class="row g-3 mt-2">
     <div class="col-12 col-lg-5">
       <div class="card">
