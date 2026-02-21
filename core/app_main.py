@@ -2001,6 +2001,12 @@ def telegram_webhook():
             
             # 📊 مراجعات 24 ساعة (مقفلة)
             if action in ("my_sig_24h", "my_sig_24h_refresh"):
+                # Make this button actually useful: run the due-paper runner first.
+                # ttl_sec=0 disables throttling for manual refresh.
+                try:
+                    _run_due_paper_reviews(ttl_sec=0)
+                except Exception:
+                    pass
                 msg = _my_saved_24h_reviews_message(str(chat_id), lookback_days=30, limit=50)
                 _ui(msg, reply_markup=_build_my_sig_24h_kb(back_action="my_sig_menu"))
                 return jsonify({"ok": True})
@@ -3079,15 +3085,39 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
 
 
 def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: int = 30) -> str:
-    """Return frozen 24h review snapshots for this chat."""
+    """24h reviews for a chat.
+
+    - ✅ "مكتملة" = frozen snapshots saved by the runner (kind=paper_24h_final)
+    - ⏳ "قيد الانتظار" = saved paper trades that haven't reached 24h yet (or runner hasn't snapped them yet)
+
+    This makes the Telegram button useful even before any snapshot exists.
+    """
+    now = datetime.now(timezone.utc)
     try:
-        rows = list_final_paper_reviews_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=int(limit))
+        rows_final = list_final_paper_reviews_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=max(50, int(limit)))
     except Exception:
-        rows = []
-    if not rows:
-        return "📊 مراجعات 24 ساعة\n\nلا توجد مراجعات مكتملة محفوظة حتى الآن."
-    lines: List[str] = []
-    for r in rows[:int(limit)]:
+        rows_final = []
+
+    try:
+        paper_rows = list_paper_trades_for_chat(str(chat_id), lookback_days=int(lookback_days), limit=max(80, int(limit) * 3))
+    except Exception:
+        paper_rows = []
+
+    # Map completed snapshots by signal_id (so we can mark pending items correctly)
+    completed_by_signal: Dict[int, Dict[str, Any]] = {}
+    for rr in rows_final or []:
+        try:
+            sid = int(rr.get("signal_id") or 0)
+            if sid:
+                completed_by_signal[sid] = rr
+        except Exception:
+            continue
+
+    completed_lines: List[str] = []
+    pending_lines: List[str] = []
+
+    # 1) Completed snapshots
+    for r in (rows_final or [])[: int(limit)]:
         try:
             symbol = (r.get("symbol") or "").upper().strip()
             mode = (r.get("mode") or "D1").upper().strip()
@@ -3112,13 +3142,61 @@ def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: 
             src_line = f" | Src: {price_src}" if price_src else ""
             ts_line = f" | {review_ts[:16].replace('T',' ')}" if review_ts else ""
             sc_line = f" | Score: {float(score):.1f}" if score is not None else ""
-            lines.append(
+            completed_lines.append(
                 f"{res} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret_pct:+.2f}% | Entry: {entry:.2f} | Exit: {exit_price:.2f}{sc_line}{src_line}{ts_line}"
             )
         except Exception:
             continue
-    header = f"📊 مراجعات 24 ساعة (مقفلة)\n— العدد: {len(rows)}\n"
-    return header + "\n".join(lines[:25])
+
+    # 2) Pending / scheduled
+    for pr in (paper_rows or [])[: max(120, int(limit) * 3)]:
+        try:
+            sid = int(pr.get("signal_id") or 0)
+            if sid and sid in completed_by_signal:
+                continue  # already completed
+
+            symbol = (pr.get("symbol") or "").upper().strip()
+            mode = (pr.get("mode") or "D1").upper().strip()
+            side = (pr.get("side") or "buy").lower().strip()
+            entry = float(pr.get("entry") or 0.0)
+            due_ts = pr.get("due_ts") or ""
+            if not symbol or entry <= 0 or not due_ts:
+                continue
+            due_dt = datetime.fromisoformat(due_ts.replace("Z", "+00:00"))
+            remaining = due_dt - now
+            side_label = "شراء" if side != "sell" else "بيع"
+
+            if remaining.total_seconds() > 0:
+                # Still counting down
+                mins = int(max(0, remaining.total_seconds()) // 60)
+                hh = mins // 60
+                mm = mins % 60
+                pending_lines.append(
+                    f"⏳ {symbol} ({mode.lower()}) | 🎯 {side_label} | Entry: {entry:.2f} | باقي: {hh:02d}:{mm:02d} | Due: {due_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+                )
+            else:
+                # Due but runner hasn't snapped yet (or just snapped and DB read is stale)
+                pending_lines.append(
+                    f"🕒 {symbol} ({mode.lower()}) | 🎯 {side_label} | Entry: {entry:.2f} | مستحقة الآن (اضغط تحديث)"
+                )
+        except Exception:
+            continue
+
+    header = (
+        f"📊 مراجعات 24 ساعة (لقطة ثابتة)\n"
+        f"— مكتملة: {len(rows_final or [])}\n"
+        f"— قيد الانتظار: {len(pending_lines)}\n"
+    )
+
+    parts: List[str] = [header]
+    if completed_lines:
+        parts.append("✅ مكتملة:\n" + "\n".join(completed_lines[:25]))
+    if pending_lines:
+        parts.append("\n⏳ قيد الانتظار:\n" + "\n".join(pending_lines[:25]))
+
+    if not completed_lines and not pending_lines:
+        parts.append("\nلا توجد مراجعات أو شارات محفوظة ضمن الفترة الحالية.")
+    return "\n".join(parts).rstrip()
 
 
 def _review_and_saved_message(chat_id: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -3402,6 +3480,19 @@ def _start_scheduler() -> None:
         id="scan_job",
         replace_existing=True,
     )
+
+    # Ensure 24h paper reviews run even if nobody presses Telegram buttons.
+    # This is important for Railway (always-on web dyno) so due reviews are snapped on time.
+    try:
+        _scheduler.add_job(
+            _run_due_paper_reviews,
+            IntervalTrigger(minutes=3),
+            kwargs={"ttl_sec": 0},
+            id="paper_24h_job",
+            replace_existing=True,
+        )
+    except Exception:
+        pass
     _scheduler.start()
     atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler else None)
 try:
