@@ -10,7 +10,42 @@ from core.config import (
 from core.alpaca_client import list_assets, bars
 from core.indicators import sma, ema, rsi, atr, macd, bollinger_bands, adx, stochastic, obv, vwap
 from core.candlestick_patterns import classify_last_patterns
+from core.features_store import normalize_features
 from core.storage import get_all_settings, parse_int, parse_float, get_watchlist
+
+def _get_weekly_features(symbol: str, lookback_weeks: int = 120) -> Dict[str, Any]:
+    """Fetch weekly bars and compute a small set of higher-timeframe features.
+
+    We use these as confirmation for 1D signals to reduce whipsaws.
+    """
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(weeks=lookback_weeks)
+        data = bars([symbol], start=start, end=end, timeframe="1Week", limit=min(lookback_weeks, 1000))
+        # Support both {'bars': {'SYM': [...]}} and {'SYM': [...]}
+        blist = None
+        if isinstance(data, dict):
+            if "bars" in data and isinstance(data["bars"], dict):
+                blist = data["bars"].get(symbol)
+            if blist is None:
+                blist = data.get(symbol)
+        if not blist:
+            return {}
+        closes = [float(b.get("c") or b.get("close")) for b in blist if (b.get("c") is not None or b.get("close") is not None)]
+        if len(closes) < 60:
+            return {}
+        last = closes[-1]
+        w_ema20 = ema(closes, 20)
+        w_ema50 = ema(closes, 50)
+        w_rsi14 = rsi(closes, 14)
+        return {
+            "W_CLOSE": last,
+            "W_EMA20": w_ema20,
+            "W_EMA50": w_ema50,
+            "W_RSI14": w_rsi14,
+        }
+    except Exception:
+        return {}
 
 @dataclass
 class Candidate:
@@ -175,7 +210,7 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
     if vwap20 is not None and last > vwap20:
         notes.append("Above VWAP20")
 
-    return {
+    raw = {
         "price": round(last, 4),
         "SMA20": round(s20, 4) if s20 is not None else None,
         "SMA50": round(s50, 4) if s50 is not None else None,
@@ -214,6 +249,9 @@ def get_symbol_features(symbol: str) -> Dict[str, Any]:
         "notes": ", ".join(notes),
     }
 
+    raw.update(_get_weekly_features(symbol))
+
+    return normalize_features(raw)
 
 def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
     """Fetch recent 5-min bars for one symbol and compute lightweight intraday features.
@@ -265,7 +303,7 @@ def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
     if pat.get("pattern"):
         notes.append(f"{pat.get('pattern')} {pat.get('strength') or ''}".strip())
 
-    return {
+    raw = {
         "tf": "5Min",
         "last": round(float(last), 4),
         "ema20": (round(float(e20), 4) if e20 is not None else None),
@@ -283,6 +321,9 @@ def get_symbol_features_m5(symbol: str) -> Dict[str, Any]:
         "notes": ",".join(notes),
     }
 
+    raw.update(_get_weekly_features(symbol))
+
+    return normalize_features(raw)
 
 def scan_universe_from_symbols(symbols: List[str]) -> List[Candidate]:
     end = datetime.now(timezone.utc)

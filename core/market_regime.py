@@ -30,7 +30,14 @@ def get_market_regime(ttl_sec: int = 300) -> Dict[str, Any]:
         end = _utcnow()
         start = end - timedelta(days=220)
         data = bars(["SPY"], start=start, end=end, timeframe="1Day", limit=220)
-        blist = (data.get("SPY") or []) if isinstance(data, dict) else []
+        # alpaca_client.bars returns {"bars": {"SPY": [...]}}; keep backward compatibility
+        if isinstance(data, dict):
+            if "bars" in data and isinstance(data.get("bars"), dict):
+                blist = data.get("bars", {}).get("SPY") or []
+            else:
+                blist = data.get("SPY") or []
+        else:
+            blist = []
         closes: List[float] = []
         for b in blist:
             c = b.get("c") if isinstance(b, dict) else None
