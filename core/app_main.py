@@ -7,8 +7,6 @@ import json
 import time
 import re
 import requests
-
-from core.ai_gemini import generate_insight as gemini_insight, is_enabled as gemini_enabled
 import xml.etree.ElementTree as ET
 import atexit
 import traceback
@@ -71,6 +69,8 @@ from core.storage import (
     delete_paper_trade_for_chat,
     cleanup_old_paper_trades,
     list_final_paper_reviews_for_chat,
+    open_paper_trades_for_monitor,
+    update_paper_trade_monitor_state,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
 app = Flask(__name__)
@@ -319,7 +319,7 @@ def _build_my_signals_root_kb() -> Dict[str, Any]:
     """Entry point for user's signals management."""
     return _ikb([
         [("📈 مراجعة الأداء", "my_sig_review"), ("📌 شاراتي المحفوظة", "my_sig_list")],
-        [("📊 مراجعات 24 ساعة", "my_sig_24h")],
+        [("📊 مراجعات 24 ساعة", "my_sig_24h"), ("📊 داشبورد", "my_sig_dash")],
         [("🗑 حذف الكل", "my_sig_delall")],
         [("⬅️ رجوع", "menu")],
     ])
@@ -1335,29 +1335,14 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
     st = _strength(float(c.score))
     if st == "قوي جداً":
         grade = "A+"
-        risk_pct = _get_float(settings, "RISK_APLUS_PCT", 1.0)
+        risk_pct = _get_float(settings, "RISK_APLUS_PCT", 1.5)
     elif st == "قوي":
         grade = "A"
-        risk_pct = _get_float(settings, "RISK_A_PCT", 0.75)
+        risk_pct = _get_float(settings, "RISK_A_PCT", 1.0)
     else:
         grade = "B"
         risk_pct = _get_float(settings, "RISK_B_PCT", 0.5)
 
-    
-    # Platinum risk management: cap risk per trade and adapt to market regime (Risk-On/Risk-Off)
-    max_risk = _get_float(settings, "RISK_MAX_PCT", 1.0)
-    if max_risk > 0:
-        risk_pct = min(float(risk_pct), float(max_risk))
-
-    try:
-        from core.market_regime import get_market_regime
-        regime = get_market_regime()
-        if regime.get("risk") == "OFF":
-            # be "muhannak": reduce size, don't hard-block unless user forces it
-            factor = _get_float(settings, "RISK_OFF_FACTOR", 0.6)
-            risk_pct = max(0.1, float(risk_pct) * float(factor))
-    except Exception:
-        regime = {"risk": "UNK"}
     capital = _get_float(settings, "CAPITAL_USD", 800.0)
     risk_amount = max(1.0, capital * (risk_pct / 100.0))
     qty_risk = int(risk_amount / risk_per_share)
@@ -1555,22 +1540,6 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         else:
             live_line = f"سعر مباشر (مرجعي): {lp} ({ts}) | الدخول محسوب على إغلاق D1: {rc}\n"
 
-    # Optional Gemini premium insight (short execution note)
-    insight = None
-    try:
-        if gemini_enabled() and _get_bool(_settings(), "GEMINI_ON", False):
-            p = (
-                f"Symbol: {c.symbol}\n"
-                f"Side: {side_lbl}\n"
-                f"Score: {c.score:.2f}\n"
-                f"Entry: {plan.get('entry')} | TP: {plan.get('tp')} | SL: {plan.get('sl')}\n"
-                f"Notes: {getattr(c,'notes','')}\n"
-                "Give a short Arabic execution note: best entry discipline, what invalidates, and 1 risk warning."
-            )
-            insight = gemini_insight(p, max_chars=520)
-    except Exception:
-        insight = None
-
     return (
         f"🚀 سهم: {c.symbol} | {side_lbl} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}"
         + (f" | AI: {ai_score}/100" if ai_score is not None else "")
@@ -1592,7 +1561,6 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         f"وقف الخسارة: {plan['sl']}\n"
         f"الخطة: {mode_label}\n"
         f"ملاحظة: {c.notes}\n"
-        + (f"🧠 رأي AI: {insight}\n" if insight else "")
     )
 
 def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, str]) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -1795,6 +1763,210 @@ def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
 # ================= Telegram webhook =================
 
 
+
+
+_LAST_PAPER_MONITOR_RUN: float = 0.0
+
+def _dt_from_iso(ts: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _scan_hit_in_bars(symbol: str, side: str, tp: float, sl: float, start: datetime, end: datetime) -> Optional[Dict[str, Any]]:
+    """Return hit dict if TP/SL hit in window, with ordering resolved as best as possible."""
+    try:
+        data = bars([symbol], start=start, end=end, timeframe="5Min", limit=5000)
+        bl = (data.get("bars", {}).get(symbol) or [])
+    except Exception:
+        bl = []
+    if not bl:
+        return None
+
+    side = (side or "buy").lower()
+    want_buy = side != "sell"
+
+    def bar_dt(b):
+        t = b.get("t") or ""
+        dt = _dt_from_iso(str(t)) if isinstance(t, str) else None
+        if dt is None:
+            try:
+                # Alpaca can return nanoseconds int in some setups
+                dt = datetime.fromtimestamp(float(t)/1e9, tz=timezone.utc)
+            except Exception:
+                dt = None
+        return dt
+
+    for b in bl:
+        dt = bar_dt(b)
+        if dt is None:
+            continue
+        h = float(b.get("h") or 0.0)
+        l = float(b.get("l") or 0.0)
+
+        if want_buy:
+            hit_tp = tp > 0 and h >= tp
+            hit_sl = sl > 0 and l <= sl
+        else:
+            # short: TP is lower target, SL is higher stop
+            hit_tp = tp > 0 and l <= tp
+            hit_sl = sl > 0 and h >= sl
+
+        if hit_tp and hit_sl:
+            # tie-break inside this 5m bar using 1Min bars
+            try:
+                t0 = dt
+                t1 = dt + timedelta(minutes=5)
+                data1 = bars([symbol], start=t0, end=t1, timeframe="1Min", limit=1000)
+                bl1 = (data1.get("bars", {}).get(symbol) or [])
+                for b1 in bl1:
+                    dt1 = bar_dt(b1)
+                    if dt1 is None:
+                        continue
+                    h1 = float(b1.get("h") or 0.0)
+                    l1 = float(b1.get("l") or 0.0)
+                    if want_buy:
+                        if tp > 0 and h1 >= tp:
+                            return {"kind": "tp", "ts": dt1.isoformat().replace("+00:00","Z"), "price": tp}
+                        if sl > 0 and l1 <= sl:
+                            return {"kind": "sl", "ts": dt1.isoformat().replace("+00:00","Z"), "price": sl}
+                    else:
+                        if tp > 0 and l1 <= tp:
+                            return {"kind": "tp", "ts": dt1.isoformat().replace("+00:00","Z"), "price": tp}
+                        if sl > 0 and h1 >= sl:
+                            return {"kind": "sl", "ts": dt1.isoformat().replace("+00:00","Z"), "price": sl}
+            except Exception:
+                pass
+            # conservative fallback
+            return {"kind": "sl", "ts": dt.isoformat().replace("+00:00","Z"), "price": sl if sl>0 else 0.0}
+
+        if hit_tp:
+            return {"kind": "tp", "ts": dt.isoformat().replace("+00:00","Z"), "price": tp}
+        if hit_sl:
+            return {"kind": "sl", "ts": dt.isoformat().replace("+00:00","Z"), "price": sl}
+    return None
+
+
+def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
+    """Monitor OPEN paper trades for TP/SL hits and notify immediately."""
+    global _LAST_PAPER_MONITOR_RUN
+    now = time.time()
+    if (now - float(_LAST_PAPER_MONITOR_RUN or 0.0)) < float(ttl_sec):
+        return
+    _LAST_PAPER_MONITOR_RUN = now
+
+    try:
+        rows = open_paper_trades_for_monitor(limit=500)
+    except Exception:
+        return
+    if not rows:
+        return
+
+    now_dt = datetime.now(timezone.utc)
+
+    for r in rows:
+        try:
+            paper_id = int(r.get("id") or 0)
+            chat = str(r.get("chat_id") or "")
+            symbol = (r.get("symbol") or "").upper().strip()
+            side = (r.get("side") or "buy").lower().strip()
+            entry = float(r.get("entry") or 0.0)
+            tp = float(r.get("tp") or 0.0)
+            sl = float(r.get("sl") or 0.0)
+
+            if not paper_id or not chat or not symbol or entry <= 0:
+                continue
+            if tp <= 0 and sl <= 0:
+                # nothing to monitor
+                update_paper_trade_monitor_state(paper_id, last_check_ts=now_dt.isoformat().replace("+00:00","Z"))
+                continue
+
+            sig_dt = _dt_from_iso(str(r.get("signal_ts") or "")) or (now_dt - timedelta(hours=26))
+            due_dt = _dt_from_iso(str(r.get("due_ts") or "")) or (sig_dt + timedelta(hours=24))
+            end_dt = min(now_dt, due_dt)
+
+            last_check = _dt_from_iso(str(r.get("last_check_ts") or "")) or sig_dt
+            # avoid scanning too-far back repeatedly
+            start_dt = max(last_check - timedelta(minutes=5), sig_dt)
+
+            if end_dt <= start_dt:
+                update_paper_trade_monitor_state(paper_id, last_check_ts=now_dt.isoformat().replace("+00:00","Z"))
+                continue
+
+            hit = _scan_hit_in_bars(symbol, side, tp, sl, start_dt, end_dt)
+            update_paper_trade_monitor_state(paper_id, last_check_ts=end_dt.isoformat().replace("+00:00","Z"))
+
+            if not hit:
+                continue
+
+            kind = hit.get("kind")
+            hit_ts = str(hit.get("ts") or now_dt.isoformat().replace("+00:00","Z"))
+            hit_price = float(hit.get("price") or 0.0)
+
+            if kind == "tp":
+                update_paper_trade_monitor_state(paper_id, status="tp", tp_hit=1, hit_ts=hit_ts, hit_price=hit_price)
+                res_emoji = "✅"
+                res_title = "تحقق جني الربح (TP)"
+            else:
+                update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_ts=hit_ts, hit_price=hit_price)
+                res_emoji = "❌"
+                res_title = "تحقق وقف الخسارة (SL)"
+
+            # R-multiple estimate
+            r_mult = None
+            try:
+                if side == "sell":
+                    risk = (sl - entry) if sl > 0 else None
+                    reward = (entry - hit_price)
+                else:
+                    risk = (entry - sl) if sl > 0 else None
+                    reward = (hit_price - entry)
+                if risk and abs(risk) > 1e-9:
+                    r_mult = reward / risk
+            except Exception:
+                pass
+
+            extra = f" | R: {r_mult:+.2f}" if r_mult is not None else ""
+            msg = (
+                f"🔔 {res_emoji} {symbol} — {res_title}\n\n"
+                f"Entry: {entry:.4g}$\n"
+                f"TP: {tp:.4g}$ {'✅' if kind=='tp' else '❌'}\n"
+                f"SL: {sl:.4g}$ {'✅' if kind=='sl' else '❌'}\n"
+                f"hit@: {hit_ts}\n"
+                f"{extra}"
+            )
+            _tg_send(chat, msg, silent=True)
+
+            # log snapshot event
+            try:
+                signal_id = int(r.get("signal_id") or 0)
+                if signal_id > 0:
+                    note = json.dumps({
+                        "kind": "paper_24h_hit",
+                        "hit_kind": kind,
+                        "hit_ts": hit_ts,
+                        "hit_price": hit_price,
+                        "tp": tp,
+                        "sl": sl,
+                        "entry": entry,
+                    }, ensure_ascii=False)
+                    # use close field to store hit_price for event logs
+                    log_signal_review(
+                        ts=datetime.now(timezone.utc).isoformat(),
+                        signal_id=signal_id,
+                        close=float(hit_price),
+                        return_pct=0.0,
+                        mfe_pct=0.0,
+                        mae_pct=0.0,
+                        note=note,
+                    )
+            except Exception:
+                pass
+
+        except Exception:
+            continue
+
+
 def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
     """Check for due 24h paper trades and send results to their chats (throttled)."""
     global _LAST_PAPER_REVIEW_RUN
@@ -1822,10 +1994,52 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
             if not chat or not symbol or entry <= 0:
                 continue
 
-            # Use live price now if possible; fallback to last close for last 1D bar
-            live_p, live_ts = _get_live_trade_price(symbol)
-            exit_price = float(live_p) if live_p is not None else None
-            price_src = "LIVE" if exit_price is not None else "LAST_CLOSE"
+
+            tp = float(r.get("tp") or 0.0)
+            sl = float(r.get("sl") or 0.0)
+            p_status = (r.get("status") or "open").lower().strip()
+            hit_price = float(r.get("hit_price") or 0.0)
+            hit_ts = str(r.get("hit_ts") or "")
+
+            # If TP/SL was already hit during monitoring, finalize based on that hit.
+            if p_status in ("tp", "sl") and hit_price > 0:
+                exit_price = hit_price
+                live_p = None
+                live_ts = None
+                price_src = "TP_HIT" if p_status == "tp" else "SL_HIT"
+            else:
+                exit_price = None
+                price_src = ""
+            
+            # If still open at finalize time, scan the full 24h window for TP/SL hit to avoid missing events.
+            if exit_price is None and (tp > 0 or sl > 0):
+                try:
+                    sig_dt = _dt_from_iso(str(r.get("signal_ts") or "")) or datetime.now(timezone.utc) - timedelta(hours=26)
+                    due_dt = _dt_from_iso(str(r.get("due_ts") or "")) or (sig_dt + timedelta(hours=24))
+                    hit2 = _scan_hit_in_bars(symbol, side, tp, sl, sig_dt, due_dt)
+                    if hit2:
+                        kind2 = hit2.get("kind")
+                        hit_ts2 = str(hit2.get("ts") or "")
+                        hit_price2 = float(hit2.get("price") or 0.0)
+                        if kind2 == "tp":
+                            p_status = "tp"
+                            update_paper_trade_monitor_state(paper_id, status="tp", tp_hit=1, hit_ts=hit_ts2, hit_price=hit_price2)
+                            price_src = "TP_HIT"
+                        else:
+                            p_status = "sl"
+                            update_paper_trade_monitor_state(paper_id, status="sl", sl_hit=1, hit_ts=hit_ts2, hit_price=hit_price2)
+                            price_src = "SL_HIT"
+                        hit_ts = hit_ts2
+                        hit_price = hit_price2
+                        exit_price = hit_price2
+                except Exception:
+                    pass
+
+# Use live price now if possible; fallback to last close for last 1D bar
+            if exit_price is None:
+                live_p, live_ts = _get_live_trade_price(symbol)
+                exit_price = float(live_p) if live_p is not None else None
+                price_src = "LIVE" if exit_price is not None else "LAST_CLOSE"
 
             if exit_price is None:
                 try:
@@ -1865,6 +2079,13 @@ def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
                         "price_src": price_src,
                         "live_ts": live_ts or "",
                         "review_ts": datetime.now(timezone.utc).isoformat(),
+                        "tp": tp,
+                        "sl": sl,
+                        "paper_status": p_status,
+                        "hit_ts": hit_ts,
+                        "hit_price": hit_price,
+                        "tp_hit": 1 if p_status=="tp" else int(r.get("tp_hit") or 0),
+                        "sl_hit": 1 if p_status=="sl" else int(r.get("sl_hit") or 0),
                     }, ensure_ascii=False)
                     log_signal_review(
                         ts=datetime.now(timezone.utc).isoformat(),
@@ -2035,8 +2256,19 @@ def telegram_webhook():
             
             # 📊 مراجعات 24 ساعة (مقفلة)
             if action in ("my_sig_24h", "my_sig_24h_refresh"):
+                try:
+                    _run_open_paper_monitor(ttl_sec=0.0)
+                    _run_due_paper_reviews(ttl_sec=0.0)
+                except Exception:
+                    pass
                 msg = _my_saved_24h_reviews_message(str(chat_id), lookback_days=30, limit=50)
                 _ui(msg, reply_markup=_build_my_sig_24h_kb(back_action="my_sig_menu"))
+                return jsonify({"ok": True})
+
+
+            if action == "my_sig_dash":
+                msg = _my_signals_dashboard_message(str(chat_id), lookback_days=30)
+                _ui(msg, reply_markup=_ikb([[("⬅️ رجوع", "my_sig_menu")]]))
                 return jsonify({"ok": True})
 
 # 📌 شاراتي المحفوظة
@@ -3112,6 +3344,55 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
     return header + "\n" + body + ("\n\n... (+ المزيد)" if len(lines) > 25 else "")
 
 
+
+def _my_signals_dashboard_message(chat_id: str, lookback_days: int = 30) -> str:
+    """Premium dashboard summary for the user's paper trades."""
+    chat_id = str(chat_id)
+    now_dt = datetime.now(timezone.utc)
+
+    paper = list_paper_trades_for_chat(chat_id, lookback_days=lookback_days, limit=500)
+    open_trades = [p for p in paper if str(p.get("status") or "open").lower() in ("open","")]
+    due_now = []
+    for p in open_trades:
+        due_dt = _dt_from_iso(str(p.get("due_ts") or "")) or (now_dt + timedelta(days=1))
+        if due_dt <= now_dt:
+            due_now.append(p)
+
+    finals = list_final_paper_reviews_for_chat(chat_id, lookback_days=lookback_days, limit=500)
+    wins = 0
+    losses = 0
+    tps = 0
+    sls = 0
+    for r in finals:
+        try:
+            rp = float(r.get("return_pct") or 0.0)
+            if rp > 0:
+                wins += 1
+            elif rp < 0:
+                losses += 1
+            note = str(r.get("note") or "")
+            if "TP_HIT" in note or '"tp_hit": 1' in note:
+                tps += 1
+            if "SL_HIT" in note or '"sl_hit": 1' in note:
+                sls += 1
+        except Exception:
+            pass
+    total = wins + losses
+
+    wr = (wins / total * 100.0) if total > 0 else 0.0
+    msg = (
+        f"📊 داشبورد — آخر {int(lookback_days)} يوم\n"
+        f"— صفقات محفوظة: {len(paper)}\n"
+        f"— مفتوحة: {len(open_trades)}\n"
+        f"— مستحقة الآن: {len(due_now)}\n\n"
+        f"📈 نتائج 24 ساعة (لقطات ثابتة): {len(finals)}\n"
+        f"— Winrate: {wr:.1f}% (رابحة: {wins} | خاسرة: {losses})\n"
+        f"— TP Hit: {tps} | SL Hit: {sls}\n\n"
+        f"آخر تحديث: {now_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    return msg
+
+
 def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: int = 30) -> str:
     """Return frozen 24h review snapshots for this chat."""
     try:
@@ -3436,6 +3717,26 @@ def _start_scheduler() -> None:
         id="scan_job",
         replace_existing=True,
     )
+
+    # Premium: monitor TP/SL hits frequently (no broker API needed)
+    try:
+        _scheduler.add_job(
+            _run_open_paper_monitor,
+            IntervalTrigger(minutes=int(os.getenv("PAPER_MONITOR_MIN") or 5)),
+            kwargs={"ttl_sec": 0.0},
+            id="paper_monitor_job",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            _run_due_paper_reviews,
+            IntervalTrigger(minutes=int(os.getenv("PAPER_REVIEW_MIN") or 3)),
+            kwargs={"ttl_sec": 0.0},
+            id="paper_due_review_job",
+            replace_existing=True,
+        )
+    except Exception:
+        pass
+
     _scheduler.start()
     atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler else None)
 try:

@@ -14,6 +14,7 @@ from core.storage import (
     get_watchlist,
     add_watchlist,
     remove_watchlist,
+    list_final_paper_reviews_for_chat,
 )
 
 bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -74,11 +75,38 @@ def index():
         counts[sym] = counts.get(sym, 0) + 1
     top_symbols = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:10]
 
+    
+    # paper trade KPI
+    open_paper = [p for p in paper if str(p.get("status") or "open").lower() in ("open","")]
+    due_now = []
+    for p in open_paper:
+        try:
+            dt = datetime.fromisoformat(str(p.get("due_ts") or "").replace("Z","+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+        if dt <= datetime.utcnow():
+            due_now.append(p)
+
+    finals = []
+    try:
+        if chat_id:
+            finals = list_final_paper_reviews_for_chat(chat_id, lookback_days=lookback_days, limit=500)
+    except Exception:
+        finals = []
+    wins = sum(1 for r in finals if float(r.get("return_pct") or 0.0) > 0)
+    losses = sum(1 for r in finals if float(r.get("return_pct") or 0.0) < 0)
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total else 0.0
+
     return render_template(
         "admin/index.html",
         lookback_days=lookback_days,
         paper_count=len(paper),
+        open_paper_count=len(open_paper),
+        due_now_count=len(due_now),
         signals_count=len(signals_window),
+        finals_count=len(finals),
+        winrate=winrate,
         top_symbols=top_symbols,
         recent_paper=paper[:20],
     )
