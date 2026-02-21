@@ -1071,7 +1071,7 @@ def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
                     """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
                        FROM paper_trades p
                        JOIN signals s ON s.id = p.signal_id
-                       WHERE COALESCE(p.notified,0)=0 AND p.due_ts <= %s
+                       WHERE COALESCE(p.notified,0)=0 AND (p.due_ts::timestamptz <= now())
                        ORDER BY p.due_ts ASC
                        LIMIT %s""",
                     (now_ts, int(limit)),
@@ -1130,6 +1130,8 @@ def list_paper_trades_for_chat(chat_id: str, lookback_days: int = 7, limit: int 
                         s.score,
                         s.entry,
                         s.sl,
+                        s.tp,
+                        s.sl,
                         s.tp
                     FROM paper_trades pt
                     JOIN signals s ON s.id = pt.signal_id
@@ -1158,6 +1160,8 @@ def list_paper_trades_for_chat(chat_id: str, lookback_days: int = 7, limit: int 
                 s.strength,
                 s.score,
                 s.entry,
+                s.sl,
+                s.tp,
                 s.sl,
                 s.tp
             FROM paper_trades pt
@@ -1230,12 +1234,14 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                         r.close AS exit_price,
                         r.return_pct,
                         r.note,
-                        s.signal_ts,
+                        s.ts AS signal_ts,
                         s.symbol,
                         s.mode,
                         s.side,
                         s.score,
-                        s.entry
+                        s.entry,
+                        s.sl,
+                        s.tp
                     FROM paper_trades pt
                     JOIN signals s ON s.id = pt.signal_id
                     JOIN signal_reviews r ON r.signal_id = pt.signal_id
@@ -1266,7 +1272,9 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                 s.mode,
                 s.side,
                 s.score,
-                s.entry
+                s.entry,
+                s.sl,
+                s.tp
             FROM paper_trades pt
             JOIN signals s ON s.id = pt.signal_id
             JOIN signal_reviews r ON r.signal_id = pt.signal_id
