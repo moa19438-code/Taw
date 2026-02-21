@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 
@@ -149,6 +149,7 @@ def init_db() -> None:
             try:
                 ensure_signal_schema()
                 ensure_signal_reviews_schema()
+                ensure_paper_trades_schema()
             except Exception:
                 pass
 
@@ -340,6 +341,46 @@ _SIGNAL_COLS = {
     "label": "INTEGER",
     "model_prob": "REAL",
 }
+
+# --- Paper trades schema migrations (Premium / Platinum) ---
+# We keep paper_trades lightweight but store enough to support manual execution + TP/SL monitoring.
+_PAPER_TRADE_COLS = {
+    "entry": "REAL",
+    "sl": "REAL",
+    "tp": "REAL",
+    "side": "TEXT",          # BUY/SELL
+    "score": "REAL",
+    "strength": "TEXT",
+    "tf": "TEXT",            # e.g., d1
+    "qty": "REAL",
+    "exec_price": "REAL",
+    "exec_ts": "TEXT",
+    "status": "TEXT",        # planned/executed/closed
+    "result": "TEXT",        # TP/SL/WIN_CLOSE/LOSS_CLOSE
+    "hit": "TEXT",           # TP/SL/NONE
+    "hit_ts": "TEXT",
+    "hit_price": "REAL"
+}
+
+def ensure_paper_trades_schema() -> None:
+    """Add missing columns to paper_trades table (SQLite/Postgres)."""
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                for col, typ in _PAPER_TRADE_COLS.items():
+                    ptyp = "DOUBLE PRECISION" if typ == "REAL" else ("INTEGER" if typ == "INTEGER" else "TEXT")
+                    cur.execute(f"ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS {col} {ptyp};")
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("PRAGMA table_info(paper_trades)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, typ in _PAPER_TRADE_COLS.items():
+            if col not in existing:
+                con.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {typ};")
+        con.commit()
+
 
 def ensure_signal_schema() -> None:
     """Add missing columns to signals table (SQLite/Postgres)."""
@@ -1042,28 +1083,131 @@ def latest_signal_reviews_since(days: int = 7) -> List[Dict[str, Any]]:
 
 # --- Paper trades (manual simulation tracking) ---
 def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
-    """Link a saved signal to a chat_id for 24h later review."""
+    """Save a signal for later review (24h) and persist key trade-plan fields.
+
+    We intentionally snapshot entry/sl/tp at save-time so later edits to the signal feed
+    won't change the user's saved plan.
+    """
+    sid = int(signal_id)
+    cid = str(chat_id)
+
+    # fetch signal snapshot
+    sig: Dict[str, Any] = {}
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength FROM signals WHERE id=%s",
+                    (sid,),
+                )
+                row = cur.fetchone()
+                if row:
+                    sig = dict(row)
+            # insert
+            side = (sig.get("side") or ("BUY" if (sig.get("mode") or "").upper().startswith("L") else "SELL")).upper()
+            with con.cursor() as cur2:
+                cur2.execute(
+                    """INSERT INTO paper_trades
+                       (chat_id, signal_id, due_ts, notified, entry, sl, tp, side, score, strength, tf, status)
+                       VALUES (%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        cid, sid, due_ts,
+                        sig.get("entry"), sig.get("sl"), sig.get("tp"),
+                        side, sig.get("score"), sig.get("strength"),
+                        "d1",
+                        "planned",
+                    ),
+                )
+            con.commit()
+        return
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength FROM signals WHERE id=?",
+            (sid,),
+        ).fetchone()
+        if row:
+            sig = dict(row)
+        side = (sig.get("side") or ("BUY" if (sig.get("mode") or "").upper().startswith("L") else "SELL")).upper()
+        con.execute(
+            """INSERT INTO paper_trades
+               (chat_id, signal_id, due_ts, notified, entry, sl, tp, side, score, strength, tf, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                cid, sid, due_ts, 0,
+                sig.get("entry"), sig.get("sl"), sig.get("tp"),
+                side, sig.get("score"), sig.get("strength"),
+                "d1",
+                "planned",
+            ),
+        )
+        con.commit()
+
+
+def set_paper_trade_execution(paper_id: int, exec_price: float, qty: float, exec_ts: Optional[str] = None) -> None:
+    """Mark a saved trade as executed (manual fill) for more accurate tracking."""
+    exec_ts = exec_ts or datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (%s,%s,%s,0)",
-                    (str(chat_id), int(signal_id), due_ts),
+                    """UPDATE paper_trades
+                       SET exec_price=%s, qty=%s, exec_ts=%s, status='executed'
+                       WHERE id=%s""",
+                    (float(exec_price), float(qty), exec_ts, int(paper_id)),
                 )
             con.commit()
         return
 
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            "INSERT INTO paper_trades (chat_id, signal_id, due_ts, notified) VALUES (?,?,?,0)",
-            (str(chat_id), int(signal_id), due_ts),
+            """UPDATE paper_trades
+               SET exec_price=?, qty=?, exec_ts=?, status='executed'
+               WHERE id=?""",
+            (float(exec_price), float(qty), exec_ts, int(paper_id)),
         )
         con.commit()
 
 
+def list_open_paper_trades(chat_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """Trades not closed yet (planned/executed)."""
+    cid = str(chat_id)
+    if IS_POSTGRES:
+        with _pg_connect() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """SELECT p.*, s.symbol, s.ts AS signal_ts
+                       FROM paper_trades p
+                       JOIN signals s ON s.id=p.signal_id
+                       WHERE p.chat_id=%s AND COALESCE(p.status,'planned') IN ('planned','executed')
+                       ORDER BY (p.due_ts)::timestamptz DESC
+                       LIMIT %s""",
+                    (cid, int(limit)),
+                )
+                return cur.fetchall()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT p.*, s.symbol, s.ts AS signal_ts
+               FROM paper_trades p
+               JOIN signals s ON s.id=p.signal_id
+               WHERE p.chat_id=? AND COALESCE(p.status,'planned') IN ('planned','executed')
+               ORDER BY p.due_ts DESC
+               LIMIT ?""",
+            (cid, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
-    """Paper trades that are due for review and not yet notified."""
-    now_ts = datetime.utcnow().isoformat()
+    """Paper trades that are due for review and not yet notified.
+
+    Note:
+      - In Postgres we store due_ts as ISO string; we cast to timestamptz for correct comparisons.
+      - In SQLite we keep lexicographic ISO strings and compare to now_ts ISO.
+    """
+    now_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
     if IS_POSTGRES:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
@@ -1071,10 +1215,11 @@ def due_paper_trades(limit: int = 200) -> List[Dict[str, Any]]:
                     """SELECT p.*, s.ts AS signal_ts, s.symbol, s.mode, s.side, s.entry, s.sl, s.tp, s.score, s.strength
                        FROM paper_trades p
                        JOIN signals s ON s.id = p.signal_id
-                       WHERE COALESCE(p.notified,0)=0 AND (p.due_ts::timestamptz <= now())
-                       ORDER BY p.due_ts ASC
+                       WHERE COALESCE(p.notified,0)=0
+                         AND (p.due_ts)::timestamptz <= now()
+                       ORDER BY (p.due_ts)::timestamptz ASC
                        LIMIT %s""",
-                    (now_ts, int(limit)),
+                    (int(limit),),
                 )
                 return cur.fetchall()
 
@@ -1130,8 +1275,6 @@ def list_paper_trades_for_chat(chat_id: str, lookback_days: int = 7, limit: int 
                         s.score,
                         s.entry,
                         s.sl,
-                        s.tp,
-                        s.sl,
                         s.tp
                     FROM paper_trades pt
                     JOIN signals s ON s.id = pt.signal_id
@@ -1160,8 +1303,6 @@ def list_paper_trades_for_chat(chat_id: str, lookback_days: int = 7, limit: int 
                 s.strength,
                 s.score,
                 s.entry,
-                s.sl,
-                s.tp,
                 s.sl,
                 s.tp
             FROM paper_trades pt
@@ -1234,14 +1375,12 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                         r.close AS exit_price,
                         r.return_pct,
                         r.note,
-                        s.ts AS signal_ts,
+                        s.signal_ts,
                         s.symbol,
                         s.mode,
                         s.side,
                         s.score,
-                        s.entry,
-                        s.sl,
-                        s.tp
+                        s.entry
                     FROM paper_trades pt
                     JOIN signals s ON s.id = pt.signal_id
                     JOIN signal_reviews r ON r.signal_id = pt.signal_id
@@ -1272,9 +1411,7 @@ def list_final_paper_reviews_for_chat(chat_id: str, lookback_days: int = 30, lim
                 s.mode,
                 s.side,
                 s.score,
-                s.entry,
-                s.sl,
-                s.tp
+                s.entry
             FROM paper_trades pt
             JOIN signals s ON s.id = pt.signal_id
             JOIN signal_reviews r ON r.signal_id = pt.signal_id
