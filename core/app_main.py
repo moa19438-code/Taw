@@ -73,6 +73,7 @@ from core.storage import (
     update_paper_trade_monitor_state,
 )
 from core.scanner import scan_universe_with_meta, Candidate, get_symbol_features, get_symbol_features_m5
+from core.setup_classifier import classify_setup
 app = Flask(__name__)
 app.register_blueprint(admin_bp)
 @app.get("/health")
@@ -145,6 +146,32 @@ def _tg_call(method: str, payload: Dict[str, Any]) -> Tuple[bool, str, Optional[
         return True, "ok", j
     except Exception as e:
         return False, str(e), None
+
+
+
+def _notify_simple(text: str, settings: Dict[str, str] | None = None, silent: bool = True) -> None:
+    """Send a Telegram message using configured route (dm/group/both)."""
+    s = settings or get_all_settings()
+    route = str(s.get("NOTIFY_ROUTE") or "dm").lower().strip()
+    silent_flag = bool(parse_bool(s.get("NOTIFY_SILENT") or "1")) if settings is None else bool(silent)
+    # Fallbacks
+    dm = TELEGRAM_CHAT_ID or TELEGRAM_ADMIN_ID
+    grp = TELEGRAM_CHANNEL_ID
+    if route == "both":
+        if dm:
+            _tg_send(dm, text, silent=silent_flag)
+        if grp:
+            _tg_send(grp, text, silent=silent_flag)
+    elif route == "group":
+        if grp:
+            _tg_send(grp, text, silent=silent_flag)
+        elif dm:
+            _tg_send(dm, text, silent=silent_flag)
+    else:  # dm
+        if dm:
+            _tg_send(dm, text, silent=silent_flag)
+        elif grp:
+            _tg_send(grp, text, silent=silent_flag)
 
 def _tg_edit_text(chat_id: str, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
@@ -1267,6 +1294,45 @@ def _strength(score: float) -> str:
     if score >= 5.0:
         return "متوسط"
     return "ضعيف"
+
+def _dynamic_risk_pct(ai_score: float | None,
+                      loss_prob: float | None,
+                      settings: Dict[str, str]) -> float:
+    """مخاطرة ذكية (% من رأس المال) بناءً على جودة الصفقة واحتمالية الخسارة.
+    الهدف: تكبير الربح عبر زيادة الوزن للفرص الأقوى، وتقليل الوزن للفرص الأضعف.
+    """
+    # Defaults (مناسبة للحسابات الصغيرة)
+    min_r = _get_float(settings, "RISK_MIN_PCT", 4.0)
+    max_r = _get_float(settings, "RISK_MAX_PCT", 8.0)
+
+    # إذا ما عندنا بيانات كفاية: نستخدم متوسط
+    if ai_score is None and loss_prob is None:
+        return float((min_r + max_r) / 2.0)
+
+    # إن لم يتوفر أحدهما، نعوّض بقيم وسطية
+    sc = float(ai_score) if ai_score is not None else 80.0
+    lp = float(loss_prob) if loss_prob is not None else 0.35
+
+    # خريطة بسيطة: كلما زاد Score تقل lp (عادة)، ونعكسها إلى مخاطرة أعلى
+    # نطاقات موصى بها للاختبار
+    if lp >= float(_get_float(settings, "LOSS_PROB_BLOCK", 0.50)):
+        return 0.0  # يعني ممنوع
+    if sc >= 90 and lp <= 0.25:
+        r = max_r
+    elif sc >= 86 and lp <= 0.30:
+        r = max(min_r, max_r - 1.0)
+    elif sc >= 82 and lp <= 0.35:
+        r = max(min_r, max_r - 2.0)
+    elif sc >= 75 and lp <= 0.40:
+        r = min_r
+    else:
+        # جودة/احتمال غير مريح: مخاطرة منخفضة جدًا
+        r = max(1.0, min_r - 1.5)
+
+    # Clamp
+    r = max(0.0, min(float(r), float(max_r)))
+    return float(r)
+
 def _mode_matches(c: Candidate, mode: str) -> bool:
     mode = (mode or "daily").lower()
     if mode == "daily":
@@ -1331,6 +1397,39 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
         risk_per_share = max(entry - sl, 0.01)
         tp = entry + (risk_per_share * tp_r_mult)
 
+
+    # === تحسين الخروج لصفقات 1D: Partial TP + Trailing Stop (اقتراحات يدوية) ===
+    # افتراضيًا: TP2 هو الهدف النهائي (tp) الموجود سابقًا.
+    # TP1 هدف جزئي (مثلاً 1R) + تفعيل Trailing بعده لرفع نسبة الصفقات الرابحة وتقليل الارتداد.
+    tp1_r_mult = _get_float(settings, "TP1_R_MULT", 1.0)
+    partial_pct = _get_float(settings, "PARTIAL_TP_PCT", 0.5)  # 0..0.95
+    trail_atr_mult = _get_float(settings, "TRAIL_ATR_MULT", 1.2)
+    trail_after_tp1 = _get_bool(settings, "TRAIL_AFTER_TP1", True)
+    move_sl_to_be = _get_bool(settings, "MOVE_SL_TO_BE_AFTER_TP1", True)
+
+    tp1 = None
+    try:
+        pp = max(0.0, min(0.95, float(partial_pct)))
+        if tp1_r_mult and float(tp1_r_mult) > 0 and pp > 0:
+            if side == "sell":
+                tp1 = max(0.01, entry - (risk_per_share * float(tp1_r_mult)))
+            else:
+                tp1 = entry + (risk_per_share * float(tp1_r_mult))
+        else:
+            pp = 0.0
+        partial_pct = pp
+    except Exception:
+        tp1 = None
+        partial_pct = 0.0
+
+    # Trailing stop suggestion (manual):
+    # بعد TP1 (إذا trail_after_tp1=True) ننقل SL إلى BE (اختياري) ثم نتابع بـ ATR trailing.
+    trail_note = ""
+    if trail_atr_mult and float(trail_atr_mult) > 0:
+        if trail_after_tp1:
+            trail_note = f"بعد TP1 فعّل Trailing ≈ ATR×{trail_atr_mult} (و{'حرّك SL لبريك إيفن' if move_sl_to_be else 'بدون تحريك SL'})"
+        else:
+            trail_note = f"Trailing من البداية ≈ ATR×{trail_atr_mult}"
     # تصنيف (A+/A/B) حسب القوة
     st = _strength(float(c.score))
     if st == "قوي جداً":
@@ -1343,31 +1442,62 @@ def _compute_trade_plan(settings: Dict[str, str], c: Candidate, entry_override: 
         grade = "B"
         risk_pct = _get_float(settings, "RISK_B_PCT", 0.5)
 
+    # === رأس المال + مخاطرة ذكية (مع دعم Fractional Shares) ===
     capital = _get_float(settings, "CAPITAL_USD", 800.0)
-    risk_amount = max(1.0, capital * (risk_pct / 100.0))
-    qty_risk = int(risk_amount / risk_per_share)
-    if qty_risk < 1:
-        qty_risk = 1
+
+    # مخاطر أدنى/أقصى (%)
+    risk_min = _get_float(settings, "RISK_MIN_PCT", 0.5)
+    risk_max = _get_float(settings, "RISK_MAX_PCT", 2.0)
+    risk_pct = max(risk_min, min(risk_max, float(risk_pct)))
+
+    # مبلغ المخاطرة بالدولار
+    risk_amount = max(0.10, capital * (risk_pct / 100.0))
+
+    # حجم الصفقة بناءً على المخاطرة (يسمح بالكسور)
+    qty_risk = risk_amount / max(risk_per_share, 0.01)
 
     # حد أقصى لحجم الصفقة (كنسبة من رأس المال)
     pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
     max_notional = max(0.0, capital * pos_pct)
-    qty_cap = int(max_notional / max(entry, 0.01)) if max_notional > 0 else qty_risk
-    if qty_cap < 1:
-        qty_cap = 1
+    qty_cap = (max_notional / max(entry, 0.01)) if max_notional > 0 else qty_risk
 
-    qty = max(1, min(qty_risk, qty_cap))
+    qty = max(0.01, min(qty_risk, qty_cap))
+
+    # تقريب مناسب للـ fractional (3 منازل)
+    try:
+        qty = round(float(qty), 3)
+    except Exception:
+        qty = float(qty)
     entry_mode = _get_str(settings, "ENTRY_MODE", "auto").lower()
+
+    # تصنيف نوع الفرصة (Breakout / Pullback / Gap / Mixed)
+    setup = "MIXED"
+    setup_notes: list[str] = []
+    try:
+        f0 = get_symbol_features(symbol) or {}
+        setup, setup_notes = classify_setup(f0, side=side)
+    except Exception:
+        setup = "MIXED"
+        setup_notes = []
 
     # RR محسوب على أساس المخاطرة R
     rr = (abs(tp - entry)) / max(abs(entry - sl), 0.01)
 
     return {
         "side": side,
+        "setup": setup,
+        "setup_notes": setup_notes,
         "entry": round(entry, 2),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
-        "qty": int(qty),
+        "tp1": (round(float(tp1), 2) if tp1 is not None else None),
+        "tp2": round(tp, 2),
+        "partial_pct": float(partial_pct) if partial_pct is not None else 0.0,
+        "trail_atr_mult": float(trail_atr_mult) if trail_atr_mult is not None else 0.0,
+        "trail_after_tp1": bool(trail_after_tp1),
+        "move_sl_to_be_after_tp1": bool(move_sl_to_be),
+        "trail_note": trail_note,
+        "qty": float(qty),
         "atr": round(atr_val, 2),
         "sl_atr_mult": sl_atr_mult,
         "tp_r_mult": tp_r_mult,
@@ -1499,7 +1629,7 @@ def _build_trade_plan(symbol: str,
         "tp_r_mult": round(float(tp_r_mult), 2),
         "risk_pct": round(float(risk_pct), 2),
         "risk_amount": round(float(risk_amount), 2),
-        "qty": int(qty),
+        "qty": float(qty),
         "risk_per_share": round(float(risk_per_share), 4),
         "rr": round(float(rr), 2),
         "grade": grade,
@@ -1508,6 +1638,7 @@ def _build_trade_plan(symbol: str,
         "ml_prob": None,
         "ev_r": None,
     }
+
 
 
 def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_score: int | None = None) -> str:
@@ -1540,35 +1671,76 @@ def _format_sahm_block(mode_label: str, c: Candidate, plan: Dict[str, Any], ai_s
         else:
             live_line = f"سعر مباشر (مرجعي): {lp} ({ts}) | الدخول محسوب على إغلاق D1: {rc}\n"
 
-    return (
+    header = (
         f"🚀 سهم: {c.symbol} | {side_lbl} | التصنيف: {plan.get('grade','')} | القوة: {strength} | Score: {c.score:.1f}"
         + (f" | AI: {ai_score}/100" if ai_score is not None else "")
         + (f" | ML: {int(round(float(plan.get('ml_prob') or 0)*100))}%" if plan.get('ml_prob') is not None else "")
         + (f" | EV(R): {float(plan.get('ev_r')):.2f}" if plan.get('ev_r') is not None else "")
-        + "\n"
-        f"العملية: {op_lbl}\n"
-        f"النوع: {entry_type}\n"
-        f"السعر: {plan['entry']}\n"
-        f"{live_line}"
-        f"الكمية: {plan['qty']}\n"
-        f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n"
-        f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n"
-        f"TF: D:{'✅' if getattr(c, 'daily_ok', False) else '❌'} W:{'✅' if getattr(c, 'weekly_ok', False) else '❌'} M:{'✅' if getattr(c, 'monthly_ok', False) else '❌'} | Liquidity(ADV$): {round(float(getattr(c, 'avg_dollar_vol', 0) or 0)/1e6,1)}M\n"
-
-        f"{ai_line}"
-        f"الأمر المرفق: جني الربح/وقف الخسارة\n"
-        f"جني الربح: {plan['tp']}\n"
-        f"وقف الخسارة: {plan['sl']}\n"
-        f"الخطة: {mode_label}\n"
-        f"ملاحظة: {c.notes}\n"
     )
 
+    loss_line = ""
+    try:
+        if plan.get("loss_prob") is not None:
+            loss_line = f"احتمال الخسارة: {int(round(float(plan.get('loss_prob'))*100))}%\n"
+    except Exception:
+        loss_line = ""
+
+    parts: List[str] = []
+    parts.append(f"{header}\n")
+    parts.append(f"العملية: {op_lbl}\n")
+    parts.append(f"النوع: {entry_type}\n")
+    parts.append(f"السعر: {plan['entry']}\n")
+    if live_line:
+        parts.append(live_line)
+    parts.append(f"الكمية: {plan['qty']}\n")
+    if plan.get("setup"):
+        setup_notes = ", ".join((plan.get("setup_notes") or [])[:2])
+        parts.append(f"نوع الفرصة: {plan.get('setup','')} | {setup_notes}\n")
+    if loss_line:
+        parts.append(loss_line)
+    parts.append(f"المخاطرة: {plan.get('risk_pct',0)}% (≈ {plan.get('risk_amount',0)}$) | R/R: {plan.get('rr',0)}\n")
+    parts.append(f"ATR: {plan.get('atr',0)} | SL×ATR: {plan.get('sl_atr_mult',0)} | TP×R: {plan.get('tp_r_mult',0)}\n")
+    parts.append(f"TF: D:{'✅' if getattr(c, 'daily_ok', False) else '❌'} W:{'✅' if getattr(c, 'weekly_ok', False) else '❌'} M:{'✅' if getattr(c, 'monthly_ok', False) else '❌'} | Liquidity(ADV$): {round(float(getattr(c, 'avg_dollar_vol', 0) or 0)/1e6,1)}M\n")
+    if ai_line:
+        parts.append(ai_line)
+    parts.append("الأمر المرفق: جني الربح/وقف الخسارة\n")
+    if bool(plan.get("one_day", True)):
+        parts.append(f"صلاحية الأمر: يوم | أغلق قبل الإغلاق بـ {int(plan.get('close_exit_minutes') or 15)} دقيقة إذا ما تحقق TP/SL\n")
+    if plan.get("tp1") is not None and float(plan.get("partial_pct") or 0) > 0:
+        parts.append(f"TP1 (جزئي): {plan.get('tp1')} | نسبة: {int(round(float(plan.get('partial_pct') or 0)*100))}%\n")
+    parts.append(f"TP2 (نهائي): {plan.get('tp2', plan.get('tp'))}\n")
+    if plan.get("trail_note"):
+        parts.append(f"Trailing: {plan.get('trail_note','')}\n")
+    parts.append(f"وقف الخسارة: {plan['sl']}\n")
+    parts.append(f"الخطة: {mode_label}\n")
+    parts.append(f"ملاحظة: {c.notes}\n")
+    body = "".join(parts)
+    return body
 def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, str]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """اختيار أفضل الفرص + تسجيلها + تجهيز رسالة التليجرام.
+    - يطبق فلتر AI (Score) + فلتر الأخبار (اختياري) + حماية السحب (Drawdown Guard)
+    - يحسب Loss Probability + مخاطرة ذكية + كمية (Fractional) حسب رأس المال
     """
-    Returns:
-      - blocks: list[str] formatted for Telegram
-      - logged: list of dicts (symbol, strength, score, entry, sl, tp)
-    """
+    from core.risk_manager import check_drawdown_and_pause
+    from core.probability_model import estimate_loss_probability
+    from core.news_filter import check_news_risk
+
+    # --- Capital protection (Drawdown) ---
+    paused, dd_meta, dd_reasons = check_drawdown_and_pause()
+    if paused:
+        msg = "🛑 التداول موقوف لحماية رأس المال.\n"
+        if dd_reasons:
+            msg += "\n".join(dd_reasons) + "\n"
+        try:
+            dd = float(dd_meta.get("drawdown_pct") or 0.0)
+            hwm = float(dd_meta.get("equity_hwm") or 0.0)
+            eq = float(dd_meta.get("equity") or 0.0)
+            msg += f"Equity: {eq:.2f}$ | High: {hwm:.2f}$ | DD: {dd:.1f}%\n"
+        except Exception:
+            pass
+        msg += "لإلغاء الإيقاف يدويًا: غيّر Setting TRADING_PAUSED إلى 0."
+        return [msg], []
+
     mode = _get_str(settings, "PLAN_MODE", "daily").lower()
     dedup_hours = _get_int(settings, "DEDUP_HOURS", 6)
     allow_resend_stronger = _get_bool(settings, "ALLOW_RESEND_IF_STRONGER", True)
@@ -1577,7 +1749,8 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=dedup_hours)
     mode_label = _mode_label(mode)
-    # Optional: require multi-timeframe alignment (safer entries)
+
+    # Optional: require multi-timeframe alignment
     req_daily = _get_bool(settings, "REQUIRE_DAILY_OK", True)
     req_weekly = _get_bool(settings, "REQUIRE_WEEKLY_OK", True)
     req_monthly = _get_bool(settings, "REQUIRE_MONTHLY_OK", False)
@@ -1591,148 +1764,128 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
             return False
         return True
 
-    # filter + sort
     candidates = [c for c in picks if _mode_matches(c, mode) and _tf_ok(c)]
     candidates.sort(key=lambda x: x.score, reverse=True)
+
     blocks: List[str] = []
     logged: List[Dict[str, Any]] = []
+
     ai_topn = _get_int(settings, "AI_PREDICT_TOPN", 5)
     ai_cache: Dict[str, Optional[dict]] = {}
     ai_used = 0
+
+    def _recently_sent(symbol: str, strength: str) -> bool:
+        last = last_signal(symbol, mode)
+        if not last:
+            return False
+        try:
+            last_ts = datetime.fromisoformat(str(last["ts"]).replace("Z", "+00:00"))
+        except Exception:
+            last_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        if last_ts < cutoff:
+            return False
+        if not allow_resend_stronger:
+            return True
+        prev_rank = _STRENGTH_RANK.get(str(last.get("strength")), 0)
+        cur_rank = _STRENGTH_RANK.get(strength, 0)
+        return cur_rank <= prev_rank
+
     for c in candidates:
         if len(blocks) >= max_send:
             break
+
         st = _strength(float(c.score))
-        last = last_signal(c.symbol, mode)
-        should_send = False
-        if not last:
-            should_send = True
-        else:
-            # check time
-            try:
-                last_ts = datetime.fromisoformat(str(last["ts"]).replace("Z", "+00:00"))
-            except Exception:
-                last_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
-            if last_ts < cutoff:
-                should_send = True
-            else:
-                if allow_resend_stronger:
-                    prev_rank = _STRENGTH_RANK.get(str(last.get("strength")), 0)
-                    cur_rank = _STRENGTH_RANK.get(st, 0)
-                    if cur_rank > prev_rank:
-                        should_send = True
-        if not should_send:
+        if _recently_sent(c.symbol, st):
             continue
 
-            ai_score = None
-            _ai_reasons: List[str] = []
-            _ai_features: Dict[str, Any] = {}
-            if AI_FILTER_ENABLED:
-                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, (getattr(c, "side", "buy") or "buy"), min_score=AI_FILTER_MIN_SCORE)
-                if not ok_ai:
-                    continue
-        plan = _compute_trade_plan(settings, c)
-        # Optional AI direction prediction (run only on top N to avoid slowness)
-        if _get_bool(settings, "AI_PREDICT_ENABLED", False) and ai_used < max(0, ai_topn):
-            if c.symbol not in ai_cache:
-                try:
-                    ai_cache[c.symbol] = _ai_direction_for_symbol(c.symbol, settings)
-                except Exception:
-                    ai_cache[c.symbol] = None
-            pred = ai_cache.get(c.symbol)
-            if pred:
-                plan["ai_dir"] = pred.get("direction")
-                plan["ai_conf"] = pred.get("confidence")
-                plan["ai_h"] = pred.get("horizon")
-                ai_used += 1
-        # ML probability / expected value (اختياري)
-        try:
-            if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
-                w = parse_weights(settings.get("ML_WEIGHTS") or "")
-                x = featurize(_ai_features)
-                p = float(predict_prob(w, x))
-                plan["ml_prob"] = round(p, 4)
-                # Expected value in R units: p*TP_R - (1-p)*1R
-                tp_r = float(plan.get("tp_r_mult") or 0.0)
-                plan["ev_r"] = round((p * tp_r) - ((1.0 - p) * 1.0), 3)
-        except Exception:
-            pass
-        blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
-        logged.append({
-            "symbol": c.symbol,
-            "side": (getattr(c, "side", "buy") or "buy"),
-            "strength": st,
-            "score": float(c.score),
-            "entry": float(plan["entry"]),
-            "sl": float(plan["sl"]),
-            "tp": float(plan["tp"]),
-            "mode": mode,
-            "ai_score": ai_score,
-            "ml_prob": plan.get("ml_prob"),
-            "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
-            "features": (_ai_features if AI_FILTER_ENABLED else None),
-        })
-    # ensure at least min_send if possible (even if repeats blocked by dedup)
-    if len(blocks) < min_send:
-        # fill remaining with highest-ranked not already chosen (but still avoid duplicates within this message)
-        chosen = {d["symbol"] for d in logged}
-        for c in candidates:
-            if len(blocks) >= min_send:
-                break
-            if c.symbol in chosen:
+        side = (getattr(c, "side", "buy") or "buy")
+        ai_score: int | None = None
+        _ai_reasons: List[str] = []
+        _ai_features: Dict[str, Any] = {}
+
+        # --- Deterministic AI filter (score) ---
+        if AI_FILTER_ENABLED:
+            ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, side, min_score=AI_FILTER_MIN_SCORE)
+            if not ok_ai:
                 continue
 
-            ai_score = None
-            _ai_reasons: List[str] = []
-            _ai_features: Dict[str, Any] = {}
-            if AI_FILTER_ENABLED:
-                ok_ai, ai_score, _ai_reasons, _ai_features = should_alert(c.symbol, (getattr(c, "side", "buy") or "buy"), min_score=AI_FILTER_MIN_SCORE)
-                if not ok_ai:
-                    continue
-            plan = _compute_trade_plan(settings, c)
-            if _get_bool(settings, "AI_PREDICT_ENABLED", False) and ai_used < max(0, ai_topn):
-                if c.symbol not in ai_cache:
-                    try:
-                        ai_cache[c.symbol] = _ai_direction_for_symbol(c.symbol, settings)
-                    except Exception:
-                        ai_cache[c.symbol] = None
-                pred = ai_cache.get(c.symbol)
-                if pred:
-                    plan["ai_dir"] = pred.get("direction")
-                    plan["ai_conf"] = pred.get("confidence")
-                    plan["ai_h"] = pred.get("horizon")
-                    ai_used += 1
+        # --- News filter (optional) ---
+        ok_news, news_reasons, news_meta = check_news_risk(c.symbol)
+        if not ok_news:
+            # If user wants to see rejects, show one-line reject for transparency
+            if _get_bool(settings, "NEWS_FILTER_SEND_REJECTS", False):
+                blocks.append(f"📰 تم استبعاد {c.symbol} بسبب الأخبار.\n" + "\n".join(news_reasons[:3]))
+            continue
+
+        # --- Trade plan ---
+        plan = _compute_trade_plan(settings, c)
+        # --- One-day rules: صفقة ثانية فقط إذا الأولى ربحت، وخسارة واحدة فقط في اليوم ---
+        from core.storage import get_user_state, set_user_state
+        today = datetime.now(timezone.utc).date().isoformat()
+        chat_key = "GLOBAL"
+        one_day_only = _get_bool(settings, "ONE_DAY_ONLY", True)
+        second_only_if_win = _get_bool(settings, "SECOND_TRADE_ONLY_IF_WIN", True)
+        if one_day_only:
+            trades_count = int(float(get_user_state(chat_key, f"daily_trades_{today}", "0") or 0))
+            day_status = (get_user_state(chat_key, f"daily_status_{today}", "") or "").lower().strip()  # open|win|loss|flat
+            if day_status == "loss":
+                continue
+            if day_status == "open":
+                continue
+            if trades_count >= 1 and second_only_if_win and day_status != "win":
+                continue
+            if trades_count >= 2:
+                continue
+
+
+
+
+            loss_prob, lp_reasons = estimate_loss_probability(_ai_features or plan, score=ai_score if ai_score is not None else c.score)
+            plan["loss_prob"] = round(float(loss_prob), 3)
+            risk_pct = _dynamic_risk_pct(ai_score=float(ai_score) if ai_score is not None else None,
+                                         loss_prob=float(loss_prob),
+                                         settings=settings)
+            if risk_pct <= 0:
+                continue
+
             try:
-                if ML_ENABLED and AI_FILTER_ENABLED and (_ai_features is not None):
-                    w = parse_weights(settings.get("ML_WEIGHTS") or "")
-                    x = featurize(_ai_features)
-                    p = float(predict_prob(w, x))
-                    plan["ml_prob"] = round(p, 4)
-                    tp_r = float(plan.get("tp_r_mult") or 0.0)
-                    plan["ev_r"] = round((p * tp_r) - ((1.0 - p) * 1.0), 3)
+                capital = _get_float(settings, "CAPITAL_USD", 800.0)
+                risk_amount = max(0.10, capital * (risk_pct / 100.0))
+                rps = float(plan.get("risk_per_share") or 0.01)
+                qty_risk = risk_amount / max(rps, 0.01)
+                pos_pct = _get_float(settings, "POSITION_PCT", 0.20)
+                max_notional = max(0.0, capital * pos_pct)
+                qty_cap = (max_notional / max(float(plan.get("entry") or 0.01), 0.01)) if max_notional > 0 else qty_risk
+                qty = max(0.01, min(qty_risk, qty_cap))
+                qty = round(float(qty), 3)
+                plan["risk_pct"] = round(float(risk_pct), 2)
+                plan["risk_amount"] = round(float(risk_amount), 2)
+                plan["qty"] = qty
             except Exception:
                 pass
-            st = _strength(float(c.score))
+
             blocks.append(_format_sahm_block(mode_label, c, plan, ai_score=ai_score))
             logged.append({
                 "symbol": c.symbol,
+                "side": (getattr(c, "side", "buy") or "buy"),
                 "strength": st,
                 "score": float(c.score),
                 "entry": float(plan["entry"]),
                 "sl": float(plan["sl"]),
                 "tp": float(plan["tp"]),
                 "mode": mode,
-            "ai_score": ai_score,
-            "ml_prob": plan.get("ml_prob"),
-            "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
-            "features": (_ai_features if AI_FILTER_ENABLED else None),
+                "ai_score": ai_score,
+                "ml_prob": plan.get("ml_prob"),
+                "reasons": (_ai_reasons if AI_FILTER_ENABLED else None),
+                "features": (_ai_features if AI_FILTER_ENABLED else None),
             })
+
     # persist
     ts = now_utc.isoformat()
     horizon_days = int(_get_int(_settings(), "SIGNAL_EVAL_DAYS", SIGNAL_EVAL_DAYS))
     for d in logged:
         try:
-            log_signal(
+            sig_id = log_signal(
                 ts=ts,
                 symbol=d["symbol"],
                 source="scan",
@@ -1742,16 +1895,23 @@ def _select_and_log_new_candidates(picks: List[Candidate], settings: Dict[str, s
                 score=float(d["score"]),
                 entry=float(d["entry"]),
                 sl=d.get("sl"),
-                tp=d.get("tp"),
-                features_json=json.dumps(d.get("features") or {}, ensure_ascii=False),
-                reasons_json=json.dumps(d.get("reasons") or [], ensure_ascii=False),
+                tp=(d.get("tp1") if d.get("tp1") is not None else d.get("tp")),
+                features_json=json.dumps({"ai_features": (d.get("features") or {}), "plan": {k: d.get(k) for k in ["tp1","tp2","qty","risk_pct","risk_amount","loss_prob","setup","setup_notes","one_day","close_exit_minutes"]}}, ensure_ascii=False),
+                reasons_json=json.dumps({"ai_reasons": (d.get("reasons") or []), "news": (d.get("news_meta") or {}), "notes": {"mode": d.get("mode"), "strength": d.get("strength")}}, ensure_ascii=False),
                 horizon_days=horizon_days,
                 model_prob=(float(d.get("ml_prob")) if d.get("ml_prob") is not None else None),
             )
+            try:
+                if sig_id:
+                    # نضيفها تلقائيًا للمراقبة/السجل (بدون أزرار)
+                    due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00","Z")
+                    add_paper_trade("GLOBAL", int(sig_id), due)
+            except Exception:
+                pass
         except Exception:
             continue
-    return blocks, logged
 
+    return blocks, logged
 def _run_scan_and_build_message(settings: Dict[str, str]) -> Tuple[str, int]:
     picks, universe_size = scan_universe_with_meta()
     blocks, _ = _select_and_log_new_candidates(picks, settings)
@@ -2046,6 +2206,13 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                 )
                 title = "تحقق TP1 — تم تفعيل Runner (Trail إلى الدخول)"
                 res_emoji = "✅"
+                # تحديث حالة اليوم للسماح بصفقة ثانية
+                try:
+                    from core.storage import set_user_state
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    set_user_state("GLOBAL", f"daily_status_{today}", "win")
+                except Exception:
+                    pass
             elif mapped_kind == "tp2":
                 # TP2 hit → lock profits (trail to TP1)
                 new_trail = tp1 if tp1 > 0 else entry
@@ -2087,6 +2254,13 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
                 )
                 title = "تحقق وقف الخسارة" if mapped_kind == "sl" else "تحقق Trail Stop"
                 res_emoji = "❌"
+                # تحديث حالة اليوم: توقف بعد خسارة
+                try:
+                    from core.storage import set_user_state
+                    today = datetime.now(timezone.utc).date().isoformat()
+                    set_user_state("GLOBAL", f"daily_status_{today}", "loss")
+                except Exception:
+                    pass
 
             # R-multiple estimate (vs SL risk if available)
             r_mult = None
@@ -2147,6 +2321,77 @@ def _run_open_paper_monitor(ttl_sec: float = 30.0) -> None:
 
         except Exception:
             continue
+
+
+
+def _run_eod_close_reminder(ttl_sec: float = 60.0) -> None:
+    """Reminder to close 1D one-day positions before market close.
+
+    Since التنفيذ يدوي عبر (سهم)، نرسل تذكير قبل الإغلاق بـ CLOSE_EXIT_MINUTES.
+    """
+    global _LAST_EOD_REMINDER_RUN
+    try:
+        _LAST_EOD_REMINDER_RUN
+    except Exception:
+        _LAST_EOD_REMINDER_RUN = 0.0  # type: ignore
+
+    now = time.time()
+    if (now - float(_LAST_EOD_REMINDER_RUN or 0.0)) < float(ttl_sec):
+        return
+    _LAST_EOD_REMINDER_RUN = now  # type: ignore
+
+    s = get_all_settings()
+    close_min = _get_int(s, "CLOSE_EXIT_MINUTES", 15)
+    one_day_only = _get_bool(s, "ONE_DAY_ONLY", True)
+    if not one_day_only:
+        return
+
+    try:
+        c = clock() or {}
+    except Exception:
+        return
+    if not c.get("is_open"):
+        return
+
+    ts = _dt_from_iso(str(c.get("timestamp") or "")) or datetime.now(timezone.utc)
+    next_close = _dt_from_iso(str(c.get("next_close") or "")) or None
+    if not next_close:
+        return
+
+    minutes_to_close = (next_close - ts).total_seconds() / 60.0
+    # trigger once when we enter the window
+    if minutes_to_close > float(close_min) or minutes_to_close < max(1.0, float(close_min) - 5.0):
+        return
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    from core.storage import get_user_state, set_user_state
+    status = (get_user_state("GLOBAL", f"daily_status_{today}", "") or "").lower().strip()
+    if status != "open":
+        return
+    if (get_user_state("GLOBAL", f"daily_eod_notified_{today}", "0") or "0") == "1":
+        return
+
+    plan_raw = get_user_state("GLOBAL", f"daily_last_plan_{today}", "") or ""
+    try:
+        plan = json.loads(plan_raw) if plan_raw.strip().startswith("{") else {}
+    except Exception:
+        plan = {}
+    symbol = (plan.get("symbol") or "").upper().strip()
+    if not symbol:
+        return
+
+    live_p, live_ts = _get_live_trade_price(symbol)
+    p_line = f"السعر الحالي: {live_p} ({live_ts})\n" if live_p is not None else ""
+
+    msg = (
+        f"⏰ تذكير إغلاق (صفقة يوم واحد)\n"
+        f"السهم: {symbol}\n"
+        f"{p_line}"
+        f"إذا ما تحقق TP/SL: اغلق الصفقة قبل الإغلاق بـ {close_min} دقيقة.\n"
+        f"الدخول: {plan.get('entry')} | SL: {plan.get('sl')} | TP1: {plan.get('tp1')} | TP2: {plan.get('tp2')}"
+    )
+    _notify_simple(msg, s, silent=False)
+    set_user_state("GLOBAL", f"daily_eod_notified_{today}", "1")
 
 def _run_due_paper_reviews(ttl_sec: float = 60.0) -> None:
     """Check for due 24h paper trades and send results to their chats (throttled)."""
@@ -3523,6 +3768,13 @@ def _review_my_saved_performance(chat_id: str, lookback_days: int = 2, limit: in
             lines.append(
                 f"{label} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret:.2f}% | {price_label}: {price:.2f} | Entry: {entry:.2f} | t: {t_short} | Score: {score_str} | MFE: {mfe:.2f}% | MAE: {mae:.2f}%"
             )
+            try:
+                if sig_id:
+                    # نضيفها تلقائيًا للمراقبة/السجل (بدون أزرار)
+                    due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00","Z")
+                    add_paper_trade("GLOBAL", int(sig_id), due)
+            except Exception:
+                pass
         except Exception:
             continue
 
@@ -3626,6 +3878,13 @@ def _my_saved_24h_reviews_message(chat_id: str, lookback_days: int = 30, limit: 
             lines.append(
                 f"{res} {symbol} ({mode.lower()}) | 🎯 {side_label} | Ret: {ret_pct:+.2f}% | Entry: {entry:.2f} | Exit: {exit_price:.2f}{sc_line}{src_line}{ts_line}"
             )
+            try:
+                if sig_id:
+                    # نضيفها تلقائيًا للمراقبة/السجل (بدون أزرار)
+                    due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00","Z")
+                    add_paper_trade("GLOBAL", int(sig_id), due)
+            except Exception:
+                pass
         except Exception:
             continue
     header = f"📊 مراجعات 24 ساعة (مقفلة)\n— العدد: {len(rows)}\n"
@@ -3721,6 +3980,13 @@ def _review_recent_signals(lookback_days: int = 2, limit: int = 50) -> str:
                 if score is not None
                 else f"{label} {symbol} ({mode}) | Ret: {ret:.2f}% | Close: {last_close:.2f} | Entry: {entry:.2f}"
             )
+            try:
+                if sig_id:
+                    # نضيفها تلقائيًا للمراقبة/السجل (بدون أزرار)
+                    due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00","Z")
+                    add_paper_trade("GLOBAL", int(sig_id), due)
+            except Exception:
+                pass
         except Exception:
             continue
 
@@ -3930,6 +4196,15 @@ def _start_scheduler() -> None:
             id="paper_due_review_job",
             replace_existing=True,
         )
+        # تذكير إغلاق صفقات اليوم الواحد قبل الإغلاق (يدوي)
+        _scheduler.add_job(
+            _run_eod_close_reminder,
+            IntervalTrigger(minutes=2),
+            kwargs={"ttl_sec": 30.0},
+            id="eod_reminder_job",
+            replace_existing=True,
+        )
+
     except Exception:
         pass
 

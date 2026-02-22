@@ -144,3 +144,63 @@ def gemini_predict_direction(symbol: str, features: dict, horizon: str = "D1", m
                 raise
 
     raise RuntimeError(f"فشل استدعاء Gemini للتوقع. الموديلات التي جُربت: {tried}\nآخر خطأ: {last_err}")
+
+
+def gemini_assess_news(symbol: str, headlines: list[dict], model: str | None = None) -> dict:
+    """Assess recent news risk for a symbol.
+
+    Returns a dict (best-effort JSON parsed from Gemini):
+      {"risk":"LOW|MEDIUM|HIGH","sentiment":"POSITIVE|NEUTRAL|NEGATIVE","block":true/false,"reasons":[...]}
+    If Gemini isn't available, returns a safe fallback with block=False.
+    """
+    if _CLIENT is None:
+        return {"risk":"UNKNOWN","sentiment":"NEUTRAL","block":False,"reasons":["Gemini غير متوفر"]}
+    m = (model or DEFAULT_MODEL).strip()
+    # Keep prompt small and structured
+    lines = [
+        f"أنت محلل أخبار مالي. قيّم مخاطر الأخبار للسهم: {symbol}.",
+        "أمامك عناوين/ملخصات خلال آخر 24-48 ساعة. الهدف: تحديد هل هناك خبر قد يسبب هبوط مفاجئ أو تذبذب قوي اليوم.",
+        "",
+        "الأخبار (قد تكون مختصرة):",
+    ]
+    for it in (headlines or [])[:8]:
+        h = str(it.get("headline") or it.get("title") or "").strip()
+        s = str(it.get("summary") or "").strip()
+        ts = str(it.get("created_at") or it.get("updated_at") or it.get("time") or "")
+        if not h and not s:
+            continue
+        blob = (h + (" — " + s if s else "")).strip()
+        lines.append(f"- ({ts}) {blob[:220]}")
+    lines += [
+        "",
+        "أخرج JSON فقط بدون أي نص خارجي.",
+        "المفاتيح المطلوبة:",
+        "risk: واحدة من [LOW, MEDIUM, HIGH]",
+        "sentiment: واحدة من [POSITIVE, NEUTRAL, NEGATIVE]",
+        "block: true إذا risk=HIGH أو إذا الخبر: earnings قريب، طرح أسهم، تحقيق SEC، إفلاس، إيقاف تداول، دعوى كبيرة، شطب.",
+        "reasons: 1-4 أسباب قصيرة بالعربي.",
+    ]
+    prompt = "\n".join(lines)
+
+    tried: list[str] = []
+    candidates = [m] + [x for x in _FALLBACK_MODELS if x != m]
+    last_err: Exception | None = None
+    for mm in candidates:
+        tried.append(mm)
+        try:
+            resp = _CLIENT.models.generate_content(model=mm, contents=prompt)
+            txt = (resp.text or "").strip()
+            # best-effort parse
+            try:
+                j = json.loads(txt)
+                if isinstance(j, dict):
+                    j["_model"] = mm
+                    return j
+            except Exception:
+                pass
+            return {"raw": txt, "_model": mm, "risk":"UNKNOWN","sentiment":"NEUTRAL","block":False,"reasons":["تعذر تحليل JSON من Gemini"]}
+        except Exception as e:
+            last_err = e
+            if not _is_model_not_found(e):
+                raise
+    return {"risk":"UNKNOWN","sentiment":"NEUTRAL","block":False,"reasons":[f"فشل Gemini: {last_err}"],"_tried": tried}

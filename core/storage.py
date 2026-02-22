@@ -659,6 +659,13 @@ def _env_defaults() -> Dict[str, str]:
             "RISK_APLUS_PCT": "1.5",
             "RISK_A_PCT": "1.0",
             "RISK_B_PCT": "0.5",
+            # مخاطرة ذكية للحسابات الصغيرة (D1)
+            "RISK_MIN_PCT": "4",
+            "RISK_MAX_PCT": "8",
+            # إذا تجاوز احتمال الخسارة هذا الرقم يتم منع الصفقة
+            "LOSS_PROB_BLOCK": "0.50",
+            # إرسال رسائل رفض بسبب الأخبار؟
+            "NEWS_FILTER_SEND_REJECTS": "0",
             "SCAN_INTERVAL_MIN": "20",
             "SCHED_ENABLED": "1",
             "POSITION_PCT": "0.20",
@@ -1120,7 +1127,7 @@ def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
         with _pg_connect() as con:
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    """SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength
+                    """SELECT id, ts, symbol, mode, side, entry, sl, tp, score, strength, features_json, reasons_json
                        FROM signals WHERE id=%s""",
                     (int(signal_id),),
                 )
@@ -1161,6 +1168,21 @@ def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
     sl = float(sig.get("sl") or 0.0)
     tp1 = float(sig.get("tp") or 0.0)
 
+        # إذا كانت خطة الصفقة تحتوي TP2/TP3 مخصصة (من features_json)، استخدمها بدل 4R/8R الافتراضية
+    plan_tp2 = 0.0
+    plan_tp3 = 0.0
+    try:
+        fj = str(sig.get("features_json") or "")
+        j = json.loads(fj) if fj.strip().startswith("{") else {}
+        plan = j.get("plan") if isinstance(j, dict) else None
+        if isinstance(plan, dict):
+            if plan.get("tp2") is not None:
+                plan_tp2 = float(plan.get("tp2") or 0.0)
+            if plan.get("tp3") is not None:
+                plan_tp3 = float(plan.get("tp3") or 0.0)
+    except Exception:
+        pass
+
     # Multi-stage TP: if SL exists, compute TP2/TP3 as 4R/8R runners.
     tp2 = 0.0
     tp3 = 0.0
@@ -1173,6 +1195,15 @@ def add_paper_trade(chat_id: str, signal_id: int, due_ts: str) -> None:
             else:
                 tp2 = entry + 4.0 * risk
                 tp3 = entry + 8.0 * risk
+    except Exception:
+        pass
+
+    # Override with plan-defined targets if available
+    try:
+        if plan_tp2 and float(plan_tp2) > 0:
+            tp2 = float(plan_tp2)
+        if plan_tp3 and float(plan_tp3) > 0:
+            tp3 = float(plan_tp3)
     except Exception:
         pass
 

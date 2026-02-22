@@ -113,3 +113,29 @@ def bars(
         "feed": "iex",
     }
     return _get_data("/v2/stocks/bars", params=params)
+
+
+# ===== News (Market Data) =====
+def news(symbols: List[str] | str, limit: int = 20, lookback_hours: int = 48) -> Any:
+    """Fetch recent news for given symbol(s) via Alpaca News endpoint (if enabled in account).
+    Uses Market Data base URL.
+    """
+    from datetime import timedelta
+    if isinstance(symbols, str):
+        sym = symbols
+    else:
+        sym = ",".join([s for s in symbols if s])
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=int(max(1, lookback_hours)))
+    params = {
+        "symbols": sym,
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "limit": int(max(1, min(50, limit))),
+        "sort": "desc",
+    }
+    try:
+        return _get_data("/v1beta1/news", params=params)
+    except Exception:
+        # Some accounts may not have the endpoint; return empty.
+        return {"news": []}

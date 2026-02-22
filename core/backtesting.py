@@ -1,12 +1,12 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.alpaca_client import bars
 from core.indicators import ema, rsi, atr, macd
+
 
 @dataclass
 class Trade:
@@ -20,6 +20,13 @@ class Trade:
     pnl: float
     r_mult: float
     outcome: str  # "tp"|"sl"|"time"|"exit"
+    # Optional diagnostics (non-breaking for existing consumers)
+    tp1_hit: bool = False
+    tp1_price: float | None = None
+    tp2_price: float | None = None
+    trail_used: bool = False
+    partial_pct: float | None = None
+
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -27,12 +34,14 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+
 def _position_size(equity: float, risk_pct: float, entry: float, sl: float) -> int:
-    # risk_pct is percent of equity, e.g. 1.0
+    """Position sizing by fixed % equity risk."""
     risk_amount = max(0.0, equity * (risk_pct / 100.0))
-    risk_per_share = max(entry - sl, 1e-6)
+    risk_per_share = max(abs(entry - sl), 1e-6)
     qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
     return max(qty, 0)
+
 
 def run_backtest_symbol(
     symbol: str,
@@ -42,27 +51,38 @@ def run_backtest_symbol(
     capital: float = 10000.0,
     risk_per_trade_pct: float = 1.0,
     sl_atr_mult: float = 1.5,
-    tp_r_mult: float = 1.8,
-    max_holding_days: int = 7,
+    tp2_r_mult: float = 1.8,
+    # Win-rate focused exits (1D): partial take profit + trailing stop
+    tp1_r_mult: float = 1.0,
+    partial_pct: float = 0.5,
+    trail_atr_mult: float = 1.2,
+    trail_after_tp1: bool = True,
+    move_sl_to_be_after_tp1: bool = True,
+    max_holding_days: int = 12,
     cooldown_days: int = 2,
 ) -> Dict[str, Any]:
-    """
-    Simple, transparent daily-bar backtest:
-      Entry condition (long):
-        - EMA20 > EMA50
-        - Close > EMA200
-        - RSI14 between 50..70
-        - MACD hist > 0
-      Entry at next day's open (approximated by next day's close if open not available).
-      Stop = entry - ATR14 * sl_atr_mult
-      Take profit = entry + (entry - stop) * tp_r_mult
-      Exit on TP/SL, or time-based exit at max_holding_days.
+    """Daily-bar backtest with practical 1D exits.
+
+    Entry (LONG) baseline:
+      - EMA20 > EMA50
+      - Close > EMA200
+      - RSI14 between 50..70
+      - MACD hist > 0
+
+    Exits (LONG):
+      - SL = entry - ATR14 * sl_atr_mult
+      - TP1 = entry + R * tp1_r_mult (optional partial)
+      - TP2 = entry + R * tp2_r_mult (final target)
+      - Optional trailing stop (ATR-based), typically activated after TP1.
+
+    Notes:
+      - Uses OHLC daily bars; intra-day order is unknown, so we use a conservative ordering:
+        Stop-loss triggers before take-profit if both touched in same bar.
     """
     symbol = (symbol or "").upper().strip()
     if not symbol:
         return {"error": "empty_symbol"}
 
-    # pull enough lookback to compute EMA200
     pull_start = start - timedelta(days=365)
     data = bars([symbol], start=pull_start, end=end, timeframe="1Day", limit=1000)
     bmap = data.get("bars", {}) if isinstance(data, dict) else {}
@@ -70,18 +90,14 @@ def run_backtest_symbol(
     if len(blist) < 260:
         return {"error": "not_enough_bars", "bars": len(blist)}
 
-    # Build series
     ts = [str(b.get("t")) for b in blist]
     closes = [_safe_float(b.get("c")) for b in blist]
-    highs  = [_safe_float(b.get("h")) for b in blist]
-    lows   = [_safe_float(b.get("l")) for b in blist]
+    highs = [_safe_float(b.get("h")) for b in blist]
+    lows = [_safe_float(b.get("l")) for b in blist]
 
-    # Map to index range within [start,end]
     def _to_dt(s: str) -> Optional[datetime]:
         try:
-            # Alpaca bar time is ISO; can end with Z
-            ss = s.replace("Z", "+00:00")
-            return datetime.fromisoformat(ss)
+            return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
         except Exception:
             return None
 
@@ -95,15 +111,22 @@ def run_backtest_symbol(
     max_dd = 0.0
 
     trades: List[Trade] = []
+
+    # position state
     in_pos = False
     entry_i = -1
     entry_price = 0.0
-    sl = 0.0
-    tp = 0.0
-    qty = 0
+    base_sl = 0.0
+    tp1 = None  # type: ignore[assignment]
+    tp2 = 0.0
+    qty_total = 0
+    qty_left = 0
+    qty_tp1 = 0
+    tp1_hit = False
+    trail_sl = None  # type: ignore[assignment]
+    trail_used = False
     cooldown_until_i = -1
 
-    # Helper: drawdown tracking
     def _update_dd(eq: float) -> None:
         nonlocal peak, max_dd
         if eq > peak:
@@ -112,14 +135,15 @@ def run_backtest_symbol(
         if dd > max_dd:
             max_dd = dd
 
+    def _risk_per_share() -> float:
+        return max(abs(entry_price - base_sl), 1e-6)
+
     for i in idxs:
         if i < 210:
-            continue  # need EMA200/ATR history
-
+            continue
         if i <= cooldown_until_i:
             continue
 
-        # compute indicators up to i (inclusive)
         c_slice = closes[: i + 1]
         h_slice = highs[: i + 1]
         l_slice = lows[: i + 1]
@@ -135,73 +159,149 @@ def run_backtest_symbol(
             continue
 
         _, _, hist = m
-        close = c_slice[-1]
+        close = float(c_slice[-1])
+        lo = float(lows[i])
+        hi = float(highs[i])
 
-        # Manage open position first
+        atr_val = float(a14) if float(a14) > 0 else max(close * 0.01, 0.5)
+
+        # ---- Manage open position (LONG only in this baseline backtest) ----
         if in_pos:
             hold_days = i - entry_i
-            lo = lows[i]
-            hi = highs[i]
+
+            # Update trailing stop (end-of-day style) using today's close
+            if trail_after_tp1:
+                active_trail = bool(tp1_hit)
+            else:
+                active_trail = True
+
+            if trail_atr_mult > 0 and active_trail:
+                new_trail = close - (atr_val * float(trail_atr_mult))
+                if trail_sl is None:
+                    trail_sl = new_trail
+                else:
+                    trail_sl = max(float(trail_sl), float(new_trail))
+                trail_used = True
+
+            # Effective SL: max(base_sl, trail_sl) for LONG
+            eff_sl = float(base_sl)
+            if trail_sl is not None:
+                eff_sl = max(eff_sl, float(trail_sl))
 
             exit_reason = None
             exit_price = None
 
-            # Worst-first: stop then tp within same day (conservative for longs)
-            if lo <= sl:
-                exit_reason = "sl"
-                exit_price = sl
-            elif hi >= tp:
-                exit_reason = "tp"
-                exit_price = tp
-            elif hold_days >= max_holding_days:
-                exit_reason = "time"
-                exit_price = close
+            # Conservative intraday ordering: SL first
+            if lo <= eff_sl:
+                exit_reason = "sl" if eff_sl == base_sl else "exit"
+                exit_price = eff_sl
+            else:
+                # Partial TP1
+                if (tp1 is not None) and (not tp1_hit) and hi >= float(tp1) and qty_tp1 > 0:
+                    tp1_hit = True
+                    realized = (float(tp1) - entry_price) * qty_tp1
+                    equity += realized
+                    qty_left -= qty_tp1
+                    _update_dd(equity)
+
+                    # optionally move SL to breakeven after TP1
+                    if move_sl_to_be_after_tp1:
+                        base_sl = max(base_sl, entry_price)
+
+                # Final TP2
+                if qty_left > 0 and hi >= float(tp2):
+                    exit_reason = "tp"
+                    exit_price = float(tp2)
+                elif hold_days >= int(max_holding_days):
+                    exit_reason = "time"
+                    exit_price = close
 
             if exit_reason and exit_price is not None:
-                pnl = (exit_price - entry_price) * qty
-                r = (exit_price - entry_price) / max(entry_price - sl, 1e-6)
+                pnl = (exit_price - entry_price) * qty_left
                 equity += pnl
                 _update_dd(equity)
-                trades.append(Trade(
-                    symbol=symbol,
-                    entry_ts=ts[entry_i],
-                    exit_ts=ts[i],
-                    entry=round(entry_price, 4),
-                    exit=round(exit_price, 4),
-                    qty=int(qty),
-                    side="buy",
-                    pnl=round(pnl, 2),
-                    r_mult=round(r, 3),
-                    outcome=exit_reason,
-                ))
+
+                # Total pnl includes any partial realized earlier
+                # Estimate total pnl by (equity delta) is hard here; record full-trade pnl as:
+                # (exit remainder pnl) + (tp1 pnl if hit)
+                tp1_pnl = 0.0
+                if tp1_hit and tp1 is not None and qty_tp1 > 0:
+                    tp1_pnl = (float(tp1) - entry_price) * qty_tp1
+                total_pnl = pnl + tp1_pnl
+
+                r = (exit_price - entry_price) / _risk_per_share()
+                if tp1_hit and tp1 is not None and qty_tp1 > 0:
+                    # Add partial R contribution (approx)
+                    r += ((float(tp1) - entry_price) / _risk_per_share()) * (qty_tp1 / max(qty_total, 1))
+
+                trades.append(
+                    Trade(
+                        symbol=symbol,
+                        entry_ts=ts[entry_i],
+                        exit_ts=ts[i],
+                        entry=round(entry_price, 4),
+                        exit=round(exit_price, 4),
+                        qty=int(qty_total),
+                        side="buy",
+                        pnl=round(total_pnl, 2),
+                        r_mult=round(float(r), 3),
+                        outcome=exit_reason,
+                        tp1_hit=bool(tp1_hit),
+                        tp1_price=(round(float(tp1), 4) if tp1 is not None else None),
+                        tp2_price=round(float(tp2), 4),
+                        trail_used=bool(trail_used),
+                        partial_pct=float(partial_pct),
+                    )
+                )
+
+                # reset state
                 in_pos = False
                 entry_i = -1
-                qty = 0
-                cooldown_until_i = i + max(0, cooldown_days)
+                entry_price = 0.0
+                base_sl = 0.0
+                tp1 = None
+                tp2 = 0.0
+                qty_total = 0
+                qty_left = 0
+                qty_tp1 = 0
+                tp1_hit = False
+                trail_sl = None
+                trail_used = False
+                cooldown_until_i = i + max(0, int(cooldown_days))
             continue
 
-        # Entry signal
-        cond = (e20 > e50) and (close > e200) and (50.0 <= float(r14) <= 70.0) and (float(hist) > 0)
+        # ---- Entry signal ----
+        cond = (float(e20) > float(e50)) and (close > float(e200)) and (50.0 <= float(r14) <= 70.0) and (float(hist) > 0)
         if not cond:
             continue
 
-        # Entry next bar (approx): use current close as entry to keep deterministic
         entry_price = float(close)
+        base_sl = max(0.01, entry_price - (atr_val * float(sl_atr_mult)))
+        rps = max(entry_price - base_sl, 1e-6)
 
-        # Stops/TP
-        atr_val = float(a14) if float(a14) > 0 else max(entry_price * 0.01, 0.5)
-        sl = max(0.01, entry_price - (atr_val * float(sl_atr_mult)))
-        risk_per_share = max(entry_price - sl, 1e-6)
-        tp = entry_price + (risk_per_share * float(tp_r_mult))
+        # targets
+        tp2 = entry_price + (rps * float(tp2_r_mult))
+        tp1 = None
+        if partial_pct and partial_pct > 0 and tp1_r_mult and tp1_r_mult > 0:
+            tp1 = entry_price + (rps * float(tp1_r_mult))
 
-        qty = _position_size(equity, float(risk_per_trade_pct), entry_price, sl)
-        if qty < 1:
+        qty_total = _position_size(equity, float(risk_per_trade_pct), entry_price, base_sl)
+        if qty_total < 1:
             continue
 
+        qty_left = qty_total
+        tp1_hit = False
+        trail_sl = None
+        trail_used = False
+
+        # partial sizing
+        pp = float(partial_pct) if partial_pct is not None else 0.0
+        pp = max(0.0, min(0.95, pp))
+        qty_tp1 = int(round(qty_total * pp)) if (tp1 is not None and pp > 0) else 0
+        qty_tp1 = min(qty_tp1, qty_total - 1) if qty_total > 1 else 0  # keep at least 1 share for runner
         in_pos = True
         entry_i = i
 
-    # compute stats
     wins = sum(1 for t in trades if t.pnl > 0)
     losses = sum(1 for t in trades if t.pnl <= 0)
     winrate = (wins / len(trades)) if trades else 0.0
@@ -227,8 +327,13 @@ def run_backtest_symbol(
         "params": {
             "risk_per_trade_pct": float(risk_per_trade_pct),
             "sl_atr_mult": float(sl_atr_mult),
-            "tp_r_mult": float(tp_r_mult),
+            "tp1_r_mult": float(tp1_r_mult),
+            "tp2_r_mult": float(tp2_r_mult),
+            "partial_pct": float(partial_pct),
+            "trail_atr_mult": float(trail_atr_mult),
+            "trail_after_tp1": bool(trail_after_tp1),
+            "move_sl_to_be_after_tp1": bool(move_sl_to_be_after_tp1),
             "max_holding_days": int(max_holding_days),
             "cooldown_days": int(cooldown_days),
-        }
+        },
     }
